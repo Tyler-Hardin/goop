@@ -1,580 +1,806 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>goop</title>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  :root {
-    --bg:       #0c0e12;
-    --surface:  #16191e;
-    --surface2: #1c2027;
-    --border:   #2a2f38;
-    --border2:  #363c47;
-    --dim:      #7d8794;
-    --dim2:     #5a6370;
-    --fg:       #d2d7df;
-    --fg2:      #e8ecf1;
-    --green:    #6be07c;
-    --blue:     #6db3f2;
-    --blue-dim: #3a7fc1;
-    --yellow:   #e2b96f;
-    --red:      #f2625a;
-    --red-dim:  #a03a3a;
-    --cyan:     #4dd4c0;
-    --purple:   #b99aff;
-    --radius:   12px;
-    --radius-sm: 8px;
-    --font:     system-ui, -apple-system, 'Segoe UI', sans-serif;
-    --mono:     'Cascadia Code', 'JetBrains Mono', ui-monospace, 'SF Mono', 'Fira Code', monospace;
-  }
-
-  html, body {
-    height: 100%; background: var(--bg); color: var(--fg);
-    font-family: var(--font); font-size: 15px; line-height: 1.55;
-    -webkit-font-smoothing: antialiased;
-  }
-
-  /* ── layout ────────────────────────────────────── */
-
-  body {
-    display: flex; flex-direction: column;
-    max-width: min(100%, 1100px);
-    margin: 0 auto;
-    border-left:  1px solid var(--border);
-    border-right: 1px solid var(--border);
-    box-shadow: 0 0 60px rgba(0,0,0,0.35);
-  }
-
-  /* ── header ───────────────────────────────────── */
-
-  header {
-    padding: 11px 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 10px;
-    flex-shrink: 0;
-    background: var(--surface);
-  }
-  header .dot {
-    width: 9px; height: 9px; border-radius: 50%;
-    background: var(--dim2);
-    box-shadow: 0 0 6px rgba(125,135,148,0.3);
-    transition: background 0.3s, box-shadow 0.3s;
-  }
-  header .dot.live {
-    background: var(--green);
-    box-shadow: 0 0 10px rgba(107,224,124,0.5);
-  }
-  header .title {
-    font-weight: 650; font-size: 15px; letter-spacing: -0.2px;
-    color: var(--fg2);
-  }
-  header .status {
-    font-size: 12px; color: var(--dim); margin-left: auto;
-    transition: color 0.3s;
-    font-feature-settings: "ss02";
-  }
-
-  /* ── message list ─────────────────────────────── */
-
-  main {
-    flex: 1; overflow-y: auto; padding: 20px;
-    display: flex; flex-direction: column; gap: 14px;
-    scroll-behavior: smooth;
-    -webkit-overflow-scrolling: touch;
-    background:
-      radial-gradient(ellipse at 50% 0%, rgba(109,179,242,0.02) 0%, transparent 60%),
-      var(--bg);
-  }
-
-  .msg {
-    max-width: 78%;
-    padding: 11px 16px;
-    border-radius: var(--radius);
-    font-size: 14.5px; line-height: 1.55;
-    white-space: pre-wrap; word-break: break-word;
-    animation: fadeIn 0.2s ease;
-    position: relative;
-  }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-
-  .msg.user {
-    align-self: flex-end;
-    background: var(--blue-dim);
-    color: #fff;
-    border-bottom-right-radius: 4px;
-    font-weight: 450;
-  }
-
-  .msg.assistant {
-    align-self: flex-start;
-    background: var(--surface2);
-    border-bottom-left-radius: 4px;
-    border: 1px solid var(--border);
-  }
-
-  .msg.thinking {
-    align-self: flex-start;
-    color: var(--dim);
-    font-style: italic; font-size: 13px;
-    background: none; padding: 3px 18px;
-    opacity: 0.8;
-  }
-  .msg.thinking::before {
-    content: '';
-    display: inline-block; width: 7px; height: 7px;
-    border-radius: 50%; background: var(--dim);
-    margin-right: 8px; vertical-align: middle;
-    animation: pulse 1s ease-in-out infinite;
-  }
-  @keyframes pulse { 0%,100%{opacity:0.3} 50%{opacity:1} }
-
-  .msg.tool {
-    align-self: flex-start;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--cyan);
-    font-family: var(--mono); font-size: 13px;
-    max-width: 85%;
-    cursor: pointer;
-    user-select: none;
-    transition: border-color 0.2s;
-  }
-  .msg.tool:hover { border-color: var(--cyan); }
-  .msg.tool .tool-header {
-    padding: 9px 14px;
-    display: flex; align-items: flex-start; gap: 8px;
-  }
-  .msg.tool .tool-header .arrow {
-    color: var(--cyan); font-size: 13px; line-height: 1.4;
-    transition: transform 0.2s; flex-shrink: 0;
-  }
-  .msg.tool.open .tool-header .arrow { transform: rotate(90deg); }
-  .msg.tool .tool-header .info { flex: 1; min-width: 0; }
-  .msg.tool .name { color: var(--cyan); font-weight: 650; font-size: 13.5px; margin-bottom: 2px; }
-  .msg.tool .arg { color: var(--dim); margin: 2px 0; }
-  .msg.tool .arg b { color: var(--fg); font-weight: 550; }
-  .msg.tool .tool-body {
-    display: none;
-    border-top: 1px solid var(--border);
-    padding: 9px 14px;
-    color: var(--dim); font-size: 12.5px;
-    font-family: var(--mono);
-    white-space: pre-wrap; word-break: break-word;
-    max-height: 220px; overflow-y: auto;
-  }
-  .msg.tool.open .tool-body { display: block; }
-
-  .msg.result {
-    align-self: flex-start;
-    color: var(--dim); font-size: 12.5px;
-    font-family: var(--mono);
-    background: var(--surface);
-    border: 1px solid var(--border);
-    padding: 9px 14px;
-    max-height: 180px; overflow-y: auto;
-    max-width: 90%;
-    border-radius: var(--radius-sm);
-  }
-
-  .msg.error {
-    align-self: flex-start;
-    color: var(--red);
-    background: rgba(242,98,90,0.08);
-    border: 1px solid rgba(242,98,90,0.18);
-    font-weight: 480;
-  }
-
-  .msg.final {
-    align-self: center;
-    color: var(--dim2); font-size: 11px;
-    background: none; padding: 2px 0;
-    letter-spacing: 0.4px;
-  }
-
-  /* ── rendered markdown ────────────────────────── */
-
-  .msg.assistant.rendered { white-space: normal; }
-
-  .msg.assistant.rendered h1,
-  .msg.assistant.rendered h2,
-  .msg.assistant.rendered h3,
-  .msg.assistant.rendered h4 {
-    margin: 0.7em 0 0.35em; font-weight: 650; line-height: 1.3;
-    color: var(--fg2);
-  }
-  .msg.assistant.rendered h1 { font-size: 1.35em; }
-  .msg.assistant.rendered h2 { font-size: 1.18em; padding-bottom: 0.2em; border-bottom: 1px solid var(--border); }
-  .msg.assistant.rendered h3 { font-size: 1.06em; }
-  .msg.assistant.rendered h4 { font-size: 0.95em; color: var(--dim); }
-
-  .msg.assistant.rendered p { margin: 0.45em 0; }
-  .msg.assistant.rendered p:first-child { margin-top: 0; }
-  .msg.assistant.rendered p:last-child { margin-bottom: 0; }
-
-  .msg.assistant.rendered ul,
-  .msg.assistant.rendered ol { margin: 0.35em 0; padding-left: 1.6em; }
-  .msg.assistant.rendered li { margin: 0.18em 0; }
-
-  .msg.assistant.rendered blockquote {
-    margin: 0.45em 0; padding: 3px 12px;
-    border-left: 3px solid var(--cyan); color: var(--dim);
-    background: rgba(77,212,192,0.04);
-    border-radius: 0 6px 6px 0;
-  }
-  .msg.assistant.rendered a { color: var(--blue); text-decoration: none; }
-  .msg.assistant.rendered a:hover { text-decoration: underline; }
-  .msg.assistant.rendered hr { margin: 0.7em 0; border: none; border-top: 1px solid var(--border); }
-
-  .msg.assistant.rendered table {
-    margin: 0.45em 0; border-collapse: collapse; width: 100%;
-    font-size: 13px; border-radius: 6px; overflow: hidden;
-  }
-  .msg.assistant.rendered th,
-  .msg.assistant.rendered td {
-    padding: 6px 12px; border: 1px solid var(--border); text-align: left;
-  }
-  .msg.assistant.rendered th { background: var(--surface); font-weight: 650; color: var(--fg2); }
-  .msg.assistant.rendered td { background: var(--surface2); }
-
-  .msg.assistant.rendered :not(pre) > code {
-    background: rgba(109,179,242,0.1);
-    padding: 1.5px 6px; border-radius: 4px;
-    font-family: var(--mono); font-size: 0.88em;
-    color: var(--blue);
-  }
-
-  .msg.assistant.rendered pre {
-    margin: 0.5em 0; padding: 12px 15px; border-radius: var(--radius-sm);
-    background: #0a0d11; border: 1px solid var(--border);
-    overflow-x: auto; white-space: pre;
-  }
-  .msg.assistant.rendered pre code {
-    background: none; padding: 0;
-    font-family: var(--mono); font-size: 13px;
-    line-height: 1.5; color: var(--fg);
-  }
-
-  /* ── input bar ────────────────────────────────── */
-
-  footer {
-    padding: 12px 20px;
-    border-top: 1px solid var(--border);
-    flex-shrink: 0; display: flex; gap: 10px;
-    background: var(--surface);
-  }
-  footer textarea {
-    flex: 1;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 11px 16px;
-    color: var(--fg); font-size: 15px; outline: none;
-    font-family: var(--font);
-    transition: border-color 0.2s, box-shadow 0.2s;
-    resize: none;
-    min-height: 46px; max-height: 200px;
-    line-height: 1.55;
-  }
-  footer textarea:focus {
-    border-color: var(--blue);
-    box-shadow: 0 0 0 3px rgba(109,179,242,0.12);
-  }
-  footer textarea::placeholder { color: var(--dim2); }
-
-  footer button {
-    background: var(--blue);
-    color: #0a0d11; border: none; border-radius: var(--radius-sm);
-    padding: 11px 22px; font-weight: 650; font-size: 14px;
-    cursor: pointer;
-    transition: background 0.2s, opacity 0.2s, box-shadow 0.2s;
-    white-space: nowrap;
-  }
-  footer button:hover { background: #8bc7f6; }
-  footer button:active { opacity: 0.85; transform: scale(0.98); }
-  footer button:disabled { opacity: 0.35; cursor: default; pointer-events: none; }
-  footer button.cancel {
-    background: var(--red); color: #fff;
-  }
-  footer button.cancel:hover { background: #f87870; }
-
-  /* ── responsive ───────────────────────────────── */
-
-  @media (max-width: 700px) {
-    body {
-      max-width: 100%;
-      border-left: none; border-right: none;
-      box-shadow: none;
-    }
-    main { padding: 14px; gap: 10px; }
-    .msg { max-width: 88%; font-size: 14px; padding: 10px 14px; }
-    .msg.tool { max-width: 94%; }
-    .msg.result { max-width: 96%; }
-    header { padding: 10px 14px; }
-    footer { padding: 10px 14px; gap: 8px; }
-    footer textarea { font-size: 16px; }  /* prevent iOS zoom */
-    footer button { padding: 11px 16px; font-size: 14px; }
-  }
-
-  @media (max-width: 400px) {
-    main { padding: 10px; gap: 8px; }
-    .msg { max-width: 93%; font-size: 13.5px; padding: 9px 12px; }
-    header { padding: 8px 10px; }
-    footer { padding: 8px 10px; }
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <div class="dot" id="dot"></div>
-  <span class="title">goop</span>
-  <span class="status" id="status">connecting…</span>
-</header>
-
-<main id="log"></main>
-
-<footer>
-  <textarea id="input" placeholder="Ask anything…" autocomplete="off" autofocus rows="1"></textarea>
-  <button id="send" disabled>Send</button>
-</footer>
-
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
-<script>
-const log = document.getElementById('log');
-const input = document.getElementById('input');
-const sendBtn = document.getElementById('send');
-const dot = document.getElementById('dot');
-const statusEl = document.getElementById('status');
-
-let ws = null;
-let thinkingEl = null;
-let assistantEl = null;
-let buf = '';
-let running = false;  // true while the LLM is generating
-let lastToolEl = null;  // the most recent folded tool-call element
-
-function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-
-  ws.onopen = () => {
-    dot.classList.add('live');
-    statusEl.textContent = 'connected';
-    sendBtn.disabled = false;
-  };
-
-  ws.onclose = () => {
-    dot.classList.remove('live');
-    statusEl.textContent = 'reconnecting…';
-    sendBtn.disabled = true;
-    setTimeout(connect, 2000);
-  };
-
-  ws.onmessage = (e) => {
-    const evt = JSON.parse(e.data);
-    handle(evt);
-  };
-}
-
-function handle(evt) {
-  switch (evt.type) {
-    case 'UserPrompt':
-      append('user', evt.data.content);
-      scrollDown(true);  // always scroll — the user just sent this
-      return;
-
-    case 'Thinking':
-      if (!thinkingEl) {
-        thinkingEl = div('thinking', 'thinking…');
-        log.appendChild(thinkingEl);
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>goop</title>
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
       }
-      break;
 
-    case 'AssistantText':
-      removeThinking();
-      buf += evt.data;
-      // Update the current assistant message in real-time.
-      if (!assistantEl) {
-        assistantEl = div('assistant', buf);
-        log.appendChild(assistantEl);
-      } else {
-        assistantEl.textContent = buf;
+      :root {
+        --bg: #0c0e12;
+        --surface: #16191e;
+        --surface2: #1c2027;
+        --border: #2a2f38;
+        --border2: #363c47;
+        --dim: #7d8794;
+        --dim2: #5a6370;
+        --fg: #d2d7df;
+        --fg2: #e8ecf1;
+        --green: #6be07c;
+        --blue: #6db3f2;
+        --blue-dim: #3a7fc1;
+        --yellow: #e2b96f;
+        --red: #f2625a;
+        --red-dim: #a03a3a;
+        --cyan: #4dd4c0;
+        --purple: #b99aff;
+        --radius: 12px;
+        --radius-sm: 8px;
+        --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+        --mono:
+          "Cascadia Code", "JetBrains Mono", ui-monospace, "SF Mono",
+          "Fira Code", monospace;
       }
-      break;
 
-    case 'ToolCall': {
-      removeThinking();
-      flushBufWithEl();
-      const t = evt.data;
-      const el = document.createElement('div');
-      el.className = 'msg tool tool-call';
-      let html = '<div class="tool-header"><span class="arrow">▸</span><div class="info">';
-      html += `<div class="name">${esc(t.name)}</div>`;
-      if (t.arguments && typeof t.arguments === 'object') {
-        for (const [k, v] of Object.entries(t.arguments)) {
-          const val = typeof v === 'string' ? trunc(esc(v), 120) : trunc(esc(JSON.stringify(v)), 120);
-          html += `<div class="arg"><b>${esc(k)}:</b> ${val}</div>`;
+      html,
+      body {
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: var(--font);
+        font-size: 15px;
+        line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* ── layout ────────────────────────────────────── */
+
+      body {
+        display: flex;
+        flex-direction: column;
+        max-width: min(100%, 1100px);
+        margin: 0 auto;
+        border-left: 1px solid var(--border);
+        border-right: 1px solid var(--border);
+        box-shadow: 0 0 60px rgba(0, 0, 0, 0.35);
+      }
+
+      /* ── header ───────────────────────────────────── */
+
+      header {
+        padding: 11px 20px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-shrink: 0;
+        background: var(--surface);
+      }
+      header .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--dim2);
+        box-shadow: 0 0 6px rgba(125, 135, 148, 0.3);
+        transition:
+          background 0.3s,
+          box-shadow 0.3s;
+      }
+      header .dot.live {
+        background: var(--green);
+        box-shadow: 0 0 10px rgba(107, 224, 124, 0.5);
+      }
+      header .title {
+        font-weight: 650;
+        font-size: 15px;
+        letter-spacing: -0.2px;
+        color: var(--fg2);
+      }
+      header .status {
+        font-size: 12px;
+        color: var(--dim);
+        margin-left: auto;
+        transition: color 0.3s;
+        font-feature-settings: "ss02";
+      }
+
+      /* ── message list ─────────────────────────────── */
+
+      main {
+        flex: 1;
+        overflow-y: auto;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        scroll-behavior: smooth;
+        -webkit-overflow-scrolling: touch;
+        background:
+          radial-gradient(
+            ellipse at 50% 0%,
+            rgba(109, 179, 242, 0.02) 0%,
+            transparent 60%
+          ),
+          var(--bg);
+      }
+
+      .msg {
+        max-width: 78%;
+        padding: 11px 16px;
+        border-radius: var(--radius);
+        font-size: 14.5px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        word-break: break-word;
+        animation: fadeIn 0.2s ease;
+        position: relative;
+      }
+      @keyframes fadeIn {
+        from {
+          opacity: 0;
+          transform: translateY(6px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
         }
       }
-      html += '</div></div>';
-      html += '<div class="tool-body"></div>';
-      el.innerHTML = html;
-      // Toggle open/close on click.
-      el.querySelector('.tool-header').addEventListener('click', () => {
-        el.classList.toggle('open');
+
+      .msg.user {
+        align-self: flex-end;
+        background: var(--blue-dim);
+        color: #fff;
+        border-bottom-right-radius: 4px;
+        font-weight: 450;
+      }
+
+      .msg.assistant {
+        align-self: flex-start;
+        background: var(--surface2);
+        border-bottom-left-radius: 4px;
+        border: 1px solid var(--border);
+      }
+
+      .msg.thinking {
+        align-self: flex-start;
+        color: var(--dim);
+        font-style: italic;
+        font-size: 13px;
+        background: none;
+        padding: 3px 18px;
+        opacity: 0.8;
+      }
+      .msg.thinking::before {
+        content: "";
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--dim);
+        margin-right: 8px;
+        vertical-align: middle;
+        animation: pulse 1s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 0.3;
+        }
+        50% {
+          opacity: 1;
+        }
+      }
+
+      .msg.tool {
+        align-self: flex-start;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--cyan);
+        font-family: var(--mono);
+        font-size: 13px;
+        max-width: 85%;
+        cursor: pointer;
+        user-select: none;
+        transition: border-color 0.2s;
+      }
+      .msg.tool:hover {
+        border-color: var(--cyan);
+      }
+      .msg.tool .tool-header {
+        padding: 9px 14px;
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+      }
+      .msg.tool .tool-header .arrow {
+        color: var(--cyan);
+        font-size: 13px;
+        line-height: 1.4;
+        transition: transform 0.2s;
+        flex-shrink: 0;
+      }
+      .msg.tool.open .tool-header .arrow {
+        transform: rotate(90deg);
+      }
+      .msg.tool .tool-header .info {
+        flex: 1;
+        min-width: 0;
+      }
+      .msg.tool .name {
+        color: var(--cyan);
+        font-weight: 650;
+        font-size: 13.5px;
+        margin-bottom: 2px;
+      }
+      .msg.tool .arg {
+        color: var(--dim);
+        margin: 2px 0;
+      }
+      .msg.tool .arg b {
+        color: var(--fg);
+        font-weight: 550;
+      }
+      .msg.tool .tool-body {
+        display: none;
+        border-top: 1px solid var(--border);
+        padding: 9px 14px;
+        color: var(--dim);
+        font-size: 12.5px;
+        font-family: var(--mono);
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 220px;
+        overflow-y: auto;
+      }
+      .msg.tool.open .tool-body {
+        display: block;
+      }
+
+      .msg.result {
+        align-self: flex-start;
+        color: var(--dim);
+        font-size: 12.5px;
+        font-family: var(--mono);
+        background: var(--surface);
+        border: 1px solid var(--border);
+        padding: 9px 14px;
+        max-height: 180px;
+        overflow-y: auto;
+        max-width: 90%;
+        border-radius: var(--radius-sm);
+      }
+
+      .msg.error {
+        align-self: flex-start;
+        color: var(--red);
+        background: rgba(242, 98, 90, 0.08);
+        border: 1px solid rgba(242, 98, 90, 0.18);
+        font-weight: 480;
+      }
+
+      .msg.final {
+        align-self: center;
+        color: var(--dim2);
+        font-size: 11px;
+        background: none;
+        padding: 2px 0;
+        letter-spacing: 0.4px;
+      }
+
+      /* ── rendered markdown ────────────────────────── */
+
+      .msg.assistant.rendered {
+        white-space: normal;
+      }
+
+      .msg.assistant.rendered h1,
+      .msg.assistant.rendered h2,
+      .msg.assistant.rendered h3,
+      .msg.assistant.rendered h4 {
+        margin: 0.7em 0 0.35em;
+        font-weight: 650;
+        line-height: 1.3;
+        color: var(--fg2);
+      }
+      .msg.assistant.rendered h1 {
+        font-size: 1.35em;
+      }
+      .msg.assistant.rendered h2 {
+        font-size: 1.18em;
+        padding-bottom: 0.2em;
+        border-bottom: 1px solid var(--border);
+      }
+      .msg.assistant.rendered h3 {
+        font-size: 1.06em;
+      }
+      .msg.assistant.rendered h4 {
+        font-size: 0.95em;
+        color: var(--dim);
+      }
+
+      .msg.assistant.rendered p {
+        margin: 0.45em 0;
+      }
+      .msg.assistant.rendered p:first-child {
+        margin-top: 0;
+      }
+      .msg.assistant.rendered p:last-child {
+        margin-bottom: 0;
+      }
+
+      .msg.assistant.rendered ul,
+      .msg.assistant.rendered ol {
+        margin: 0.35em 0;
+        padding-left: 1.6em;
+      }
+      .msg.assistant.rendered li {
+        margin: 0.18em 0;
+      }
+
+      .msg.assistant.rendered blockquote {
+        margin: 0.45em 0;
+        padding: 3px 12px;
+        border-left: 3px solid var(--cyan);
+        color: var(--dim);
+        background: rgba(77, 212, 192, 0.04);
+        border-radius: 0 6px 6px 0;
+      }
+      .msg.assistant.rendered a {
+        color: var(--blue);
+        text-decoration: none;
+      }
+      .msg.assistant.rendered a:hover {
+        text-decoration: underline;
+      }
+      .msg.assistant.rendered hr {
+        margin: 0.7em 0;
+        border: none;
+        border-top: 1px solid var(--border);
+      }
+
+      .msg.assistant.rendered table {
+        margin: 0.45em 0;
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 13px;
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      .msg.assistant.rendered th,
+      .msg.assistant.rendered td {
+        padding: 6px 12px;
+        border: 1px solid var(--border);
+        text-align: left;
+      }
+      .msg.assistant.rendered th {
+        background: var(--surface);
+        font-weight: 650;
+        color: var(--fg2);
+      }
+      .msg.assistant.rendered td {
+        background: var(--surface2);
+      }
+
+      .msg.assistant.rendered :not(pre) > code {
+        background: rgba(109, 179, 242, 0.1);
+        padding: 1.5px 6px;
+        border-radius: 4px;
+        font-family: var(--mono);
+        font-size: 0.88em;
+        color: var(--blue);
+      }
+
+      .msg.assistant.rendered pre {
+        margin: 0.5em 0;
+        padding: 12px 15px;
+        border-radius: var(--radius-sm);
+        background: #0a0d11;
+        border: 1px solid var(--border);
+        overflow-x: auto;
+        white-space: pre;
+      }
+      .msg.assistant.rendered pre code {
+        background: none;
+        padding: 0;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.5;
+        color: var(--fg);
+      }
+
+      /* ── input bar ────────────────────────────────── */
+
+      footer {
+        padding: 12px 20px;
+        border-top: 1px solid var(--border);
+        flex-shrink: 0;
+        display: flex;
+        gap: 10px;
+        background: var(--surface);
+      }
+      footer textarea {
+        flex: 1;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: 11px 16px;
+        color: var(--fg);
+        font-size: 15px;
+        outline: none;
+        font-family: var(--font);
+        transition:
+          border-color 0.2s,
+          box-shadow 0.2s;
+        resize: none;
+        min-height: 46px;
+        max-height: 200px;
+        line-height: 1.55;
+      }
+      footer textarea:focus {
+        border-color: var(--blue);
+        box-shadow: 0 0 0 3px rgba(109, 179, 242, 0.12);
+      }
+      footer textarea::placeholder {
+        color: var(--dim2);
+      }
+
+      footer button {
+        background: var(--blue);
+        color: #0a0d11;
+        border: none;
+        border-radius: var(--radius-sm);
+        padding: 11px 22px;
+        font-weight: 650;
+        font-size: 14px;
+        cursor: pointer;
+        transition:
+          background 0.2s,
+          opacity 0.2s,
+          box-shadow 0.2s;
+        white-space: nowrap;
+      }
+      footer button:hover {
+        background: #8bc7f6;
+      }
+      footer button:active {
+        opacity: 0.85;
+        transform: scale(0.98);
+      }
+      footer button:disabled {
+        opacity: 0.35;
+        cursor: default;
+        pointer-events: none;
+      }
+      footer button.cancel {
+        background: var(--red);
+        color: #fff;
+      }
+      footer button.cancel:hover {
+        background: #f87870;
+      }
+
+      /* ── responsive ───────────────────────────────── */
+
+      @media (max-width: 700px) {
+        body {
+          max-width: 100%;
+          border-left: none;
+          border-right: none;
+          box-shadow: none;
+        }
+        main {
+          padding: 14px;
+          gap: 10px;
+        }
+        .msg {
+          max-width: 88%;
+          font-size: 14px;
+          padding: 10px 14px;
+        }
+        .msg.tool {
+          max-width: 94%;
+        }
+        .msg.result {
+          max-width: 96%;
+        }
+        header {
+          padding: 10px 14px;
+        }
+        footer {
+          padding: 10px 14px;
+          gap: 8px;
+        }
+        footer textarea {
+          font-size: 16px;
+        } /* prevent iOS zoom */
+        footer button {
+          padding: 11px 16px;
+          font-size: 14px;
+        }
+      }
+
+      @media (max-width: 400px) {
+        main {
+          padding: 10px;
+          gap: 8px;
+        }
+        .msg {
+          max-width: 93%;
+          font-size: 13.5px;
+          padding: 9px 12px;
+        }
+        header {
+          padding: 8px 10px;
+        }
+        footer {
+          padding: 8px 10px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="dot" id="dot"></div>
+      <span class="title">goop</span>
+      <span class="status" id="status">connecting…</span>
+    </header>
+
+    <main id="log"></main>
+
+    <footer>
+      <textarea
+        id="input"
+        placeholder="Ask anything…"
+        autocomplete="off"
+        autofocus
+        rows="1"
+      ></textarea>
+      <button id="send" disabled>Send</button>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+    <script>
+      const log = document.getElementById("log");
+      const input = document.getElementById("input");
+      const sendBtn = document.getElementById("send");
+      const dot = document.getElementById("dot");
+      const statusEl = document.getElementById("status");
+
+      let ws = null;
+      let thinkingEl = null;
+      let assistantEl = null;
+      let buf = "";
+      let running = false; // true while the LLM is generating
+      let lastToolEl = null; // the most recent folded tool-call element
+
+      function connect() {
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+        ws.onopen = () => {
+          dot.classList.add("live");
+          statusEl.textContent = "connected";
+          sendBtn.disabled = false;
+        };
+
+        ws.onclose = () => {
+          dot.classList.remove("live");
+          statusEl.textContent = "reconnecting…";
+          sendBtn.disabled = true;
+          setTimeout(connect, 2000);
+        };
+
+        ws.onmessage = (e) => {
+          const evt = JSON.parse(e.data);
+          handle(evt);
+        };
+      }
+
+      function handle(evt) {
+        switch (evt.type) {
+          case "UserPrompt":
+            append("user", evt.data.content);
+            scrollDown(true); // always scroll — the user just sent this
+            return;
+
+          case "Thinking":
+            if (!thinkingEl) {
+              thinkingEl = div("thinking", "thinking…");
+              log.appendChild(thinkingEl);
+            }
+            break;
+
+          case "AssistantText":
+            removeThinking();
+            buf += evt.data;
+            // Update the current assistant message in real-time.
+            if (!assistantEl) {
+              assistantEl = div("assistant", buf);
+              log.appendChild(assistantEl);
+            } else {
+              assistantEl.textContent = buf;
+            }
+            break;
+
+          case "ToolCall": {
+            removeThinking();
+            flushBufWithEl();
+            const t = evt.data;
+            const el = document.createElement("div");
+            el.className = "msg tool tool-call";
+            let html =
+              '<div class="tool-header"><span class="arrow">▸</span><div class="info">';
+            html += `<div class="name">${esc(t.name)}</div>`;
+            if (t.arguments && typeof t.arguments === "object") {
+              for (const [k, v] of Object.entries(t.arguments)) {
+                const val =
+                  typeof v === "string"
+                    ? trunc(esc(v), 120)
+                    : trunc(esc(JSON.stringify(v)), 120);
+                html += `<div class="arg"><b>${esc(k)}:</b> ${val}</div>`;
+              }
+            }
+            html += "</div></div>";
+            html += '<div class="tool-body"></div>';
+            el.innerHTML = html;
+            // Toggle open/close on click.
+            el.querySelector(".tool-header").addEventListener("click", () => {
+              el.classList.toggle("open");
+              scrollDown();
+            });
+            log.appendChild(el);
+            lastToolEl = el;
+            break;
+          }
+
+          case "ToolResult": {
+            flushBufWithEl();
+            if (evt.data.content && lastToolEl) {
+              const body = lastToolEl.querySelector(".tool-body");
+              if (body) {
+                body.textContent = trunc(evt.data.content, 500);
+              }
+              lastToolEl = null;
+            }
+            break;
+          }
+
+          case "FinalResponse":
+            removeThinking();
+            if (assistantEl) {
+              const raw = assistantEl.textContent;
+              assistantEl.innerHTML = DOMPurify.sanitize(marked.parse(raw));
+              assistantEl.classList.add("rendered");
+            }
+            flushBufWithEl();
+            append("final", "—");
+            setRunning(false);
+            break;
+
+          case "Error":
+            removeThinking();
+            flushBufWithEl();
+            append("error", evt.data);
+            setRunning(false);
+            break;
+
+          case "Cancelled":
+            removeThinking();
+            flushBufWithEl();
+            append("final", "cancelled");
+            setRunning(false);
+            break;
+        }
+        scrollDown();
+      }
+
+      function flushBufWithEl() {
+        // The assistantEl already has the full text; just finalize pointer.
+        assistantEl = null;
+        buf = "";
+      }
+
+      function removeThinking() {
+        if (thinkingEl) {
+          thinkingEl.remove();
+          thinkingEl = null;
+        }
+      }
+
+      function append(cls, text) {
+        const el = div(cls, text);
+        log.appendChild(el);
+        assistantEl = cls === "assistant" ? el : assistantEl;
+      }
+
+      function appendRaw(cls, html) {
+        const el = document.createElement("div");
+        el.className = "msg " + cls;
+        el.innerHTML = html;
+        log.appendChild(el);
+      }
+
+      function div(cls, text) {
+        const el = document.createElement("div");
+        el.className = "msg " + cls;
+        el.textContent = text;
+        return el;
+      }
+
+      function esc(s) {
+        const d = document.createElement("div");
+        d.textContent = s;
+        return d.innerHTML;
+      }
+
+      function trunc(s, n) {
+        return s.length > n ? s.slice(0, n - 1) + "…" : s;
+      }
+
+      function scrollDown(force) {
+        requestAnimationFrame(() => {
+          // Only auto-scroll if the user is already near the bottom.
+          // A threshold of 50 px lets the user scroll up slightly without
+          // being yanked back — the same behaviour as most terminals.
+          const threshold = 50;
+          const atBottom =
+            log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
+          if (force || atBottom) {
+            log.scrollTop = log.scrollHeight;
+          }
+        });
+      }
+
+      // ── input ────────────────────────────────────
+
+      // Auto-resize textarea as the user types.
+      input.addEventListener("input", () => {
+        input.style.height = "auto";
+        input.style.height = Math.min(input.scrollHeight, 200) + "px";
       });
-      log.appendChild(el);
-      lastToolEl = el;
-      break;
-    }
 
-    case 'ToolResult': {
-      flushBufWithEl();
-      if (evt.data.content && lastToolEl) {
-        const body = lastToolEl.querySelector('.tool-body');
-        if (body) {
-          body.textContent = trunc(evt.data.content, 500);
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          doSend();
         }
-        lastToolEl = null;
+      });
+
+      sendBtn.addEventListener("click", doSend);
+
+      function setRunning(v) {
+        running = v;
+        if (v) {
+          sendBtn.textContent = "Cancel";
+          sendBtn.classList.add("cancel");
+        } else {
+          sendBtn.textContent = "Send";
+          sendBtn.classList.remove("cancel");
+        }
       }
-      break;
-    }
 
-    case 'FinalResponse':
-      removeThinking();
-      if (assistantEl) {
-        const raw = assistantEl.textContent;
-        assistantEl.innerHTML = DOMPurify.sanitize(marked.parse(raw));
-        assistantEl.classList.add('rendered');
+      function doSend() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        if (running) {
+          // Cancel the running LLM.
+          ws.send(JSON.stringify({ type: "cancel" }));
+          return;
+        }
+
+        const text = input.value.trim();
+        if (!text) return;
+        ws.send(JSON.stringify({ type: "prompt", content: text }));
+        input.value = "";
+        input.style.height = "auto";
+        input.focus();
+        setRunning(true);
       }
-      flushBufWithEl();
-      append('final', '—');
-      setRunning(false);
-      break;
 
-    case 'Error':
-      removeThinking();
-      flushBufWithEl();
-      append('error', evt.data);
-      setRunning(false);
-      break;
+      // ── start ────────────────────────────────────
 
-    case 'Cancelled':
-      removeThinking();
-      flushBufWithEl();
-      append('final', 'cancelled');
-      setRunning(false);
-      break;
-  }
-  scrollDown();
-}
-
-function flushBufWithEl() {
-  // The assistantEl already has the full text; just finalize pointer.
-  assistantEl = null;
-  buf = '';
-}
-
-function removeThinking() {
-  if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
-}
-
-function append(cls, text) {
-  const el = div(cls, text);
-  log.appendChild(el);
-  assistantEl = cls === 'assistant' ? el : assistantEl;
-}
-
-function appendRaw(cls, html) {
-  const el = document.createElement('div');
-  el.className = 'msg ' + cls;
-  el.innerHTML = html;
-  log.appendChild(el);
-}
-
-function div(cls, text) {
-  const el = document.createElement('div');
-  el.className = 'msg ' + cls;
-  el.textContent = text;
-  return el;
-}
-
-function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-function trunc(s, n) {
-  return s.length > n ? s.slice(0, n - 1) + '…' : s;
-}
-
-function scrollDown(force) {
-  requestAnimationFrame(() => {
-    // Only auto-scroll if the user is already near the bottom.
-    // A threshold of 50 px lets the user scroll up slightly without
-    // being yanked back — the same behaviour as most terminals.
-    const threshold = 50;
-    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
-    if (force || atBottom) {
-      log.scrollTop = log.scrollHeight;
-    }
-  });
-}
-
-// ── input ────────────────────────────────────
-
-// Auto-resize textarea as the user types.
-input.addEventListener('input', () => {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 200) + 'px';
-});
-
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    doSend();
-  }
-});
-
-sendBtn.addEventListener('click', doSend);
-
-function setRunning(v) {
-  running = v;
-  if (v) {
-    sendBtn.textContent = 'Cancel';
-    sendBtn.classList.add('cancel');
-  } else {
-    sendBtn.textContent = 'Send';
-    sendBtn.classList.remove('cancel');
-  }
-}
-
-function doSend() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-  if (running) {
-    // Cancel the running LLM.
-    ws.send(JSON.stringify({ type: 'cancel' }));
-    return;
-  }
-
-  const text = input.value.trim();
-  if (!text) return;
-  ws.send(JSON.stringify({ type: 'prompt', content: text }));
-  input.value = '';
-  input.style.height = 'auto';
-  input.focus();
-  setRunning(true);
-}
-
-// ── start ────────────────────────────────────
-
-connect();
-</script>
-</body>
+      connect();
+    </script>
+  </body>
 </html>

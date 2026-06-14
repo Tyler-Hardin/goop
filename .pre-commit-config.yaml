@@ -14,3 +14,10 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+
+      - id: prettier
+        name: prettier
+        entry: prettier --check
+        language: node
+        types_or: [html, css, json]
+        additional_dependencies: [prettier]
