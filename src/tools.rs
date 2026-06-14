@@ -1,6 +1,49 @@
 use rig_derive::rig_tool;
 
 #[rig_tool(
+    description = "Read file at path, optionally with start_line and end_line (both 1-indexed, inclusive). Returns line-numbered content.",
+    required(command)
+)]
+pub async fn read(
+    path: std::path::PathBuf,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+) -> Result<String, rig::tool::ToolError> {
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+
+    let all_lines: Vec<&str> = content.lines().collect();
+    let total = all_lines.len() as u64;
+
+    let start = start_line.unwrap_or(1).max(1);
+    let end = end_line.unwrap_or(total).min(total);
+
+    if start > total {
+        return Err(rig::tool::ToolError::ToolCallError(Box::new(
+            std::io::Error::other(format!(
+                "start_line {start} exceeds file length ({total} lines)"
+            )),
+        )));
+    }
+
+    if start > end {
+        return Err(rig::tool::ToolError::ToolCallError(Box::new(
+            std::io::Error::other(format!("start_line {start} > end_line {end}")),
+        )));
+    }
+
+    let output: String = all_lines[(start - 1) as usize..end as usize]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>6}\t{}", start as usize + i, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(output)
+}
+
+#[rig_tool(
     description = "Replace old_str with new_str in file at path. old_str must be unique.",
     required(command)
 )]

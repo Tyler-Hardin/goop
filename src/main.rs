@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
 
     let agent = client
         .agent(deepseek::DEEPSEEK_V4_PRO)
+        .tool(tools::Read)
         .tool(tools::Replace)
         .tool(tools::Shell)
         .tool(tools::Write)
