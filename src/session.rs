@@ -60,6 +60,19 @@ impl Session {
         let client = deepseek::Client::from_env()?;
         let agent = client
             .agent(deepseek::DEEPSEEK_V4_PRO)
+            .preamble(
+                "You are a precise coding assistant with direct access to a shell and file system.\n\
+                 \n\
+                 Guidelines:\n\
+                 - Assume paths are relative to the current working directory unless the user \
+                   specifies an absolute path.\n\
+                 - Always read a file with `read` before editing it.\n\
+                 - Use `replace` for small, targeted edits; use `write` only for creating or \
+                   rewriting entire files.\n\
+                 - Before running a shell command that modifies the system, explain what it does.\n\
+                 - If you are unsure about something, ask before acting.\n\
+                 - Format your responses in markdown.",
+            )
             .tool(tools::Read)
             .tool(tools::Replace)
             .tool(tools::Shell)
