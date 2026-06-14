@@ -1,7 +1,6 @@
 mod tools;
 
 use futures::StreamExt;
-use mdstream::{BlockKind, MdStream, Options};
 use rig::client::{CompletionClient, ProviderClient};
 use rig::memory::InMemoryConversationMemory;
 use rig::providers::deepseek;
@@ -9,13 +8,13 @@ use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::sync::Arc;
+use streamdown_parser::Parser;
+use streamdown_render::Renderer;
 use tokio::io::AsyncWriteExt as _;
 
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
-const CYAN: &str = "\x1b[36m";
-const BLUE_BG: &str = "\x1b[44m";
 const RST: &str = "\x1b[0m";
 
 /// Wipe the current line and reset cursor to column 0.
@@ -25,93 +24,17 @@ async fn wipe_line() {
     stdout.flush().await.unwrap();
 }
 
-/// Render a single committed markdown block to stdout.
-async fn render_block(block: &mdstream::Block) {
-    let mut stdout = tokio::io::stdout();
-    let text = block.display_or_raw();
-
-    match block.kind {
-        BlockKind::Heading => {
-            stdout
-                .write_all(format!("\n{BOLD}{CYAN}{text}{RST}").as_bytes())
-                .await
-                .unwrap();
-        }
-        BlockKind::CodeFence => {
-            let mut lines = text.lines();
-            if let Some(header) = lines.next() {
-                stdout
-                    .write_all(format!("{DIM}{header}{RST}\n").as_bytes())
-                    .await
-                    .unwrap();
-            }
-            for line in lines {
-                stdout
-                    .write_all(format!("{BLUE_BG}{DIM} {line}{RST}\n").as_bytes())
-                    .await
-                    .unwrap();
-            }
-        }
-        BlockKind::BlockQuote => {
-            for line in text.lines() {
-                stdout
-                    .write_all(format!("{DIM}  {line}{RST}\n").as_bytes())
-                    .await
-                    .unwrap();
-            }
-        }
-        BlockKind::ThematicBreak => {
-            stdout
-                .write_all(format!("{DIM}───{RST}\n").as_bytes())
-                .await
-                .unwrap();
-        }
-        BlockKind::List => {
-            for line in text.lines() {
-                stdout
-                    .write_all(format!("  {line}\n").as_bytes())
-                    .await
-                    .unwrap();
-            }
-        }
-        BlockKind::Table => {
-            for line in text.lines() {
-                if line.contains("──") || line.contains("| -") || line.starts_with("|-") {
-                    stdout
-                        .write_all(format!("{DIM}{line}{RST}\n").as_bytes())
-                        .await
-                        .unwrap();
-                } else {
-                    stdout
-                        .write_all(format!("{line}\n").as_bytes())
-                        .await
-                        .unwrap();
-                }
-            }
-        }
-        _ => {
-            // Paragraph, HtmlBlock, MathBlock, FootnoteDefinition, Unknown.
-            // The raw text typically ends with its own newline(s); don't add extra.
-            stdout.write_all(text.as_bytes()).await.unwrap();
-            if !text.ends_with('\n') {
-                stdout.write_all(b"\n").await.unwrap();
-            }
-        }
-    }
-    stdout.flush().await.unwrap();
-}
-
-/// Show a single-line pending preview. Always terminated by \r\x1b[K so the
-/// next render_block / status line can overwrite it cleanly.
+/// Show a single-line pending preview.  Always terminated by \r\x1b[K so the
+/// next render / status line can overwrite it cleanly.
 async fn show_pending(raw: &str) {
     let first_line = raw.lines().next().unwrap_or("");
-    let preview = if first_line.len() > 120 {
-        format!("{}…", &first_line[..117])
+    let preview = if first_line.chars().count() > 120 {
+        let head: String = first_line.chars().take(117).collect();
+        format!("{head}…")
     } else {
         first_line.to_string()
     };
     let mut stdout = tokio::io::stdout();
-    // Wipe whatever was on this line (old pending / "thinking…") then print.
     stdout.write_all(b"\r\x1b[K").await.unwrap();
     if !preview.is_empty() {
         stdout
@@ -164,7 +87,7 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
 
 /// Which phase of the streaming loop we are in.
 enum Phase {
-    /// "thinking…" is on screen; no markdown blocks emitted yet this turn.
+    /// "thinking…" is on screen; no markdown emitted yet this turn.
     Thinking,
     /// A markdown pending preview is on the current line (dim).
     Preview,
@@ -205,6 +128,8 @@ async fn main() -> anyhow::Result<()> {
         stdout.flush().await?;
     }
 
+    let term_width = streamdown_render::terminal_width();
+
     loop {
         match rl.readline("\x1b[1;33m»\x1b[0m ") {
             Ok(line) => {
@@ -217,15 +142,20 @@ async fn main() -> anyhow::Result<()> {
                 let agent = agent.clone();
                 let prompt = trimmed.to_string();
 
-                let mut md_stream = MdStream::new(Options::default());
+                // ---- per-turn parser & renderer ----
+                let mut parser = Parser::new();
+                let mut renderer = Renderer::new(std::io::stdout(), term_width);
+                let mut line_buf = String::new();
                 let mut phase = Phase::Thinking;
 
                 // Print initial "thinking…" indicator.
-                let mut stdout = tokio::io::stdout();
-                stdout
-                    .write_all(format!("{DIM}thinking…{RST}").as_bytes())
-                    .await?;
-                stdout.flush().await?;
+                {
+                    let mut stdout = tokio::io::stdout();
+                    stdout
+                        .write_all(format!("{DIM}thinking…{RST}").as_bytes())
+                        .await?;
+                    stdout.flush().await?;
+                }
 
                 let mut stream = agent.stream_prompt(&prompt).await;
 
@@ -234,36 +164,48 @@ async fn main() -> anyhow::Result<()> {
                         Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                             StreamedAssistantContent::Text(text),
                         )) => {
-                            let update = md_stream.append(&text.text);
+                            line_buf.push_str(&text.text);
 
-                            // Render any newly-committed blocks.
-                            if !update.committed.is_empty() {
-                                // Wipe the current line (old pending preview or "thinking…").
-                                wipe_line().await;
-                                for block in &update.committed {
-                                    render_block(block).await;
+                            // Process every complete line through parser + renderer.
+                            while let Some(pos) = line_buf.find('\n') {
+                                let complete = line_buf[..pos].to_string();
+                                line_buf = line_buf[pos + 1..].to_string();
+
+                                // Wipe thinking / preview line before first output.
+                                if matches!(phase, Phase::Thinking | Phase::Preview) {
+                                    wipe_line().await;
                                 }
+
+                                let events = parser.parse_line(&complete);
+                                for event in &events {
+                                    renderer.render_event(event).unwrap();
+                                }
+
+                                phase = Phase::Preview;
                             }
 
-                            // Show the new pending block (single-line dim preview).
-                            if let Some(ref pending) = update.pending {
-                                show_pending(pending.display_or_raw()).await;
+                            // Show the incomplete trailing line as a dim preview.
+                            if !line_buf.is_empty() {
+                                show_pending(&line_buf).await;
                                 phase = Phase::Preview;
                             }
                         }
                         Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                             StreamedAssistantContent::ToolCall { tool_call, .. },
                         )) => {
-                            // Wipe current line then finalize any pending markdown.
+                            // Wipe current line, finalize any open parser state.
                             wipe_line().await;
-                            let final_update = md_stream.finalize();
-                            for block in &final_update.committed {
-                                render_block(block).await;
+                            let events = parser.finalize();
+                            for event in &events {
+                                renderer.render_event(event).unwrap();
                             }
 
-                            // Reset markdown parser.
-                            md_stream = MdStream::new(Options::default());
+                            // Reset for next assistant turn.
+                            parser = Parser::new();
+                            renderer = Renderer::new(std::io::stdout(), term_width);
+                            line_buf.clear();
 
+                            // Display the tool call prettily.
                             let args_str = tool_call.function.arguments.to_string();
                             tool_header(&tool_call.function.name).await;
 
@@ -316,15 +258,24 @@ async fn main() -> anyhow::Result<()> {
                             phase = Phase::Thinking;
                         }
                         Ok(rig::agent::MultiTurnStreamItem::FinalResponse(_response)) => {
-                            // Wipe current line, finalize, render, done.
+                            // Wipe current line.
                             wipe_line().await;
-                            let final_update = md_stream.finalize();
-                            for block in &final_update.committed {
-                                render_block(block).await;
+
+                            // Parse any remaining partial line.
+                            if !line_buf.is_empty() {
+                                let events = parser.parse_line(&line_buf);
+                                for event in &events {
+                                    renderer.render_event(event).unwrap();
+                                }
+                                line_buf.clear();
                             }
-                            if let Some(ref pending) = final_update.pending {
-                                render_block(pending).await;
+                            // Finalize parser.
+                            let events = parser.finalize();
+                            for event in &events {
+                                renderer.render_event(event).unwrap();
                             }
+
+                            // Trailing blank line.
                             let mut stdout = tokio::io::stdout();
                             stdout.write_all(b"\n").await?;
                             stdout.flush().await?;
@@ -344,16 +295,20 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // If the loop ended without FinalResponse, flush whatever is left.
-                // Only do this if we're still in Thinking or Preview phase (not error/tool).
                 match phase {
                     Phase::Thinking | Phase::Preview => {
                         wipe_line().await;
-                        let final_update = md_stream.finalize();
-                        for block in &final_update.committed {
-                            render_block(block).await;
+                        // Parse any remaining partial line.
+                        if !line_buf.is_empty() {
+                            let events = parser.parse_line(&line_buf);
+                            for event in &events {
+                                renderer.render_event(event).unwrap();
+                            }
                         }
-                        if let Some(ref pending) = final_update.pending {
-                            render_block(pending).await;
+                        // Finalize.
+                        let events = parser.finalize();
+                        for event in &events {
+                            renderer.render_event(event).unwrap();
                         }
                         let mut stdout = tokio::io::stdout();
                         stdout.write_all(b"\n").await?;
