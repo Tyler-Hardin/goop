@@ -576,7 +576,8 @@
 
       function connect() {
         const proto = location.protocol === "https:" ? "wss" : "ws";
-        ws = new WebSocket(`${proto}://${location.host}/ws`);
+        const host = location.host || "127.0.0.1:8187";
+        ws = new WebSocket(`${proto}://${host}/ws`);
 
         ws.onopen = () => {
           dot.classList.add("live");

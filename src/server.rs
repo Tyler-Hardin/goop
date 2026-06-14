@@ -13,16 +13,20 @@ use crate::session::Session;
 
 const PAGE: &str = include_str!("../assets/index.html");
 
+/// Build the axum router (exposed so GUI mode can bind the listener
+/// synchronously before opening the webview).
+pub fn build_router(session: Arc<Session>) -> Router {
+    let state = Arc::new(ServerState { session });
+    Router::new()
+        .route("/", get(index))
+        .route("/ws", get(ws_handler))
+        .with_state(state)
+}
+
 /// Launch the axum HTTP + WebSocket server.
 /// Binds to 127.0.0.1:8187 — safe behind an nginx reverse proxy.
 pub async fn serve(session: Arc<Session>) -> anyhow::Result<()> {
-    let state = Arc::new(ServerState { session });
-
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/ws", get(ws_handler))
-        .with_state(state);
-
+    let app = build_router(session);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8187").await?;
     tracing::info!("web server on http://127.0.0.1:8187");
     axum::serve(listener, app).await?;
@@ -48,13 +52,18 @@ async fn ws_handler(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
 ) -> Response {
-    // Only allow requests whose Origin matches the Host we're proxied behind.
+    // Only allow requests whose Origin matches the Host we're proxied behind,
+    // or whose origin is null (GUI webview with `with_html`).
     // When nginx proxies, the browser sends Origin = https://your.domain,
     // and nginx forwards Host = your.domain.  We check they agree.
     if let (Some(origin), Some(host)) = (
         headers.get("origin").and_then(|v| v.to_str().ok()),
         headers.get("host").and_then(|v| v.to_str().ok()),
     ) {
+        // Allow null origin (e.g. webview loaded via with_html).
+        if origin == "null" {
+            return ws.on_upgrade(move |socket| handle_socket(socket, state));
+        }
         // Strip scheme from origin for comparison (origin = "https://foo.com", host = "foo.com")
         let origin_host = origin
             .trim_start_matches("https://")

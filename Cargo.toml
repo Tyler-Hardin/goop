@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = "0.12"
+clap = { version = "4.6.1", features = ["derive"] }
 futures = "0.3"
 rig = { version = "0.38", features = ["derive"] }
 rig-derive = "0.38"
@@ -16,6 +17,8 @@ serde_json = "1.0"
 streamdown-parser = "0.1"
 streamdown-render = "0.1"
 subprocess = "1.1"
+tao = { version = "0.35.3", default-features = false, features = ["x11", "rwh_06"] }
 tokio = { version = "1.52", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wry = "0.55.1"
