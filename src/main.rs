@@ -5,8 +5,8 @@ use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use rig_derive::rig_tool;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use std::io::Write as _;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt as _;
 
 #[rig_tool(
     description = "Replace old_str with new_str in file at path. old_str must be unique.",
@@ -17,7 +17,8 @@ async fn replace(
     old_str: String,
     new_str: String,
 ) -> Result<String, rig::tool::ToolError> {
-    let content = std::fs::read_to_string(&path)
+    let content = tokio::fs::read_to_string(&path)
+        .await
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
     let count = content.matches(&old_str).count();
     if count == 0 {
@@ -33,7 +34,8 @@ async fn replace(
         )))
     } else {
         let new_content = content.replacen(&old_str, &new_str, 1);
-        std::fs::write(&path, &new_content)
+        tokio::fs::write(&path, &new_content)
+            .await
             .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
         Ok(format!("Replaced 1 occurrence in {}", path.display()))
     }
@@ -44,13 +46,16 @@ async fn replace(
     required(command)
 )]
 async fn shell(command: String) -> Result<String, rig::tool::ToolError> {
-    subprocess::Exec::shell(&command)
-        .capture()
+    tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .output()
+        .await
         .map(|out| {
-            let stdout = out.stdout_str();
-            let stderr = out.stderr_str();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
             if stderr.is_empty() {
-                stdout
+                stdout.into_owned()
             } else {
                 format!("{stdout}{stderr}")
             }
@@ -66,7 +71,8 @@ async fn write(
     path: std::path::PathBuf,
     content: String,
 ) -> Result<String, rig::tool::ToolError> {
-    std::fs::write(&path, &content)
+    tokio::fs::write(&path, &content)
+        .await
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
     Ok(format!("Wrote {} bytes to {}", content.len(), path.display()))
 }
@@ -76,24 +82,42 @@ const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
 const RST: &str = "\x1b[0m";
 
-fn print_thinking() {
-    print!("{DIM}thinking…{RST}");
-    let _ = std::io::stdout().flush();
+async fn print_thinking() {
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(format!("{DIM}thinking…{RST}").as_bytes()).await.unwrap();
+    stdout.flush().await.unwrap();
 }
 
-fn clear_thinking() {
-    print!("\r\x1b[K");
+async fn clear_thinking() {
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(b"\r\x1b[K").await.unwrap();
+    stdout.flush().await.unwrap();
 }
 
-fn tool_header(name: &str) {
-    println!(
-        "{DIM}  ────────────────────────────────────────{RST}\n\
-         {BOLD}  ▸ {name}{RST}"
-    );
+async fn tool_header(name: &str) {
+    let mut stdout = tokio::io::stdout();
+    stdout
+        .write_all(
+            format!(
+                "{DIM}  ────────────────────────────────────────{RST}\n\
+                 {BOLD}  ▸ {name}{RST}\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stdout.flush().await.unwrap();
 }
 
-fn tool_arg(key: &str, value: &str) {
-    println!("    {BOLD}{key}:{RST} {GREEN}{value}{RST}");
+async fn tool_arg(key: &str, value: &str) {
+    let mut stdout = tokio::io::stdout();
+    stdout
+        .write_all(
+            format!("    {BOLD}{key}:{RST} {GREEN}{value}{RST}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    stdout.flush().await.unwrap();
 }
 
 #[tokio::main]
@@ -115,11 +139,18 @@ async fn main() -> anyhow::Result<()> {
 
     let mut rl = DefaultEditor::new()?;
 
-    println!(
-        "\x1b[1;36m╔════════════════════════════════╗\n\
-         ║   goop — ai agent repl         ║\n\
-         ╚════════════════════════════════╝\x1b[0m"
-    );
+    {
+        let mut stdout = tokio::io::stdout();
+        stdout
+            .write_all(
+                "\x1b[1;36m╔════════════════════════════════╗\n\
+                 ║   goop — ai agent repl         ║\n\
+                 ╚════════════════════════════════╝\x1b[0m\n"
+                    .as_bytes(),
+            )
+            .await?;
+        stdout.flush().await?;
+    }
 
     loop {
         match rl.readline("\x1b[1;33m»\x1b[0m ") {
@@ -135,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut response_text = String::new();
                 let mut thinking = true;
-                print_thinking();
+                print_thinking().await;
 
                 let mut stream = agent.stream_prompt(&prompt).await;
 
@@ -145,23 +176,28 @@ async fn main() -> anyhow::Result<()> {
                             StreamedAssistantContent::Text(text),
                         )) => {
                             if thinking {
-                                clear_thinking();
+                                clear_thinking().await;
                                 thinking = false;
                             }
-                            print!("{text}");
-                            let _ = std::io::stdout().flush();
+                            {
+                                let mut stdout = tokio::io::stdout();
+                                stdout.write_all(text.text.as_bytes()).await?;
+                                stdout.flush().await?;
+                            }
                             response_text.push_str(&text.text);
                         }
                         Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                             StreamedAssistantContent::ToolCall { tool_call, .. },
                         )) => {
                             if thinking {
-                                println!(); // finish "thinking…" line
+                                let mut stdout = tokio::io::stdout();
+                                stdout.write_all(b"\n").await?;
+                                stdout.flush().await?;
                                 thinking = false;
                             }
                             let args = tool_call.function.arguments.to_string();
-                            tool_header(&tool_call.function.name);
-                            tool_arg("command", &args);
+                            tool_header(&tool_call.function.name).await;
+                            tool_arg("command", &args).await;
                         }
                         Ok(rig::agent::MultiTurnStreamItem::StreamUserItem(
                             rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
@@ -177,34 +213,47 @@ async fn main() -> anyhow::Result<()> {
                                 .collect::<Vec<_>>()
                                 .join("");
                             if !text.is_empty() {
-                                println!();
-                                println!("{DIM}{text}{RST}");
+                                let mut stdout = tokio::io::stdout();
+                                stdout.write_all(b"\n").await?;
+                                stdout.write_all(format!("{DIM}{text}{RST}").as_bytes()).await?;
+                                stdout.flush().await?;
                             }
                             // Model is thinking about the next step
-                            print_thinking();
+                            print_thinking().await;
                             thinking = true;
                         }
                         Ok(rig::agent::MultiTurnStreamItem::FinalResponse(response)) => {
                             if thinking {
-                                clear_thinking();
+                                clear_thinking().await;
                                 thinking = false;
                             }
                             // If we haven't accumulated any text yet, use the final response
                             if response_text.is_empty() {
                                 let r = response.response();
-                                print!("{r}");
-                                let _ = std::io::stdout().flush();
+                                let mut stdout = tokio::io::stdout();
+                                stdout.write_all(r.as_bytes()).await?;
+                                stdout.flush().await?;
                             }
-                            println!();
+                            {
+                                let mut stdout = tokio::io::stdout();
+                                stdout.write_all(b"\n").await?;
+                                stdout.flush().await?;
+                            }
                             break;
                         }
                         Ok(_) => {}
                         Err(e) => {
                             if thinking {
-                                clear_thinking();
+                                clear_thinking().await;
                                 thinking = false;
                             }
-                            eprintln!("\x1b[1;31merror:\x1b[0m {e}");
+                            let mut stderr = tokio::io::stderr();
+                            stderr
+                                .write_all(
+                                    format!("\x1b[1;31merror:\x1b[0m {e}\n").as_bytes(),
+                                )
+                                .await?;
+                            stderr.flush().await?;
                             break;
                         }
                     }
@@ -212,15 +261,23 @@ async fn main() -> anyhow::Result<()> {
 
                 // If loop ended without FinalResponse but we have text, add a newline
                 if !response_text.is_empty() && thinking {
-                    println!();
+                    let mut stdout = tokio::io::stdout();
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
                 }
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
-                println!("\x1b[2mbye.\x1b[0m");
+                let mut stdout = tokio::io::stdout();
+                stdout.write_all(b"\x1b[2mbye.\x1b[0m\n").await?;
+                stdout.flush().await?;
                 break;
             }
             Err(e) => {
-                eprintln!("readline error: {e}");
+                let mut stderr = tokio::io::stderr();
+                stderr
+                    .write_all(format!("readline error: {e}\n").as_bytes())
+                    .await?;
+                stderr.flush().await?;
                 break;
             }
         }
