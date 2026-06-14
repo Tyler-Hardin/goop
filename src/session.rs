@@ -91,7 +91,7 @@ impl Session {
             preamble.push_str("highly importand user preferences\n");
         } else {
             // No AGENTS.md found, continue with base guidelines only.
-            eprintln!("Warning: AGENTS.md not found in the current directory.");
+            tracing::warn!("AGENTS.md not found in the current directory");
         }
 
         let agent = client

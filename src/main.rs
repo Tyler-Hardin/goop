@@ -9,6 +9,8 @@ use terminal::TerminalView;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let session = Session::new(256)?;
 
     // Run terminal REPL and web server concurrently.

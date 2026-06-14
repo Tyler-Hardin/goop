@@ -24,7 +24,7 @@ pub async fn serve(session: Arc<Session>) -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8187").await?;
-    println!("web server on http://127.0.0.1:8187");
+    tracing::info!("web server on http://127.0.0.1:8187");
     axum::serve(listener, app).await?;
     Ok(())
 }
