@@ -116,6 +116,9 @@
   }
   footer button:active { opacity: 0.8; }
   footer button:disabled { opacity: 0.4; cursor: default; }
+  footer button.cancel {
+    background: var(--red); color: #fff;
+  }
 
   /* mobile tweaks */
   @media (max-width: 480px) {
@@ -155,6 +158,7 @@ let ws = null;
 let thinkingEl = null;
 let assistantEl = null;
 let buf = '';
+let running = false;  // true while the LLM is generating
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -236,12 +240,21 @@ function handle(evt) {
       }
       flushBufWithEl();
       append('final', '—');
+      setRunning(false);
       break;
 
     case 'Error':
       removeThinking();
       flushBufWithEl();
       append('error', evt.data);
+      setRunning(false);
+      break;
+
+    case 'Cancelled':
+      removeThinking();
+      flushBufWithEl();
+      append('final', 'cancelled');
+      setRunning(false);
       break;
   }
   scrollDown();
@@ -304,12 +317,32 @@ input.addEventListener('keydown', (e) => {
 
 sendBtn.addEventListener('click', doSend);
 
+function setRunning(v) {
+  running = v;
+  if (v) {
+    sendBtn.textContent = 'Cancel';
+    sendBtn.classList.add('cancel');
+  } else {
+    sendBtn.textContent = 'Send';
+    sendBtn.classList.remove('cancel');
+  }
+}
+
 function doSend() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  if (running) {
+    // Cancel the running LLM.
+    ws.send(JSON.stringify({ type: 'cancel' }));
+    return;
+  }
+
   const text = input.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!text) return;
   ws.send(JSON.stringify({ type: 'prompt', content: text }));
   input.value = '';
   input.focus();
+  setRunning(true);
 }
 
 // ── start ────────────────────────────────────

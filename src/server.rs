@@ -86,6 +86,9 @@ async fn handle_socket(ws: WebSocket, state: Arc<ServerState>) {
                             ClientMessage::Prompt { content } => {
                                 session.submit(content, PromptSource::Web);
                             }
+                            ClientMessage::Cancel => {
+                                session.cancel();
+                            }
                         }
                     }
                 }
@@ -107,4 +110,6 @@ async fn handle_socket(ws: WebSocket, state: Arc<ServerState>) {
 enum ClientMessage {
     #[serde(rename = "prompt")]
     Prompt { content: String },
+    #[serde(rename = "cancel")]
+    Cancel,
 }

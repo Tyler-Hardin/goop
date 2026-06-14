@@ -40,4 +40,7 @@ pub enum SessionEvent {
 
     /// A recoverable or informational error.
     Error(String),
+
+    /// The current prompt was cancelled by the user.
+    Cancelled,
 }

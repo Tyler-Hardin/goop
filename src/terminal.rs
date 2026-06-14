@@ -213,7 +213,13 @@ impl TerminalView {
 
         // ── main loop ──────────────────────────────────────────
         loop {
-            let raw = input_rx.recv().await;
+            let raw = tokio::select! {
+                r = input_rx.recv() => r,
+                _ = tokio::signal::ctrl_c() => {
+                    // Ctrl+C at the prompt → exit.
+                    None
+                }
+            };
 
             match raw {
                 Some(Some(line)) => {
@@ -224,10 +230,35 @@ impl TerminalView {
                     let session_done = self.session.submit(&line, PromptSource::Terminal);
                     // Wait for session to finish generating.
                     session_done.await.ok();
-                    // Now wait for the render task to finish
-                    // rendering (it sends on done_tx after
-                    // FinalResponse / Error).
-                    done_rx.recv().await;
+
+                    // Wait for render to finish, but allow Ctrl+C
+                    // to cancel the running LLM.
+                    let mut cancelled = false;
+                    loop {
+                        tokio::select! {
+                            _ = done_rx.recv() => {
+                                break; // LLM finished (or cancel completed)
+                            }
+                            _ = tokio::signal::ctrl_c() => {
+                                if cancelled {
+                                    // Second Ctrl+C: exit.
+                                    let mut stdout = tokio::io::stdout();
+                                    stdout.write_all(b"\x1b[2mbye.\x1b[0m\n").await?;
+                                    stdout.flush().await?;
+                                    *ready_rx.lock().unwrap() = None;
+                                    drop(ev_tx);
+                                    render_handle.abort();
+                                    fwd_handle.abort();
+                                    return Ok(());
+                                }
+                                // First Ctrl+C: cancel the LLM.
+                                self.session.cancel();
+                                cancelled = true;
+                                // Loop back to wait for render to
+                                // finish flushing the cancellation.
+                            }
+                        }
+                    }
                     ready_tx.send(()).ok();
                 }
                 _ => {
@@ -425,6 +456,21 @@ async fn render_loop<P: rustyline::ExternalPrinter>(
                 reset_renderer!(renderer, printer);
                 parser = Parser::new();
                 line_buf.clear();
+                in_turn = false;
+                done_tx.send(()).ok();
+            }
+
+            SessionEvent::Cancelled => {
+                // Flush any partial markdown, then signal done.
+                flush_markdown!(parser, renderer.as_mut().unwrap(), line_buf);
+                reset_renderer!(renderer, printer);
+                parser = Parser::new();
+                line_buf.clear();
+                printer
+                    .lock()
+                    .unwrap()
+                    .print(format!("{DIM}cancelled.{RST}\n"))
+                    .ok();
                 in_turn = false;
                 done_tx.send(()).ok();
             }

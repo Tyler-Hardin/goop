@@ -47,6 +47,10 @@ pub struct Session {
     /// Push a prompt here from any view; the background worker drains it.
     /// Each entry carries an optional completion signal for the submitter.
     submit_tx: mpsc::UnboundedSender<(String, PromptSource, Option<oneshot::Sender<()>>)>,
+
+    /// Set by `cancel()` and consumed by the currently-running turn.
+    /// When the sender is dropped or fired, the turn is cancelled.
+    cancel_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Session {
@@ -92,6 +96,7 @@ impl Session {
             tx,
             history: Mutex::new(Vec::new()),
             submit_tx,
+            cancel_tx: std::sync::Mutex::new(None),
         });
 
         // Spawn the background worker that serializes prompt processing.
@@ -113,6 +118,14 @@ impl Session {
         // Unbounded send never fails.
         let _ = self.submit_tx.send((prompt.into(), source, Some(tx)));
         rx
+    }
+
+    /// Cancel the currently-running LLM turn (if any).
+    /// Safe to call from any thread / async context; idempotent.
+    pub fn cancel(&self) {
+        if let Some(tx) = self.cancel_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
     }
 
     // ── subscribe ────────────────────────────────────────────────
@@ -159,69 +172,103 @@ impl Session {
 
     /// Process a single prompt through the agent, emitting events.
     async fn run_one(&self, prompt: &str) {
+        // Set up cancellation for this turn.
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        *self.cancel_tx.lock().unwrap() = Some(cancel_tx);
+
         self.emit(SessionEvent::Thinking).await;
 
         let mut stream = self.agent.stream_prompt(prompt).await;
 
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
-                    text,
-                ))) => {
-                    self.emit(SessionEvent::AssistantText(text.text)).await;
+        loop {
+            tokio::select! {
+                // Bias: check cancel first so a queued cancel wins
+                // even if a stream item happens to be ready.
+                biased;
+
+                _ = &mut cancel_rx => {
+                    self.emit(SessionEvent::Cancelled).await;
+                    return;
                 }
 
-                Ok(MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::ToolCall { tool_call, .. },
-                )) => {
-                    let args = match serde_json::from_str::<serde_json::Value>(
-                        &tool_call.function.arguments.to_string(),
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            serde_json::Value::String(tool_call.function.arguments.to_string())
+                item = stream.next() => {
+                    match item {
+                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Text(text),
+                        ))) => {
+                            self.emit(SessionEvent::AssistantText(text.text)).await;
                         }
-                    };
-                    self.emit(SessionEvent::ToolCall {
-                        name: tool_call.function.name,
-                        arguments: args,
-                    })
-                    .await;
-                }
 
-                Ok(MultiTurnStreamItem::StreamUserItem(
-                    rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
-                )) => {
-                    let text: String = tool_result
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            rig::message::ToolResultContent::Text(t) => Some(t.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
+                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::ToolCall { tool_call, .. },
+                        ))) => {
+                            let args = match serde_json::from_str::<serde_json::Value>(
+                                &tool_call.function.arguments.to_string(),
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    serde_json::Value::String(
+                                        tool_call.function.arguments.to_string(),
+                                    )
+                                }
+                            };
+                            self.emit(SessionEvent::ToolCall {
+                                name: tool_call.function.name,
+                                arguments: args,
+                            })
+                            .await;
+                        }
 
-                    self.emit(SessionEvent::ToolResult { content: text }).await;
-                    self.emit(SessionEvent::Thinking).await;
-                }
+                        Some(Ok(MultiTurnStreamItem::StreamUserItem(
+                            rig::streaming::StreamedUserContent::ToolResult {
+                                tool_result, ..
+                            },
+                        ))) => {
+                            let text: String = tool_result
+                                .content
+                                .iter()
+                                .filter_map(|c| match c {
+                                    rig::message::ToolResultContent::Text(t) => {
+                                        Some(t.text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
 
-                Ok(MultiTurnStreamItem::FinalResponse(_response)) => {
-                    self.emit(SessionEvent::FinalResponse).await;
-                    return;
-                }
+                            self.emit(SessionEvent::ToolResult { content: text }).await;
+                            self.emit(SessionEvent::Thinking).await;
+                        }
 
-                Ok(_) => {}
+                        Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
+                            self.clear_cancel();
+                            self.emit(SessionEvent::FinalResponse).await;
+                            return;
+                        }
 
-                Err(e) => {
-                    self.emit(SessionEvent::Error(e.to_string())).await;
-                    return;
+                        Some(Ok(_)) => {}
+
+                        Some(Err(e)) => {
+                            self.clear_cancel();
+                            self.emit(SessionEvent::Error(e.to_string())).await;
+                            return;
+                        }
+
+                        None => {
+                            // Stream ended without FinalResponse.
+                            self.clear_cancel();
+                            self.emit(SessionEvent::FinalResponse).await;
+                            return;
+                        }
+                    }
                 }
             }
         }
+    }
 
-        // If the stream ended without FinalResponse, still signal completion.
-        self.emit(SessionEvent::FinalResponse).await;
+    /// Remove the cancel sender for the current turn (turn ending normally).
+    fn clear_cancel(&self) {
+        self.cancel_tx.lock().unwrap().take();
     }
 
     /// Send an event to live subscribers and append to history.
