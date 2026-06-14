@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::{Html, IntoResponse};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
@@ -13,7 +14,7 @@ use crate::session::Session;
 const PAGE: &str = include_str!("../assets/index.html");
 
 /// Launch the axum HTTP + WebSocket server.
-/// Binds to `0.0.0.0:8187` so phones on the LAN can connect.
+/// Binds to 127.0.0.1:8187 — safe behind an nginx reverse proxy.
 pub async fn serve(session: Arc<Session>) -> anyhow::Result<()> {
     let state = Arc::new(ServerState { session });
 
@@ -22,8 +23,8 @@ pub async fn serve(session: Arc<Session>) -> anyhow::Result<()> {
         .route("/ws", get(ws_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8187").await?;
-    println!("web server on http://0.0.0.0:8187");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8187").await?;
+    println!("web server on http://127.0.0.1:8187");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -40,10 +41,30 @@ async fn index() -> Html<&'static str> {
     Html(PAGE)
 }
 
+/// Upgrade to WebSocket after validating the Origin header.
+/// Rejects requests from unexpected origins to prevent CSWSH.
 async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
-) -> impl IntoResponse {
+) -> Response {
+    // Only allow requests whose Origin matches the Host we're proxied behind.
+    // When nginx proxies, the browser sends Origin = https://your.domain,
+    // and nginx forwards Host = your.domain.  We check they agree.
+    if let (Some(origin), Some(host)) = (
+        headers.get("origin").and_then(|v| v.to_str().ok()),
+        headers.get("host").and_then(|v| v.to_str().ok()),
+    ) {
+        // Strip scheme from origin for comparison (origin = "https://foo.com", host = "foo.com")
+        let origin_host = origin
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/');
+        if origin_host != host {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
