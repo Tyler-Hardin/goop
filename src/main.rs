@@ -146,6 +146,22 @@ async fn tool_arg(key: &str, value: &str) {
     stdout.flush().await.unwrap();
 }
 
+const MAX_ARG_LEN: usize = 80;
+const MAX_RESULT_LEN: usize = 500;
+
+/// Truncate `s` to at most `max_chars` characters, appending "…" if cut.
+fn ellipsize(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else if max_chars <= 1 {
+        "…".to_string()
+    } else {
+        let head: String = s.chars().take(max_chars - 1).collect();
+        format!("{head}…")
+    }
+}
+
 /// Which phase of the streaming loop we are in.
 enum Phase {
     /// "thinking…" is on screen; no markdown blocks emitted yet this turn.
@@ -248,9 +264,23 @@ async fn main() -> anyhow::Result<()> {
                             // Reset markdown parser.
                             md_stream = MdStream::new(Options::default());
 
-                            let args = tool_call.function.arguments.to_string();
+                            let args_str = tool_call.function.arguments.to_string();
                             tool_header(&tool_call.function.name).await;
-                            tool_arg("command", &args).await;
+
+                            match serde_json::from_str::<serde_json::Value>(&args_str) {
+                                Ok(serde_json::Value::Object(obj)) => {
+                                    for (key, value) in &obj {
+                                        let display_val = match value {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            other => other.to_string(),
+                                        };
+                                        tool_arg(key, &ellipsize(&display_val, MAX_ARG_LEN)).await;
+                                    }
+                                }
+                                _ => {
+                                    tool_arg("args", &ellipsize(&args_str, MAX_ARG_LEN)).await;
+                                }
+                            }
                             phase = Phase::AfterTool;
                         }
                         Ok(rig::agent::MultiTurnStreamItem::StreamUserItem(
@@ -268,10 +298,11 @@ async fn main() -> anyhow::Result<()> {
                                 .collect::<Vec<_>>()
                                 .join("");
                             if !text.is_empty() {
+                                let displayed = ellipsize(&text, MAX_RESULT_LEN);
                                 let mut stdout = tokio::io::stdout();
                                 stdout.write_all(b"\n").await?;
                                 stdout
-                                    .write_all(format!("{DIM}{text}{RST}").as_bytes())
+                                    .write_all(format!("{DIM}{displayed}{RST}").as_bytes())
                                     .await?;
                                 stdout.flush().await?;
                             }
