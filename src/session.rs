@@ -63,21 +63,40 @@ impl Session {
     /// tokio runtime must already be running.
     pub fn new(capacity: usize) -> anyhow::Result<Arc<Self>> {
         let client = deepseek::Client::from_env()?;
+
+        // Build preamble: base guidelines, plus AGENTS.md content if present.
+        let mut preamble = String::from(
+            "You are a precise coding assistant with direct access to a shell and file system.\n\
+             \n\
+             Guidelines:\n\
+             - Assume paths are relative to the current working directory unless the user \
+               specifies an absolute path.\n\
+             - Always read a file with `read` before editing it.\n\
+             - Use `replace` for small, targeted edits; use `write` only for creating or \
+               rewriting entire files.\n\
+             - Before running a shell command that modifies the system, explain what it does.\n\
+             - If you are unsure about something, ask before acting.\n\
+             - Format your responses in markdown.",
+        );
+
+        if let Ok(agents_md) = std::fs::read_to_string("AGENTS.md") {
+            preamble.push_str("\n\n---\n\n");
+            preamble.push_str("The project you are working on includes this AGENTS.md:\n\n");
+            preamble.push_str(&agents_md);
+            preamble.push_str("\n\n");
+            preamble.push_str("Remember to update the AGENTS.md if you make changes that ");
+            preamble.push_str("warrant an update. (Don't force it. Not all changes need to be ");
+            preamble.push_str("reflected, especially if they're small or bug fixes. The intent ");
+            preamble.push_str("of AGENTS.md is to be an overview of the project and to hold any ");
+            preamble.push_str("highly importand user preferences\n");
+        } else {
+            // No AGENTS.md found, continue with base guidelines only.
+            eprintln!("Warning: AGENTS.md not found in the current directory.");
+        }
+
         let agent = client
             .agent(deepseek::DEEPSEEK_V4_PRO)
-            .preamble(
-                "You are a precise coding assistant with direct access to a shell and file system.\n\
-                 \n\
-                 Guidelines:\n\
-                 - Assume paths are relative to the current working directory unless the user \
-                   specifies an absolute path.\n\
-                 - Always read a file with `read` before editing it.\n\
-                 - Use `replace` for small, targeted edits; use `write` only for creating or \
-                   rewriting entire files.\n\
-                 - Before running a shell command that modifies the system, explain what it does.\n\
-                 - If you are unsure about something, ask before acting.\n\
-                 - Format your responses in markdown.",
-            )
+            .preamble(&preamble)
             .tool(tools::Read)
             .tool(tools::Replace)
             .tool(tools::Shell)
