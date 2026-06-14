@@ -1,5 +1,6 @@
 use futures::StreamExt;
 use rig::client::{CompletionClient, ProviderClient};
+use rig::memory::InMemoryConversationMemory;
 use rig::providers::deepseek;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use rig_derive::rig_tool;
@@ -133,6 +134,8 @@ async fn main() -> anyhow::Result<()> {
         .tool(Write)
         .max_tokens(100_000)
         .default_max_turns(100)
+        .memory(InMemoryConversationMemory::new())
+        .conversation_id("default")
         .build();
 
     let agent = Arc::new(agent);
