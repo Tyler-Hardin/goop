@@ -6,9 +6,9 @@ use rig::client::{CompletionClient, ProviderClient};
 use rig::memory::InMemoryConversationMemory;
 use rig::providers::deepseek;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
-use crate::events::SessionEvent;
+use crate::events::{PromptSource, SessionEvent};
 use crate::tools;
 
 // ── subscriber with history replay ──────────────────────────────
@@ -45,7 +45,8 @@ pub struct Session {
     history: Mutex<Vec<SessionEvent>>,
 
     /// Push a prompt here from any view; the background worker drains it.
-    submit_tx: mpsc::UnboundedSender<String>,
+    /// Each entry carries an optional completion signal for the submitter.
+    submit_tx: mpsc::UnboundedSender<(String, PromptSource, Option<oneshot::Sender<()>>)>,
 }
 
 impl Session {
@@ -104,9 +105,14 @@ impl Session {
 
     /// Submit a prompt from any view.  Returns immediately; the prompt
     /// is queued and processed when earlier submissions finish.
-    pub fn submit(&self, prompt: impl Into<String>) {
+    ///
+    /// Returns a receiver that fires when this prompt completes
+    /// (i.e. FinalResponse or Error has been emitted).
+    pub fn submit(&self, prompt: impl Into<String>, source: PromptSource) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
         // Unbounded send never fails.
-        let _ = self.submit_tx.send(prompt.into());
+        let _ = self.submit_tx.send((prompt.into(), source, Some(tx)));
+        rx
     }
 
     // ── subscribe ────────────────────────────────────────────────
@@ -133,13 +139,21 @@ impl Session {
     // ── internals ────────────────────────────────────────────────
 
     /// Background worker: drain prompts one at a time.
-    async fn drain_queue(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<String>) {
-        while let Some(prompt) = rx.recv().await {
+    async fn drain_queue(
+        self: Arc<Self>,
+        mut rx: mpsc::UnboundedReceiver<(String, PromptSource, Option<oneshot::Sender<()>>)>,
+    ) {
+        while let Some((prompt, source, done)) = rx.recv().await {
             self.emit(SessionEvent::UserPrompt {
                 content: prompt.clone(),
+                source,
             })
             .await;
             self.run_one(&prompt).await;
+            // Notify the submitter that this prompt is done.
+            if let Some(tx) = done {
+                let _ = tx.send(());
+            }
         }
     }
 

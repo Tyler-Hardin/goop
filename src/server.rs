@@ -7,6 +7,7 @@ use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
 
+use crate::events::PromptSource;
 use crate::session::Session;
 
 const PAGE: &str = include_str!("../assets/index.html");
@@ -83,7 +84,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<ServerState>) {
                     if let Ok(req) = serde_json::from_str::<ClientMessage>(&text) {
                         match req {
                             ClientMessage::Prompt { content } => {
-                                session.submit(content);
+                                session.submit(content, PromptSource::Web);
                             }
                         }
                     }

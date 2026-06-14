@@ -1,5 +1,13 @@
 use serde::Serialize;
 
+/// Which view submitted this prompt.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[allow(dead_code)]
+pub enum PromptSource {
+    Terminal,
+    Web,
+}
+
 /// Events emitted by the session as the agent processes a prompt.
 /// Views (terminal, web, phone, …) subscribe and render in their own way.
 #[derive(Debug, Clone, Serialize)]
@@ -7,7 +15,10 @@ use serde::Serialize;
 #[serde(tag = "type", content = "data")]
 pub enum SessionEvent {
     /// A user submitted a prompt.  Arrives *before* Thinking.
-    UserPrompt { content: String },
+    UserPrompt {
+        content: String,
+        source: PromptSource,
+    },
 
     /// The agent has started a new turn and is "thinking".
     Thinking,
