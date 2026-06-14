@@ -1,0 +1,13 @@
+[package]
+name = "goop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+rig = { version = "0.38.2", features = ["derive"] }
+rig-derive = "0.38.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+subprocess = "1.1.0"
+tokio = { version = "1.52.3", features = ["full"] }
