@@ -2838,6 +2838,7 @@ name = "goop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "rig",
  "rig-derive",
  "rustyline",

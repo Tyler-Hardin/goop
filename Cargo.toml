@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+futures = "0.3.32"
 rig = { version = "0.38.2", features = ["derive"] }
 rig-derive = "0.38.2"
 rustyline = "18.0.0"
