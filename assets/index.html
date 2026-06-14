@@ -265,7 +265,7 @@
     flex-shrink: 0; display: flex; gap: 10px;
     background: var(--surface);
   }
-  footer input {
+  footer textarea {
     flex: 1;
     background: var(--bg);
     border: 1px solid var(--border);
@@ -274,12 +274,15 @@
     color: var(--fg); font-size: 15px; outline: none;
     font-family: var(--font);
     transition: border-color 0.2s, box-shadow 0.2s;
+    resize: none;
+    min-height: 46px; max-height: 200px;
+    line-height: 1.55;
   }
-  footer input:focus {
+  footer textarea:focus {
     border-color: var(--blue);
     box-shadow: 0 0 0 3px rgba(109,179,242,0.12);
   }
-  footer input::placeholder { color: var(--dim2); }
+  footer textarea::placeholder { color: var(--dim2); }
 
   footer button {
     background: var(--blue);
@@ -311,7 +314,7 @@
     .msg.result { max-width: 96%; }
     header { padding: 10px 14px; }
     footer { padding: 10px 14px; gap: 8px; }
-    footer input { font-size: 16px; }  /* prevent iOS zoom */
+    footer textarea { font-size: 16px; }  /* prevent iOS zoom */
     footer button { padding: 11px 16px; font-size: 14px; }
   }
 
@@ -334,7 +337,7 @@
 <main id="log"></main>
 
 <footer>
-  <input id="input" type="text" placeholder="Ask anything…" autocomplete="off" autofocus>
+  <textarea id="input" placeholder="Ask anything…" autocomplete="off" autofocus rows="1"></textarea>
   <button id="send" disabled>Send</button>
 </footer>
 
@@ -517,6 +520,12 @@ function scrollDown() {
 
 // ── input ────────────────────────────────────
 
+// Auto-resize textarea as the user types.
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+});
+
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -550,6 +559,7 @@ function doSend() {
   if (!text) return;
   ws.send(JSON.stringify({ type: 'prompt', content: text }));
   input.value = '';
+  input.style.height = 'auto';
   input.focus();
   setRunning(true);
 }
