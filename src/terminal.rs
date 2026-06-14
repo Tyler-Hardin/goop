@@ -107,6 +107,22 @@ impl TerminalView {
         // output has been fully rendered.
         let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
 
+        // ── banner ────────────────────────────────────────
+        // Print this *before* spawning the readline thread so the
+        // prompt doesn't race ahead and appear first.
+        {
+            let mut stdout = tokio::io::stdout();
+            stdout
+                .write_all(
+                    "\x1b[1;36m╔════════════════════════════════╗\n\
+                     ║   goop — ai agent repl         ║\n\
+                     ╚════════════════════════════════╝\x1b[0m\n"
+                        .as_bytes(),
+                )
+                .await?;
+            stdout.flush().await?;
+        }
+
         // ── permanent readline thread ──────────────────────────
         // Supports multiline input via trailing-backslash
         // continuation (like bash / POSIX shell).
@@ -168,20 +184,6 @@ impl TerminalView {
                 }
             }
         });
-
-        // Banner.
-        {
-            let mut stdout = tokio::io::stdout();
-            stdout
-                .write_all(
-                    "\x1b[1;36m╔════════════════════════════════╗\n\
-                     ║   goop — ai agent repl         ║\n\
-                     ╚════════════════════════════════╝\x1b[0m\n"
-                        .as_bytes(),
-                )
-                .await?;
-            stdout.flush().await?;
-        }
 
         // ── single render task ────────────────────────────────
         // This is the *only* rendering pipeline — all terminal
