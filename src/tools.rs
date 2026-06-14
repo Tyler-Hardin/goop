@@ -19,10 +19,7 @@ pub async fn replace(
         )))
     } else if count > 1 {
         Err(rig::tool::ToolError::ToolCallError(Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("old_str found {count} times, must be unique"),
-            ),
+            std::io::Error::other(format!("old_str found {count} times, must be unique")),
         )))
     } else {
         let new_content = content.replacen(&old_str, &new_str, 1);
@@ -33,10 +30,7 @@ pub async fn replace(
     }
 }
 
-#[rig_tool(
-    description = "Run command in shell",
-    required(command)
-)]
+#[rig_tool(description = "Run command in shell", required(command))]
 pub async fn shell(command: String) -> Result<String, rig::tool::ToolError> {
     tokio::process::Command::new("sh")
         .arg("-c")
@@ -55,10 +49,7 @@ pub async fn shell(command: String) -> Result<String, rig::tool::ToolError> {
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))
 }
 
-#[rig_tool(
-    description = "Write content to file at path",
-    required(path, content)
-)]
+#[rig_tool(description = "Write content to file at path", required(path, content))]
 pub async fn write(
     path: std::path::PathBuf,
     content: String,
@@ -66,5 +57,9 @@ pub async fn write(
     tokio::fs::write(&path, &content)
         .await
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
-    Ok(format!("Wrote {} bytes to {}", content.len(), path.display()))
+    Ok(format!(
+        "Wrote {} bytes to {}",
+        content.len(),
+        path.display()
+    ))
 }

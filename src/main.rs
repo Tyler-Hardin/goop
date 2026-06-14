@@ -5,8 +5,8 @@ use rig::client::{CompletionClient, ProviderClient};
 use rig::memory::InMemoryConversationMemory;
 use rig::providers::deepseek;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 
@@ -17,7 +17,10 @@ const RST: &str = "\x1b[0m";
 
 async fn print_thinking() {
     let mut stdout = tokio::io::stdout();
-    stdout.write_all(format!("{DIM}thinking…{RST}").as_bytes()).await.unwrap();
+    stdout
+        .write_all(format!("{DIM}thinking…{RST}").as_bytes())
+        .await
+        .unwrap();
     stdout.flush().await.unwrap();
 }
 
@@ -45,9 +48,7 @@ async fn tool_header(name: &str) {
 async fn tool_arg(key: &str, value: &str) {
     let mut stdout = tokio::io::stdout();
     stdout
-        .write_all(
-            format!("    {BOLD}{key}:{RST} {GREEN}{value}{RST}\n").as_bytes(),
-        )
+        .write_all(format!("    {BOLD}{key}:{RST} {GREEN}{value}{RST}\n").as_bytes())
         .await
         .unwrap();
     stdout.flush().await.unwrap();
@@ -142,7 +143,9 @@ async fn main() -> anyhow::Result<()> {
                                 .content
                                 .iter()
                                 .filter_map(|c| match c {
-                                    rig::message::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                                    rig::message::ToolResultContent::Text(t) => {
+                                        Some(t.text.as_str())
+                                    }
                                     _ => None,
                                 })
                                 .collect::<Vec<_>>()
@@ -150,7 +153,9 @@ async fn main() -> anyhow::Result<()> {
                             if !text.is_empty() {
                                 let mut stdout = tokio::io::stdout();
                                 stdout.write_all(b"\n").await?;
-                                stdout.write_all(format!("{DIM}{text}{RST}").as_bytes()).await?;
+                                stdout
+                                    .write_all(format!("{DIM}{text}{RST}").as_bytes())
+                                    .await?;
                                 stdout.flush().await?;
                             }
                             // Model is thinking about the next step
@@ -184,9 +189,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let mut stderr = tokio::io::stderr();
                             stderr
-                                .write_all(
-                                    format!("\x1b[1;31merror:\x1b[0m {e}\n").as_bytes(),
-                                )
+                                .write_all(format!("\x1b[1;31merror:\x1b[0m {e}\n").as_bytes())
                                 .await?;
                             stderr.flush().await?;
                             break;
