@@ -2839,6 +2839,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "mdstream",
+ "mdstream-tokio",
  "rig",
  "rig-derive",
  "rustyline",
@@ -4504,6 +4506,22 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "mdstream"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f40ba985385a037722f910369b6844b049b9f200544335648446bd825b0341d"
+
+[[package]]
+name = "mdstream-tokio"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "927d94f78e1ef9809298661e58dc7f64c20b9abb3029317a3a2cc7e947a588db"
+dependencies = [
+ "mdstream",
+ "tokio",
 ]
 
 [[package]]
