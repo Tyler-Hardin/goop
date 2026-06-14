@@ -384,7 +384,8 @@ function handle(evt) {
   switch (evt.type) {
     case 'UserPrompt':
       append('user', evt.data.content);
-      break;
+      scrollDown(true);  // always scroll — the user just sent this
+      return;
 
     case 'Thinking':
       if (!thinkingEl) {
@@ -512,9 +513,16 @@ function trunc(s, n) {
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
 }
 
-function scrollDown() {
+function scrollDown(force) {
   requestAnimationFrame(() => {
-    log.scrollTop = log.scrollHeight;
+    // Only auto-scroll if the user is already near the bottom.
+    // A threshold of 50 px lets the user scroll up slightly without
+    // being yanked back — the same behaviour as most terminals.
+    const threshold = 50;
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
+    if (force || atBottom) {
+      log.scrollTop = log.scrollHeight;
+    }
   });
 }
 
