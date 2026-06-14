@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+axum = { version = "0.8.8", features = ["ws"] }
+axum-extra = "0.10.1"
 futures = "0.3.32"
 rig = { version = "0.38.2", features = ["derive"] }
 rig-derive = "0.38.2"
