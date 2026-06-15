@@ -109,6 +109,71 @@ pub async fn read_html(path: std::path::PathBuf) -> Result<String, rig::tool::To
     .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
+#[rig_tool(
+    description = "Fetch a URL and return extracted plain text from the HTML (headings, links, body text). Use for reading web docs, wiki pages, etc.",
+    required(url)
+)]
+pub async fn web_fetch(url: String) -> Result<String, rig::tool::ToolError> {
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(rig::tool::ToolError::ToolCallError(Box::new(
+            std::io::Error::other(format!("HTTP {status}")),
+        )));
+    }
+    let html = resp
+        .text()
+        .await
+        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    let text = tokio::task::spawn_blocking({
+        let html = html.clone();
+        move || {
+            html2text::from_read(html.as_bytes(), 80).map_err(|e| {
+                rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(e.to_string())))
+            })
+        }
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))??;
+
+    // Write cached copies to temp files so the model can re-read with
+    // the `read` or `read_html` tools without re-fetching.
+    let dir = std::env::temp_dir().join("goop");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    let stem = slugify(&url);
+    let txt_path = dir.join(format!("{stem}.txt"));
+    let html_path = dir.join(format!("{stem}.html"));
+    tokio::fs::write(&txt_path, &text)
+        .await
+        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    tokio::fs::write(&html_path, &html)
+        .await
+        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+
+    Ok(format!(
+        "{text}\n\n---\nCached: {} (plain text) and {} (raw HTML) — use `read` or `read_html` or `shell` (e.g. grep) to re-examine if needed.",
+        txt_path.display(),
+        html_path.display(),
+    ))
+}
+
+/// Turn a URL into a safe filename fragment.
+fn slugify(url: &str) -> String {
+    url.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '_',
+        })
+        .collect::<String>()
+        .chars()
+        .take(120)
+        .collect()
+}
+
 #[rig_tool(description = "Write content to file at path", required(path, content))]
 pub async fn write(
     path: std::path::PathBuf,

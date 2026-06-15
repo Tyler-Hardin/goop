@@ -3591,6 +3591,7 @@ dependencies = [
  "gtk",
  "html2text",
  "log",
+ "reqwest 0.13.4",
  "rig",
  "rig-derive",
  "rustyline",

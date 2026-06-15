@@ -128,6 +128,7 @@ impl Session {
             .tool(tools::ReadHtml)
             .tool(tools::Replace)
             .tool(tools::Shell)
+            .tool(tools::WebFetch)
             .tool(tools::Write)
             .max_tokens(100_000)
             .default_max_turns(100)
