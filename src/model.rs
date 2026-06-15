@@ -17,6 +17,7 @@ use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 
 use crate::config::{self, Config, Provider};
 use crate::memory::FileConversationMemory;
+use crate::session_state::SessionState;
 
 // ── opaque streaming-response enum ───────────────────────────────
 
@@ -175,47 +176,13 @@ fn map_assistant<R>(
 
 // ── agent construction ───────────────────────────────────────────
 
-/// Wire up all goop tools on an agent builder.
-///
-/// Centralised so the tool list isn't duplicated across six match arms.
-macro_rules! with_goop_tools {
-    ($builder:expr, $config:expr, $memory:expr) => {
-        $builder
-            .tool(crate::tools::Read)
-            .tool(crate::tools::ReadHtml)
-            .tool(crate::tools::Replace)
-            .tool(crate::tools::Write)
-            .tool(crate::tools::Shell)
-            .tool(crate::tools::Cd)
-            .tool(crate::tools::Ssh)
-            .tool(crate::tools::Disconnect)
-            .tool(crate::tools::WebFetch)
-            .tool(crate::tools::Screenshot)
-            .tool(crate::tools::CursorPosition)
-            .tool(crate::tools::MouseMove)
-            .tool(crate::tools::MouseClick)
-            .tool(crate::tools::KeyType)
-            .tool(crate::tools::KeyPress)
-            .tool(crate::tools::WindowList)
-            .tool(crate::tools::WindowFocus)
-            .tool(crate::tools::WindowGetActive)
-            .tool(crate::tools::OpenUrl)
-            .max_tokens($config.max_tokens)
-            .default_max_turns($config.default_max_turns)
-            .conversation_id("default")
-            .memory($memory)
-            .build()
-    };
-}
-
-/// Build an agent for the configured provider.
-///
-/// Reads the appropriate `*_API_KEY` env var and constructs the rig
-/// agent with all goop tools and the supplied conversation memory.
+/// Build an agent for the configured provider, attaching tools from
+/// the supplied [`SessionState`].
 pub fn build_agent(
     config: &Config,
     preamble: &str,
     memory: FileConversationMemory,
+    state: Arc<SessionState>,
 ) -> anyhow::Result<Arc<AnyAgent>> {
     let api_key = config::api_key_for(config.provider)?;
     let model_name = config
@@ -223,42 +190,64 @@ pub fn build_agent(
         .as_deref()
         .unwrap_or(config.provider.default_model());
 
-    // Only one arm executes, but Rust sees a potential move in each.
-    // Use Option::take so the memory is moved exactly once.
+    let tools = crate::tools::build_tools(config, &state);
+
     let mut memory = Some(memory);
 
     let any_agent = match config.provider {
         Provider::DeepSeek => {
             let client = deepseek::Client::new(&api_key)?;
-            let builder = client.agent(model_name).preamble(preamble);
-            AnyAgent::DeepSeek(with_goop_tools!(builder, config, memory.take().unwrap()))
+            AnyAgent::DeepSeek(finish_agent(
+                client.agent(model_name).preamble(preamble),
+                config,
+                memory.take().unwrap(),
+                tools,
+            ))
         }
         Provider::OpenAI => {
             let client = openai::CompletionsClient::new(&api_key)?;
-            let builder = client.agent(model_name).preamble(preamble);
-            AnyAgent::OpenAI(with_goop_tools!(builder, config, memory.take().unwrap()))
+            AnyAgent::OpenAI(finish_agent(
+                client.agent(model_name).preamble(preamble),
+                config,
+                memory.take().unwrap(),
+                tools,
+            ))
         }
         Provider::OpenRouter => {
             let client = openrouter::Client::new(&api_key)?;
-            let builder = client.agent(model_name).preamble(preamble);
-            AnyAgent::OpenRouter(with_goop_tools!(builder, config, memory.take().unwrap()))
+            AnyAgent::OpenRouter(finish_agent(
+                client.agent(model_name).preamble(preamble),
+                config,
+                memory.take().unwrap(),
+                tools,
+            ))
         }
         Provider::Groq => {
             let client = groq::Client::new(&api_key)?;
-            let builder = client.agent(model_name).preamble(preamble);
-            AnyAgent::Groq(with_goop_tools!(builder, config, memory.take().unwrap()))
+            AnyAgent::Groq(finish_agent(
+                client.agent(model_name).preamble(preamble),
+                config,
+                memory.take().unwrap(),
+                tools,
+            ))
         }
         Provider::Ollama => {
-            // Ollama reads OLLAMA_API_BASE_URL (defaults to localhost:11434) and
-            // optional OLLAMA_API_KEY from the environment.
             let client = ollama::Client::from_env()?;
-            let builder = client.agent(model_name).preamble(preamble);
-            AnyAgent::Ollama(with_goop_tools!(builder, config, memory.take().unwrap()))
+            AnyAgent::Ollama(finish_agent(
+                client.agent(model_name).preamble(preamble),
+                config,
+                memory.take().unwrap(),
+                tools,
+            ))
         }
         Provider::Anthropic => {
             let client = anthropic::Client::new(&api_key)?;
-            let builder = client.agent(model_name).preamble(preamble);
-            AnyAgent::Anthropic(with_goop_tools!(builder, config, memory.take().unwrap()))
+            AnyAgent::Anthropic(finish_agent(
+                client.agent(model_name).preamble(preamble),
+                config,
+                memory.take().unwrap(),
+                tools,
+            ))
         }
     };
 
@@ -269,4 +258,20 @@ pub fn build_agent(
     );
 
     Ok(Arc::new(any_agent))
+}
+
+/// Common builder finalisation shared by all providers.
+fn finish_agent<M: rig::completion::CompletionModel>(
+    builder: rig::agent::AgentBuilder<M>,
+    config: &Config,
+    memory: FileConversationMemory,
+    tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+) -> Agent<M> {
+    builder
+        .tools(tools)
+        .max_tokens(config.max_tokens)
+        .default_max_turns(config.default_max_turns)
+        .conversation_id("default")
+        .memory(memory)
+        .build()
 }

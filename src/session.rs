@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
+use std::sync::Arc;
 
 use chrono::Local;
 use futures::StreamExt;
@@ -8,40 +8,24 @@ use rig::streaming::StreamedAssistantContent;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::events::{PromptSource, SessionEvent};
 use crate::memory::FileConversationMemory;
 use crate::memory::prompt_history_path;
 use crate::model;
 use crate::preamble::build_preamble;
+use crate::session_state::SessionState;
 use crate::transport::Transport;
-
-// ── per-session CWD ──────────────────────────────────────────────
-
-/// Global CWD registry, keyed by session name.
-///
-/// Tools read this to know which directory to operate in.  A `cd` tool
-/// updates it; `Session` registers the initial value on creation.
-pub(crate) static SESSION_CWDS: LazyLock<StdRwLock<std::collections::HashMap<String, PathBuf>>> =
-    LazyLock::new(|| StdRwLock::new(std::collections::HashMap::new()));
-
-tokio::task_local! {
-    /// Set by [`Session::run_one`] before streaming to the LLM so that
-    /// tools (e.g. `cd`, `shell`) can find their session's CWD.
-    pub(crate) static SESSION_ID: String;
-}
 
 // ── subscriber with history replay ──────────────────────────────
 
 /// Returned by [`Session::subscribe_all`]. Replays every prior event
 /// before yielding live events.
-#[allow(dead_code)] // used by future views (web, phone, …)
 pub struct SessionSubscriber {
     history: Vec<SessionEvent>,
     rx: broadcast::Receiver<SessionEvent>,
 }
 
-#[allow(dead_code)] // used by future views
 impl SessionSubscriber {
     /// Wait for the next event (history first, then live).
     pub async fn recv(&mut self) -> Result<SessionEvent, broadcast::error::RecvError> {
@@ -62,6 +46,8 @@ impl SessionSubscriber {
 pub struct Session {
     /// Session name (user-supplied or auto-generated like `20260128_001`).
     name: String,
+    /// Shared mutable state (CWD, transport, home_dir) accessible by tools.
+    pub(crate) state: Arc<SessionState>,
     agent: Arc<crate::model::AnyAgent>,
     tx: broadcast::Sender<SessionEvent>,
     history: Mutex<Vec<SessionEvent>>,
@@ -109,15 +95,17 @@ impl Session {
 
         // ── CWD ──────────────────────────────────────────────
         let cwd = load_cwd(&cwd_path);
-        // Register in the global map so tools can find it.
-        SESSION_CWDS
-            .write()
-            .unwrap()
-            .insert(name.clone(), cwd.clone());
 
-        let preamble = build_preamble(&cwd.display().to_string());
+        // ── SessionState (created before agent so tools can use it) ──
+        let state = Arc::new(SessionState::new(
+            name.clone(),
+            config.home_dir.clone(),
+            cwd.clone(),
+        ));
 
-        let agent = model::build_agent(config, &preamble, mem)?;
+        let preamble = build_preamble(&cwd.display().to_string(), &config.home_dir);
+
+        let agent = model::build_agent(config, &preamble, mem, state.clone())?;
 
         let (tx, _) = broadcast::channel(capacity);
         let (submit_tx, submit_rx) = mpsc::unbounded_channel();
@@ -138,6 +126,7 @@ impl Session {
 
         let this = Arc::new(Self {
             name: name.clone(),
+            state: state.clone(),
             agent,
             tx,
             history: Mutex::new(existing_events),
@@ -195,7 +184,6 @@ impl Session {
     ///
     /// Late-joining views (web, phone, …) receive every event since
     /// session creation before transitioning to live events.
-    #[allow(dead_code)] // used by future views
     pub async fn subscribe_all(&self) -> SessionSubscriber {
         let history = self.history.lock().await.clone();
         let rx = self.tx.subscribe();
@@ -234,99 +222,95 @@ impl Session {
 
         self.emit(SessionEvent::Thinking).await;
 
-        // Scope the session ID so tools can find their CWD via the
-        // global SESSION_CWDS map.
-        let name = self.name.clone();
-        SESSION_ID
-            .scope(name, async {
-                let mut stream = self.agent.stream_prompt(prompt).await;
+        // No more SESSION_ID task-local — tools receive SessionState directly.
+        {
+            let mut stream = self.agent.stream_prompt(prompt).await;
 
-                loop {
-                    tokio::select! {
-                        // Bias: check cancel first so a queued cancel wins
-                        // even if a stream item happens to be ready.
-                        biased;
+            loop {
+                tokio::select! {
+                    // Bias: check cancel first so a queued cancel wins
+                    // even if a stream item happens to be ready.
+                    biased;
 
-                        _ = &mut cancel_rx => {
-                            self.emit(SessionEvent::Cancelled).await;
-                            return;
-                        }
+                    _ = &mut cancel_rx => {
+                        self.emit(SessionEvent::Cancelled).await;
+                        return;
+                    }
 
-                        item = stream.next() => {
-                            match item {
-                                Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
-                                    StreamedAssistantContent::Text(text),
-                                ))) => {
-                                    self.emit(SessionEvent::AssistantText(text.text)).await;
-                                }
+                    item = stream.next() => {
+                        match item {
+                            Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                                StreamedAssistantContent::Text(text),
+                            ))) => {
+                                self.emit(SessionEvent::AssistantText(text.text)).await;
+                            }
 
-                                Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
-                                    StreamedAssistantContent::ToolCall { tool_call, .. },
-                                ))) => {
-                                    let args = match serde_json::from_str::<serde_json::Value>(
-                                        &tool_call.function.arguments.to_string(),
-                                    ) {
-                                        Ok(v) => v,
-                                        Err(_) => {
-                                            serde_json::Value::String(
-                                                tool_call.function.arguments.to_string(),
-                                            )
+                            Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                                StreamedAssistantContent::ToolCall { tool_call, .. },
+                            ))) => {
+                                let args = match serde_json::from_str::<serde_json::Value>(
+                                    &tool_call.function.arguments.to_string(),
+                                ) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        serde_json::Value::String(
+                                            tool_call.function.arguments.to_string(),
+                                        )
+                                    }
+                                };
+                                self.emit(SessionEvent::ToolCall {
+                                    name: tool_call.function.name,
+                                    arguments: args,
+                                })
+                                .await;
+                            }
+
+                            Some(Ok(MultiTurnStreamItem::StreamUserItem(
+                                rig::streaming::StreamedUserContent::ToolResult {
+                                    tool_result, ..
+                                },
+                            ))) => {
+                                let text: String = tool_result
+                                    .content
+                                    .iter()
+                                    .filter_map(|c| match c {
+                                        rig::message::ToolResultContent::Text(t) => {
+                                            Some(t.text.as_str())
                                         }
-                                    };
-                                    self.emit(SessionEvent::ToolCall {
-                                        name: tool_call.function.name,
-                                        arguments: args,
+                                        _ => None,
                                     })
-                                    .await;
-                                }
+                                    .collect::<Vec<_>>()
+                                    .join("");
 
-                                Some(Ok(MultiTurnStreamItem::StreamUserItem(
-                                    rig::streaming::StreamedUserContent::ToolResult {
-                                        tool_result, ..
-                                    },
-                                ))) => {
-                                    let text: String = tool_result
-                                        .content
-                                        .iter()
-                                        .filter_map(|c| match c {
-                                            rig::message::ToolResultContent::Text(t) => {
-                                                Some(t.text.as_str())
-                                            }
-                                            _ => None,
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("");
+                                self.emit(SessionEvent::ToolResult { content: text }).await;
+                                self.emit(SessionEvent::Thinking).await;
+                            }
 
-                                    self.emit(SessionEvent::ToolResult { content: text }).await;
-                                    self.emit(SessionEvent::Thinking).await;
-                                }
+                            Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
+                                self.clear_cancel();
+                                self.emit(SessionEvent::FinalResponse).await;
+                                return;
+                            }
 
-                                Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
-                                    self.clear_cancel();
-                                    self.emit(SessionEvent::FinalResponse).await;
-                                    return;
-                                }
+                            Some(Ok(_)) => {}
 
-                                Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                self.clear_cancel();
+                                self.emit(SessionEvent::Error(e.to_string())).await;
+                                return;
+                            }
 
-                                Some(Err(e)) => {
-                                    self.clear_cancel();
-                                    self.emit(SessionEvent::Error(e.to_string())).await;
-                                    return;
-                                }
-
-                                None => {
-                                    // Stream ended without FinalResponse.
-                                    self.clear_cancel();
-                                    self.emit(SessionEvent::FinalResponse).await;
-                                    return;
-                                }
+                            None => {
+                                // Stream ended without FinalResponse.
+                                self.clear_cancel();
+                                self.emit(SessionEvent::FinalResponse).await;
+                                return;
                             }
                         }
                     }
                 }
-            })
-            .await;
+            }
+        }
     }
 
     /// Remove the cancel sender for the current turn (turn ending normally).
@@ -409,32 +393,36 @@ impl SessionManager {
                 .unwrap_or_default();
             if !destination.is_empty() {
                 tracing::info!("auto-reconnecting SSH session {name} → {destination}");
+                let state = Arc::clone(&session.state);
+                let name_for_log = name.clone();
                 tokio::spawn(async move {
                     match crate::ssh::ssh_connect(&destination, None).await {
                         Ok(transport) => {
                             // Update the remote CWD to match what was
                             // persisted (canonicalize on the remote side).
                             if !remote_cwd.as_os_str().is_empty()
-                                && let Transport::Ssh(ref state) = transport
+                                && let Transport::Ssh(ref ssh_state) = transport
                             {
                                 match transport.canonicalize(&remote_cwd).await {
                                     Ok(canon) => {
-                                        *state.remote_cwd.lock().await = canon.clone();
-                                        SESSION_CWDS.write().unwrap().insert(name.clone(), canon);
+                                        *ssh_state.remote_cwd.lock().await = canon.clone();
+                                        state.set_cwd(canon);
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            "auto-reconnect SSH {name}: could not \
+                                            "auto-reconnect SSH {name_for_log}: could not \
                                                  canonicalize persisted CWD {remote_cwd:?}: {e}"
                                         );
                                     }
                                 }
                             }
-                            crate::transport::set_transport(&name, transport);
-                            tracing::info!("auto-reconnect SSH {name} succeeded");
+                            state.set_transport(transport);
+                            tracing::info!("auto-reconnect SSH {name_for_log} succeeded");
                         }
                         Err(e) => {
-                            tracing::warn!("auto-reconnect SSH {name} → {destination} failed: {e}");
+                            tracing::warn!(
+                                "auto-reconnect SSH {name_for_log} → {destination} failed: {e}"
+                            );
                         }
                     }
                 });
@@ -514,20 +502,14 @@ impl SessionManager {
 
 // ── persistence helpers ─────────────────────────────────────────
 
-/// Directory for the goop config: `~/.config/goop/`
-fn goop_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
-    PathBuf::from(home).join(".config").join("goop")
-}
-
 /// Directory for session files: `~/.config/goop/sessions/`
 pub(crate) fn sessions_dir() -> PathBuf {
-    goop_dir().join("sessions")
+    config::config_dir().join("sessions")
 }
 
 /// Path to the closed-sessions list: `~/.config/goop/closed_sessions.json`
 fn closed_sessions_path() -> PathBuf {
-    goop_dir().join("closed_sessions.json")
+    config::config_dir().join("closed_sessions.json")
 }
 
 /// Load the set of session names the user has explicitly closed.

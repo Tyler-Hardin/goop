@@ -197,7 +197,7 @@ fn parse_kv(line: &str) -> Option<(String, String)> {
 }
 
 fn ssh_config_path() -> PathBuf {
-    home_dir().join(".ssh").join("config")
+    crate::config::home_dir().join(".ssh").join("config")
 }
 
 // ── Resolved connection parameters ───────────────────────────────────
@@ -299,7 +299,7 @@ fn load_key(path: &Path) -> Result<Option<Arc<russh::keys::PrivateKey>>, anyhow:
 /// Default key paths to try: `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`,
 /// `~/.ssh/id_ecdsa`.
 fn default_identity_files() -> Vec<PathBuf> {
-    let ssh = home_dir().join(".ssh");
+    let ssh = crate::config::home_dir().join(".ssh");
     vec![
         ssh.join("id_ed25519"),
         ssh.join("id_rsa"),
@@ -568,17 +568,12 @@ pub async fn ssh_connect(
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-}
-
 fn expand_tilde(s: &str) -> PathBuf {
+    let home = crate::config::home_dir();
     if s == "~" {
-        home_dir()
+        home
     } else if let Some(rest) = s.strip_prefix("~/") {
-        home_dir().join(rest)
+        home.join(rest)
     } else {
         PathBuf::from(s)
     }
@@ -731,7 +726,7 @@ Host target
 
     #[test]
     fn test_expand_tilde() {
-        let home = home_dir();
+        let home = crate::config::home_dir();
         assert_eq!(expand_tilde("~"), home);
         assert_eq!(expand_tilde("~/foo"), home.join("foo"));
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));

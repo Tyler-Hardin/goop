@@ -1,4 +1,5 @@
-//! Configuration for goop: provider selection, model, and tuning knobs.
+//! Configuration for goop: provider selection, model, tuning knobs,
+//! and tool-group toggles.
 //!
 //! Reads from `~/.config/goop/config.toml` with env-var overrides.
 //! Falls back to DeepSeek defaults for backward compatibility.
@@ -9,9 +10,15 @@ use serde::Deserialize;
 
 // ── config file ──────────────────────────────────────────────────
 
-fn config_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
-    PathBuf::from(home).join(".config").join("goop")
+/// Return the user's home directory, computing it once at startup.
+pub fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn config_dir() -> PathBuf {
+    home_dir().join(".config").join("goop")
 }
 
 fn config_path() -> PathBuf {
@@ -68,9 +75,42 @@ impl Provider {
     }
 }
 
+// ── tool groups ──────────────────────────────────────────────────
+
+/// Groups of tools that can be enabled/disabled in config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolGroup {
+    /// `read`, `write`, `replace`, `read_html`, `cd`
+    FileOps,
+    /// `shell`
+    Shell,
+    /// `ssh`, `disconnect`
+    Ssh,
+    /// `screenshot`, `cursor_position`, `mouse_*`, `key_*`, `window_*`, `open_url`
+    ComputerUse,
+    /// `web_fetch`
+    WebFetch,
+}
+
+fn default_tool_groups() -> Vec<ToolGroup> {
+    vec![
+        ToolGroup::FileOps,
+        ToolGroup::Shell,
+        ToolGroup::Ssh,
+        ToolGroup::WebFetch,
+    ]
+}
+
+// ── config struct ────────────────────────────────────────────────
+
 /// Parsed configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// Computed once at startup; not serialized.
+    #[serde(skip)]
+    pub home_dir: PathBuf,
+
     #[serde(default = "default_provider")]
     pub provider: Provider,
     #[serde(default)]
@@ -79,6 +119,8 @@ pub struct Config {
     pub max_tokens: u64,
     #[serde(default = "default_max_turns")]
     pub default_max_turns: usize,
+    #[serde(default = "default_tool_groups")]
+    pub enabled_tool_groups: Vec<ToolGroup>,
 }
 
 fn default_provider() -> Provider {
@@ -93,14 +135,9 @@ fn default_max_turns() -> usize {
     100
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            provider: default_provider(),
-            model: None,
-            max_tokens: default_max_tokens(),
-            default_max_turns: default_max_turns(),
-        }
+impl Config {
+    pub fn has_tool_group(&self, group: ToolGroup) -> bool {
+        self.enabled_tool_groups.contains(&group)
     }
 }
 
@@ -117,8 +154,18 @@ pub fn load_config() -> anyhow::Result<Config> {
     let mut config = if let Ok(contents) = std::fs::read_to_string(config_path()) {
         toml::from_str(&contents)?
     } else {
-        Config::default()
+        Config {
+            home_dir: home_dir(),
+            provider: default_provider(),
+            model: None,
+            max_tokens: default_max_tokens(),
+            default_max_turns: default_max_turns(),
+            enabled_tool_groups: default_tool_groups(),
+        }
     };
+
+    // Ensure home_dir is always set (won't be from TOML).
+    config.home_dir = home_dir();
 
     // Env-var overrides.
     if let Ok(provider_str) = std::env::var("GOOP_PROVIDER") {

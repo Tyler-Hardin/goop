@@ -38,14 +38,18 @@ The web UI shows a session sidebar for switching between sessions.
   abstraction), a broadcast channel for events, and a FIFO prompt queue.
   Multiple views can submit prompts concurrently; the session drains them
   one at a time.
-- **`Config`** (`src/config.rs`) — provider selection, model name, and tuning
-  knobs. Reads from `~/.config/goop/config.toml` with env-var overrides
-  (`GOOP_PROVIDER`, `GOOP_MODEL`). Falls back to DeepSeek defaults.
+- **`Config`** (`src/config.rs`) — provider selection, model name, tuning
+  knobs, and tool-group toggles.  Owns `home_dir` (computed once at startup)
+  so no other module reads `HOME` from the environment.  Reads from
+  `~/.config/goop/config.toml` with env-var overrides (`GOOP_PROVIDER`,
+  `GOOP_MODEL`). Falls back to DeepSeek defaults.
 - **`model`** (`src/model.rs`) — provider abstraction layer. Wraps rig's
   type-level providers (DeepSeek, OpenAI, OpenRouter, Groq, Ollama,
   Anthropic) behind enums so one binary works with any provider. The
   `AnyAgent` enum owns the rig `Agent`; `AnyStream` unifies the
-  provider-specific stream types via mapping.
+  provider-specific stream types via mapping.  Tools are attached at build
+  time via `AgentBuilder::tools(Vec<Box<dyn ToolDyn>>)`, enabling runtime
+  configuration of which tool groups are active.
 - **`SessionEvent`** (`src/events.rs`) — enum of all events the session
   emits: `UserPrompt`, `Thinking`, `AssistantText`, `ToolCall`,
   `ToolResult`, `FinalResponse`, `Error`, `Cancelled`.  Serialized as
@@ -63,11 +67,19 @@ The web UI shows a session sidebar for switching between sessions.
   pointing at `http://127.0.0.1:8187`. The existing web UI
   (`assets/index.html`) is reused verbatim. If `--session` is given, the
   session name is passed in the URL hash so the web UI pre-selects it.
-- **Tools** (`src/tools.rs`) — `#[rig_tool]` functions exposed to
-  the LLM: `read`, `read_html`, `replace`, `write`, `shell`,
-  `cd`, `ssh`, `disconnect`, `web_fetch`, `screenshot`, `cursor_position`,
-  `mouse_move`, `mouse_click`, `key_type`, `key_press`, `window_list`,
-  `window_focus`, `window_get_active`, `open_url`.
+- **Tools** (`src/tools/`) — each tool implements `rig::tool::Tool` on a
+  struct that holds an `Arc<SessionState>`.  Tools are organised by group:
+  `file.rs` (read, write, replace, read_html, cd), `shell.rs` (shell),
+  `ssh_tool.rs` (ssh, disconnect), `web.rs` (web_fetch),
+  `computer.rs` (screenshot, cursor_position, mouse_*, key_*, window_*,
+  open_url).  The active set is built in `build_tools()` based on
+  `Config::enabled_tool_groups` and passed to the agent via the builder's
+  `.tools()` method, which takes `Vec<Box<dyn ToolDyn>>`.
+- **`SessionState`** (`src/session_state.rs`) — per-session shared mutable
+  state: `name`, `home_dir` (from Config), `cwd` (Mutex<PathBuf>), and
+  `transport` (Mutex<Transport>).  Replaces the former `SESSION_CWDS`,
+  `SESSION_TRANSPORTS` globals and `SESSION_ID` task-local.  Tools access
+  it through `Arc<SessionState>` — no global lookups needed.
 - **SSH** (`src/ssh.rs`) — connection logic: parses `~/.ssh/config`,
   resolves `HostName`/`User`/`Port`/`IdentityFile`/`ProxyJump`, loads
   private keys, and connects with key-first-then-password authentication.
@@ -331,9 +343,23 @@ with origin validation).
 
 - Rust edition 2024.
 - All async I/O uses tokio (full features).
-- Tools use `anyhow::Result` via `rig::tool::ToolError`.
-- `#[allow(dead_code)]` is used for items expected to be consumed by
-  future views (phone, web enhancements, etc.).
+- Tools implement `rig::tool::Tool` (manually, not via `#[rig_tool]`). Each
+  tool struct holds `Arc<SessionState>` for CWD/transport/home_dir access.
+- `Config::home_dir` is the single source of truth for `$HOME` — no other
+  module reads `std::env::var("HOME")`.
+- Tool groups are gated via `Config::enabled_tool_groups` (a `Vec<ToolGroup>`
+  in `config.toml`).  `build_tools()` produces a `Vec<Box<dyn ToolDyn>>` at
+  agent construction time — disabled groups simply aren't included.
 - Paths in tool arguments are `std::path::PathBuf`.
 - CLI args use `clap` derive (`#[derive(Parser)]`).
 - Never edit `Cargo.toml` directly; use `cargo add`.
+
+## Tool groups
+
+```toml
+# ~/.config/goop/config.toml
+enabled_tool_groups = ["file_ops", "shell", "ssh", "web_fetch", "computer_use"]
+```
+
+Available groups: `file_ops`, `shell`, `ssh`, `web_fetch`, `computer_use`.
+Default: all except `computer_use`.

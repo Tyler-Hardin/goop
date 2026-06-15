@@ -4,9 +4,12 @@
 //! to [`Transport::Ssh`]; `disconnect` demotes it back.  File tools
 //! (`read`, `write`, `replace`, `read_html`, `shell`, `cd`) route through
 //! the transport so they transparently work on the remote host.
+//!
+//! Transport state is stored in [`SessionState`](crate::session_state::SessionState)
+//! — there are no longer per-session global registries.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
+use std::sync::Arc;
 
 use russh::client::Handler;
 use russh_sftp::client::SftpSession;
@@ -131,30 +134,6 @@ impl Transport {
             Transport::Ssh(state) => state.label.clone(),
         }
     }
-}
-
-// ── global transport registry ──────────────────────────────────────
-
-pub(crate) static SESSION_TRANSPORTS: LazyLock<
-    StdRwLock<std::collections::HashMap<String, Transport>>,
-> = LazyLock::new(|| StdRwLock::new(std::collections::HashMap::new()));
-
-/// Get the transport for the current session (identified by the
-/// `SESSION_ID` task-local).  Falls back to `Transport::Local`.
-pub(crate) fn get_transport() -> Transport {
-    crate::session::SESSION_ID
-        .try_with(|id| SESSION_TRANSPORTS.read().unwrap().get(id).cloned())
-        .ok()
-        .flatten()
-        .unwrap_or(Transport::Local)
-}
-
-/// Register a transport for the given session.
-pub(crate) fn set_transport(session_id: &str, transport: Transport) {
-    SESSION_TRANSPORTS
-        .write()
-        .unwrap()
-        .insert(session_id.to_string(), transport);
 }
 
 // ── helpers ────────────────────────────────────────────────────────

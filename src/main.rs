@@ -6,6 +6,7 @@ mod model;
 mod preamble;
 mod server;
 mod session;
+mod session_state;
 mod ssh;
 mod terminal;
 mod tools;

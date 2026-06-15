@@ -6,17 +6,15 @@ use std::{
 
 use rig::{completion::Message, memory::ConversationMemory, memory::MemoryError};
 
+use crate::config;
+
 /// Path to the global prompt history file: `~/.config/goop/history.jsonl`
 ///
 /// Every prompt from every client (terminal, web, GUI) is appended here
 /// as a JSON-encoded string (one per line).  JSONL handles multi-line
 /// prompts without escaping ambiguities.
 pub(crate) fn prompt_history_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
-    PathBuf::from(home)
-        .join(".config")
-        .join("goop")
-        .join("history.jsonl")
+    config::config_dir().join("history.jsonl")
 }
 
 /// A file-backed [`ConversationMemory`] that persists messages as JSONL.

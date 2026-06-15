@@ -8,20 +8,19 @@
 //!   4. CWD (changes per session / cd)
 //!   5. AGENTS.md (project context; may be edited mid-session)
 
+use std::path::Path;
+
 /// Render the agent preamble from the Tera template and env context.
-pub fn build_preamble(cwd: &str) -> String {
+pub fn build_preamble(cwd: &str, home_dir: &Path) -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| String::from("unknown"));
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("~"));
     let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
 
     // USER.md
-    let user_md = if let Ok(home_dir) = std::env::var("HOME") {
-        let user_md_path = std::path::PathBuf::from(&home_dir)
-            .join(".config")
-            .join("goop")
-            .join("USER.md");
+    let user_md_path = home_dir.join(".config").join("goop").join("USER.md");
+    let user_md = {
         if !user_md_path.exists() {
-            let _ = std::fs::create_dir_all(user_md_path.parent().unwrap());
+            let parent = user_md_path.parent().unwrap(); // always has a parent
+            let _ = std::fs::create_dir_all(parent);
             let _ = std::fs::write(&user_md_path, "");
         }
         let content = std::fs::read_to_string(&user_md_path).unwrap_or_default();
@@ -31,8 +30,6 @@ pub fn build_preamble(cwd: &str) -> String {
         } else {
             trimmed.to_string()
         }
-    } else {
-        String::from("[empty, no user memories yet.]")
     };
 
     // AGENTS.md (may be present or absent — template handles the conditional)
@@ -40,7 +37,7 @@ pub fn build_preamble(cwd: &str) -> String {
 
     let mut context = tera::Context::new();
     context.insert("user", &user);
-    context.insert("home", &home);
+    context.insert("home", &home_dir.display().to_string());
     context.insert("shell", &shell);
     context.insert("os_family", std::env::consts::OS);
     context.insert("arch", std::env::consts::ARCH);
