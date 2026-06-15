@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::Arc;
 
 use tao::event::Event;
@@ -9,6 +10,9 @@ use wry::WebViewBuilderExtUnix;
 
 use crate::server;
 use crate::session::SessionManager;
+
+/// Embedded icon — a green "goop splat"
+static ICON_PNG: &[u8] = include_bytes!("../assets/goop_icon.png");
 
 /// Launch the desktop GUI, auto-starting a server if none is running.
 ///
@@ -85,6 +89,24 @@ fn open_webview(session_name: Option<String>) -> anyhow::Result<()> {
         .with_title("goop")
         .with_inner_size(tao::dpi::LogicalSize::new(1000.0, 750.0))
         .build(&event_loop)?;
+
+    // Set the window icon so it shows up in the DE window picker /
+    // Alt-Tab switcher.  We write the embedded PNG to a temp file
+    // and use GTK's set_icon_from_file.
+    {
+        let icon_path = std::env::temp_dir().join("goop_icon.png");
+        if let Err(e) = std::fs::File::create(&icon_path).and_then(|mut f| f.write_all(ICON_PNG)) {
+            tracing::warn!("could not write icon file: {e}");
+        } else {
+            use gtk::prelude::GtkWindowExt;
+            let gtk_win = window.gtk_window();
+            if let Err(e) = gtk_win.set_icon_from_file(&icon_path) {
+                tracing::warn!("failed to set window icon: {e}");
+            }
+            // Best-effort cleanup; the file is tiny and in /tmp anyway.
+            let _ = std::fs::remove_file(&icon_path);
+        }
+    }
 
     // tao creates a default GtkBox as the window's child.  We add the
     // webview into that box so it fills the window.
