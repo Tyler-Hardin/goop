@@ -18,6 +18,7 @@ streamdown-parser = "0.1"
 streamdown-render = "0.1"
 subprocess = "1.1"
 tao = { version = "0.35.3", default-features = false, features = ["x11", "rwh_06"] }
+tera = "1.20.1"
 tokio = { version = "1.52", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
