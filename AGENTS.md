@@ -54,9 +54,17 @@ The web UI shows a session sidebar for switching between sessions.
   session name is passed in the URL hash so the web UI pre-selects it.
 - **Tools** (`src/tools.rs`) — `#[rig_tool]` functions exposed to
   the LLM: `read`, `read_html`, `replace`, `write`, `shell`,
-  `cd`, `web_fetch`, `screenshot`, `cursor_position`, `mouse_move`,
-  `mouse_click`, `key_type`, `key_press`, `window_list`,
+  `cd`, `ssh`, `disconnect`, `web_fetch`, `screenshot`, `cursor_position`,
+  `mouse_move`, `mouse_click`, `key_type`, `key_press`, `window_list`,
   `window_focus`, `window_get_active`, `open_url`.
+- **SSH** (`src/ssh.rs`) — connection logic: parses `~/.ssh/config`,
+  resolves `HostName`/`User`/`Port`/`IdentityFile`/`ProxyJump`, loads
+  private keys, and connects with key-first-then-password authentication.
+  Exposes `ssh_connect()` for use by the `ssh` tool.
+- **Transport** (`src/transport.rs`) — `Transport` enum (`Local` / `Ssh`),
+  `SshState`, `SshHandler`, and the global transport registry.  File and
+  shell tools route through the transport so they work transparently on
+  local or remote hosts.
 - **FileConversationMemory** (`src/memory.rs`) — implements rig's
   `ConversationMemory` trait backed by a JSONL file on disk. One
   per session at `~/.config/goop/sessions/<name>.messages.jsonl`.
@@ -121,6 +129,49 @@ On creation the CWD defaults to the server process's CWD.
 - The global `SESSION_CWDS` (a `LazyLock<RwLock<HashMap<String, PathBuf>>>`)
   and a `tokio::task_local! SESSION_ID` allow tools to find their session's
   CWD without explicit plumbing.
+
+### SSH transport
+
+A session can operate on a remote host via the `ssh` tool.  The transport
+layer (`src/transport.rs`) abstracts local vs. remote file operations so
+that `read`, `write`, `replace`, `read_html`, `shell`, and `cd` work
+transparently on whichever host is active.
+
+Connection logic lives in `src/ssh.rs`, which:
+
+- **Parses `~/.ssh/config`** — resolves `Host` aliases to `HostName`,
+  `User`, `Port`, `IdentityFile`, and `ProxyJump`.  Supports `=`,
+  glob patterns (`*`, `?`), and multi-value `Host` lines.  `Match`
+  blocks are ignored.
+- **Key authentication** — tries configured `IdentityFile` keys (or
+  defaults: `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `~/.ssh/id_ecdsa`)
+  via `russh::keys::load_secret_key` and `authenticate_publickey`.  Falls
+  back to password if provided and keys fail.
+- **ProxyJump** — connects to the jump host, opens a `direct-tcpip`
+  channel to the target, then runs SSH over that tunnel via
+  `russh::client::connect_stream`.  Supports multiple chained jumps
+  (comma-separated in config).
+- **`ssh` tool** — calls `ssh::ssh_connect()`.  If already connected
+  to a different host, disconnects first.
+- **`disconnect` tool** — closes the SSH connection and resets the
+  transport to `Local`.  The CWD is reset to the server process's CWD.
+- **`Transport` enum** (`src/transport.rs`) — `Local` or `Ssh(Arc<SshState>)`.
+  `SshState` holds the russh `Handle` (for opening exec channels) and an
+  `SftpSession` (for file read/write/directory ops), each behind a
+  `tokio::sync::Mutex`.  The remote CWD is tracked in `SshState.remote_cwd`.
+- **File tools** (`read`, `write`, `replace`, `read_html`) — read/write
+  via SFTP when SSH'd, using `SftpSession::open_with_flags`.
+- **`shell` tool** — opens a fresh exec channel per command, with
+  `cd <cwd> && <command> 2>&1` to combine stdout/stderr.
+- **`cd` tool** — uses `SftpSession::canonicalize` to resolve remote paths
+  and `SftpSession::metadata` to verify directories.
+- **Computer-use tools** (`screenshot`, `cursor_position`, `mouse_*`,
+  `key_*`, `window_*`, `open_url`) are **local-only** — they ignore the
+  transport and always operate on the local machine.
+- **`web_fetch`** is also local-only (HTTP requests always go from the
+  server process).
+- Host key checking against `~/.ssh/known_hosts`:
+  unknown hosts are learned on first use (TOFU); changed keys are rejected.
 
 ### Web UI sidebar
 The web UI (`assets/index.html`) has a left sidebar listing all sessions.

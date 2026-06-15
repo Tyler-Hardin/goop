@@ -4,8 +4,10 @@ mod memory;
 mod preamble;
 mod server;
 mod session;
+mod ssh;
 mod terminal;
 mod tools;
+mod transport;
 
 use std::sync::Arc;
 

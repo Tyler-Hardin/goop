@@ -15,6 +15,7 @@ use crate::memory::FileConversationMemory;
 use crate::memory::prompt_history_path;
 use crate::preamble::build_preamble;
 use crate::tools;
+use crate::transport::Transport;
 
 // ── per-session CWD ──────────────────────────────────────────────
 
@@ -124,6 +125,8 @@ impl Session {
             .tool(tools::Write)
             .tool(tools::Shell)
             .tool(tools::Cd)
+            .tool(tools::Ssh)
+            .tool(tools::Disconnect)
             .tool(tools::WebFetch)
             .tool(tools::Screenshot)
             .tool(tools::CursorPosition)
@@ -390,6 +393,9 @@ impl SessionManager {
     /// If the session already exists in the map, returns it directly.
     /// Otherwise creates a new [`Session`] — which loads events and
     /// messages from disk if files exist for this name.
+    ///
+    /// If the session was previously connected via SSH (a `.ssh` file
+    /// exists), a background task is spawned to auto-reconnect.
     pub async fn get_or_create(&self, name: String) -> anyhow::Result<Arc<Session>> {
         // Fast path: read lock.
         {
@@ -406,7 +412,55 @@ impl SessionManager {
         if let Some(s) = sessions.get(&name) {
             return Ok(Arc::clone(s));
         }
-        sessions.insert(name, Arc::clone(&session));
+        sessions.insert(name.clone(), Arc::clone(&session));
+
+        // If this session was previously SSH'd, auto-reconnect in the
+        // background so the transport is warm when the first prompt
+        // arrives.
+        let ssh_file = sessions_dir().join(format!("{name}.ssh"));
+        if ssh_file.exists()
+            && let Ok(contents) = std::fs::read_to_string(&ssh_file)
+        {
+            let mut lines = contents.lines();
+            let destination = lines.next().unwrap_or("").trim().to_string();
+            let remote_cwd = lines
+                .next()
+                .map(|s| PathBuf::from(s.trim()))
+                .unwrap_or_default();
+            if !destination.is_empty() {
+                tracing::info!("auto-reconnecting SSH session {name} → {destination}");
+                tokio::spawn(async move {
+                    match crate::ssh::ssh_connect(&destination, None).await {
+                        Ok(transport) => {
+                            // Update the remote CWD to match what was
+                            // persisted (canonicalize on the remote side).
+                            if !remote_cwd.as_os_str().is_empty()
+                                && let Transport::Ssh(ref state) = transport
+                            {
+                                match transport.canonicalize(&remote_cwd).await {
+                                    Ok(canon) => {
+                                        *state.remote_cwd.lock().await = canon.clone();
+                                        SESSION_CWDS.write().unwrap().insert(name.clone(), canon);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "auto-reconnect SSH {name}: could not \
+                                                 canonicalize persisted CWD {remote_cwd:?}: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            crate::transport::set_transport(&name, transport);
+                            tracing::info!("auto-reconnect SSH {name} succeeded");
+                        }
+                        Err(e) => {
+                            tracing::warn!("auto-reconnect SSH {name} → {destination} failed: {e}");
+                        }
+                    }
+                });
+            }
+        }
+
         Ok(session)
     }
 

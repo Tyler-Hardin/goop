@@ -1,6 +1,13 @@
 use rig_derive::rig_tool;
 use std::path::PathBuf;
 
+use crate::transport::{self, Transport};
+
+/// Convert transport errors (anyhow) into rig ToolError via string formatting.
+fn tool_err(e: impl std::fmt::Display) -> rig::tool::ToolError {
+    rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(e.to_string())))
+}
+
 #[rig_tool(
     description = "Read file at path, optionally with start_line and end_line (both 1-indexed, inclusive). Returns line-numbered content.",
     required(command)
@@ -10,10 +17,9 @@ pub async fn read(
     start_line: Option<u64>,
     end_line: Option<u64>,
 ) -> Result<String, rig::tool::ToolError> {
-    let path = resolve_path(path);
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    let transport = transport::get_transport();
+    let path = resolve_path(&transport, path).await;
+    let content = transport.read_file(&path).await.map_err(tool_err)?;
 
     let all_lines: Vec<&str> = content.lines().collect();
     let total = all_lines.len() as u64;
@@ -54,10 +60,9 @@ pub async fn replace(
     old_str: String,
     new_str: String,
 ) -> Result<String, rig::tool::ToolError> {
-    let path = resolve_path(path);
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    let transport = transport::get_transport();
+    let path = resolve_path(&transport, path).await;
+    let content = transport.read_file(&path).await.map_err(tool_err)?;
     let count = content.matches(&old_str).count();
     if count == 0 {
         Err(rig::tool::ToolError::ToolCallError(Box::new(
@@ -69,32 +74,19 @@ pub async fn replace(
         )))
     } else {
         let new_content = content.replacen(&old_str, &new_str, 1);
-        tokio::fs::write(&path, &new_content)
+        transport
+            .write_file(&path, &new_content)
             .await
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+            .map_err(tool_err)?;
         Ok(format!("Replaced 1 occurrence in {}", path.display()))
     }
 }
 
 #[rig_tool(description = "Run command in shell", required(command))]
 pub async fn shell(command: String) -> Result<String, rig::tool::ToolError> {
-    let cwd = current_session_cwd();
-    tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .current_dir(&cwd)
-        .output()
-        .await
-        .map(|out| {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.is_empty() {
-                stdout.into_owned()
-            } else {
-                format!("{stdout}{stderr}")
-            }
-        })
-        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))
+    let transport = transport::get_transport();
+    let cwd = current_cwd_for(&transport).await;
+    transport.run_shell(&command, &cwd).await.map_err(tool_err)
 }
 
 #[rig_tool(
@@ -110,7 +102,8 @@ pub async fn cd(path: String) -> Result<String, rig::tool::ToolError> {
             )))
         })?;
 
-    let current = current_session_cwd();
+    let transport = transport::get_transport();
+    let current = current_cwd_for(&transport).await;
 
     // Resolve the new path.
     let new_path = if path == "~" || path == "~/" {
@@ -131,8 +124,8 @@ pub async fn cd(path: String) -> Result<String, rig::tool::ToolError> {
         current.join(&path)
     };
 
-    // Resolve symlinks, .., etc.
-    let canonical = std::fs::canonicalize(&new_path).map_err(|e| {
+    // Validate the path exists and is a directory via the transport.
+    let canonical = transport.canonicalize(&new_path).await.map_err(|e| {
         rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(format!(
             "cd: {}: {}",
             new_path.display(),
@@ -140,21 +133,46 @@ pub async fn cd(path: String) -> Result<String, rig::tool::ToolError> {
         ))))
     })?;
 
-    if !canonical.is_dir() {
+    if !transport.is_dir(&canonical).await.map_err(|e| {
+        rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(format!(
+            "cd: {}: {}",
+            canonical.display(),
+            e
+        ))))
+    })? {
         return Err(rig::tool::ToolError::ToolCallError(Box::new(
             std::io::Error::other(format!("cd: not a directory: {}", canonical.display())),
         )));
     }
 
-    // Persist to disk.
-    let cwd_path = crate::session::sessions_dir().join(format!("{session_id}.cwd"));
-    crate::session::save_cwd(&cwd_path, &canonical);
+    // Update CWD in the right place.
+    match &transport {
+        Transport::Local => {
+            // Persist to disk.
+            let cwd_path = crate::session::sessions_dir().join(format!("{session_id}.cwd"));
+            crate::session::save_cwd(&cwd_path, &canonical);
 
-    // Update the global map.
-    crate::session::SESSION_CWDS
-        .write()
-        .unwrap()
-        .insert(session_id, canonical.clone());
+            // Update the global map.
+            crate::session::SESSION_CWDS
+                .write()
+                .unwrap()
+                .insert(session_id.clone(), canonical.clone());
+        }
+        Transport::Ssh(state) => {
+            // Update remote CWD in the SshState.
+            *state.remote_cwd.lock().await = canonical.clone();
+
+            // Also persist locally so the remote CWD survives restarts.
+            let cwd_path = crate::session::sessions_dir().join(format!("{session_id}.cwd"));
+            crate::session::save_cwd(&cwd_path, &canonical);
+
+            // Update the global CWD map too (for display/consistency).
+            crate::session::SESSION_CWDS
+                .write()
+                .unwrap()
+                .insert(session_id.clone(), canonical.clone());
+        }
+    }
 
     Ok(format!(
         "Changed working directory to {}",
@@ -162,27 +180,151 @@ pub async fn cd(path: String) -> Result<String, rig::tool::ToolError> {
     ))
 }
 
-/// Read the current session's CWD from the global map.
-fn current_session_cwd() -> PathBuf {
-    crate::session::SESSION_ID
-        .try_with(|id| {
-            crate::session::SESSION_CWDS
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-        })
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+#[rig_tool(
+    description = "Connect to a remote server via SSH. All subsequent file operations (read, write, replace, read_html) and shell commands will execute on the remote host. Use 'disconnect' to return to local operation. Example destination: 'user@host' or 'user@host:2222'.",
+    required(command)
+)]
+pub async fn ssh(
+    destination: String,
+    password: Option<String>,
+) -> Result<String, rig::tool::ToolError> {
+    let session_id = crate::session::SESSION_ID
+        .try_with(|s| s.clone())
+        .map_err(|_| {
+            rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(
+                "ssh: no session context",
+            )))
+        })?;
+
+    // If already connected via SSH, disconnect first.
+    let existing = transport::get_transport();
+    if existing.is_ssh() {
+        transport::set_transport(&session_id, Transport::Local);
+    } else {
+        // We're connecting from local — stash the current local CWD so
+        // `disconnect` can restore it instead of resetting to the
+        // server process CWD.
+        let local_cwd = current_cwd_for(&existing).await;
+        let local_cwd_path = crate::session::sessions_dir().join(format!("{session_id}.cwd.local"));
+        crate::session::save_cwd(&local_cwd_path, &local_cwd);
+    }
+
+    let transport = crate::ssh::ssh_connect(&destination, password.as_deref())
+        .await
+        .map_err(|e| {
+            rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(format!(
+                "ssh: {e}"
+            ))))
+        })?;
+
+    let remote_cwd = current_cwd_for(&transport).await;
+    transport::set_transport(&session_id, transport.clone());
+
+    // Update CWD map to reflect the remote CWD.
+    crate::session::SESSION_CWDS
+        .write()
+        .unwrap()
+        .insert(session_id.clone(), remote_cwd.clone());
+
+    // Persist remote CWD.
+    let cwd_path = crate::session::sessions_dir().join(format!("{session_id}.cwd"));
+    crate::session::save_cwd(&cwd_path, &remote_cwd);
+
+    // Persist SSH destination so the session can auto-reconnect on revival.
+    let ssh_file = crate::session::sessions_dir().join(format!("{session_id}.ssh"));
+    let _ = std::fs::write(
+        &ssh_file,
+        format!("{}\n{}\n", destination, remote_cwd.display()),
+    );
+
+    Ok(format!(
+        "Connected to {} — working directory: {}",
+        transport.label(),
+        remote_cwd.display()
+    ))
 }
 
-/// Resolve `path` against the session CWD if it's relative.
-fn resolve_path(path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        path
+#[rig_tool(
+    description = "Close the SSH connection and return to local operation. File operations and shell commands will run on the local machine again.",
+    required(command)
+)]
+pub async fn disconnect() -> Result<String, rig::tool::ToolError> {
+    let session_id = crate::session::SESSION_ID
+        .try_with(|s| s.clone())
+        .map_err(|_| {
+            rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(
+                "disconnect: no session context",
+            )))
+        })?;
+
+    let transport = transport::get_transport();
+    if !transport.is_ssh() {
+        return Ok("Not connected via SSH — already operating locally.".into());
+    }
+
+    // Reset to local transport.
+    transport::set_transport(&session_id, Transport::Local);
+
+    // Remove the SSH persistence file so we don't auto-reconnect on revival.
+    let ssh_file = crate::session::sessions_dir().join(format!("{session_id}.ssh"));
+    let _ = std::fs::remove_file(&ssh_file);
+
+    // Restore the pre-SSH local CWD if we stashed one.
+    let local_cwd_path = crate::session::sessions_dir().join(format!("{session_id}.cwd.local"));
+    let local_cwd = if let Ok(contents) = std::fs::read_to_string(&local_cwd_path) {
+        let p = PathBuf::from(contents.trim());
+        if p.is_dir() {
+            // Remove the stash file so it doesn't linger.
+            let _ = std::fs::remove_file(&local_cwd_path);
+            p
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
     } else {
-        current_session_cwd().join(path)
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    crate::session::SESSION_CWDS
+        .write()
+        .unwrap()
+        .insert(session_id.clone(), local_cwd.clone());
+
+    // Persist local CWD.
+    let cwd_path = crate::session::sessions_dir().join(format!("{session_id}.cwd"));
+    crate::session::save_cwd(&cwd_path, &local_cwd);
+
+    Ok(format!(
+        "Disconnected — now operating locally in {}",
+        local_cwd.display()
+    ))
+}
+
+/// Resolve `path` against the transport's CWD if it's relative.
+async fn resolve_path(transport: &Transport, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    let cwd = current_cwd_for(transport).await;
+    cwd.join(path)
+}
+
+/// Get the effective CWD for this transport, regardless of local/remote.
+async fn current_cwd_for(transport: &Transport) -> PathBuf {
+    match transport {
+        Transport::Local => {
+            // Read from the global SESSION_CWDS map (updated by `cd` tool).
+            crate::session::SESSION_ID
+                .try_with(|id| {
+                    crate::session::SESSION_CWDS
+                        .read()
+                        .unwrap()
+                        .get(id)
+                        .cloned()
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        }
+        Transport::Ssh(state) => state.remote_cwd.lock().await.clone(),
     }
 }
 
@@ -195,10 +337,9 @@ fn home_dir() -> Option<PathBuf> {
     required(path)
 )]
 pub async fn read_html(path: std::path::PathBuf) -> Result<String, rig::tool::ToolError> {
-    let path = resolve_path(path);
-    let html = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    let transport = transport::get_transport();
+    let path = resolve_path(&transport, path).await;
+    let html = transport.read_file(&path).await.map_err(tool_err)?;
     tokio::task::spawn_blocking(move || {
         html2text::from_read(html.as_bytes(), 80).map_err(|e| {
             rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(e.to_string())))
@@ -278,10 +419,12 @@ pub async fn write(
     path: std::path::PathBuf,
     content: String,
 ) -> Result<String, rig::tool::ToolError> {
-    let path = resolve_path(path);
-    tokio::fs::write(&path, &content)
+    let transport = transport::get_transport();
+    let path = resolve_path(&transport, path).await;
+    transport
+        .write_file(&path, &content)
         .await
-        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        .map_err(tool_err)?;
     Ok(format!(
         "Wrote {} bytes to {}",
         content.len(),
