@@ -25,6 +25,7 @@
           gdk-pixbuf
           libx11
           libxcb
+          libGL
         ];
 
         # Hooks and tools needed at build-time on Linux so the webview
@@ -62,14 +63,21 @@
 
           inputsFrom = [ self.packages.${system}.default ];
 
+          # wrapGAppsHook3 must be in nativeBuildInputs (not packages) so
+          # its shell hook runs — this sets XDG_DATA_DIRS, GIO_EXTRA_MODULES,
+          # GDK_PIXBUF_MODULE_FILE etc. that WebKitGTK needs at runtime.
+          nativeBuildInputs = with pkgs; [
+            wrapGAppsHook3
+            glib-networking
+          ];
+
           packages = with pkgs; [
             cargo
             rustc
             rustfmt
             clippy
             rust-analyzer
-          ] ++ pkgs.lib.optionals isLinux linuxBuildInputs
-            ++ pkgs.lib.optionals isLinux linuxNativeBuildInputs;
+          ] ++ pkgs.lib.optionals isLinux linuxBuildInputs;
         };
       });
 }

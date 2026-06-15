@@ -3588,6 +3588,8 @@ dependencies = [
  "axum-extra",
  "clap",
  "futures",
+ "gtk",
+ "log",
  "rig",
  "rig-derive",
  "rustyline",

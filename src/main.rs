@@ -27,8 +27,9 @@ fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rig_core=warn")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,wry=debug,tao=debug,rig_core=warn")
+            }),
         )
         .init();
 
@@ -122,8 +123,15 @@ fn run_gui_client() -> anyhow::Result<()> {
 fn open_webview() -> anyhow::Result<()> {
     use tao::event::Event;
     use tao::event_loop::{ControlFlow, EventLoop};
+    use tao::platform::unix::WindowExtUnix;
     use tao::window::WindowBuilder;
     use wry::WebViewBuilder;
+    use wry::WebViewBuilderExtUnix;
+
+    // GTK must be initialized before wry can embed WebKitGTK.
+    // On Linux, wry requires build_gtk(window.default_vbox()) instead of
+    // build(&window) — raw window handles silently produce a blank window.
+    gtk::init()?;
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -131,10 +139,15 @@ fn open_webview() -> anyhow::Result<()> {
         .with_inner_size(tao::dpi::LogicalSize::new(1000.0, 750.0))
         .build(&event_loop)?;
 
+    // tao creates a default GtkBox as the window's child.  We add the
+    // webview into that box so it fills the window.
+    let vbox = window
+        .default_vbox()
+        .expect("tao window should have a default GtkBox");
     let _webview = WebViewBuilder::new()
         .with_url("http://127.0.0.1:8187")
         .with_devtools(true)
-        .build(&window)?;
+        .build_gtk(vbox)?;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
