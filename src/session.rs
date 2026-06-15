@@ -125,6 +125,7 @@ impl Session {
             .agent(deepseek::DEEPSEEK_V4_PRO)
             .preamble(&preamble)
             .tool(tools::Read)
+            .tool(tools::ReadHtml)
             .tool(tools::Replace)
             .tool(tools::Shell)
             .tool(tools::Write)

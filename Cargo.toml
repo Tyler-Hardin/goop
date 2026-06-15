@@ -10,6 +10,7 @@ axum-extra = "0.12"
 clap = { version = "4.6.1", features = ["derive"] }
 futures = "0.3"
 gtk = { version = "0.18.2", features = ["v3_24"] }
+html2text = "0.17.1"
 log = "0.4"
 rig = { version = "0.38", features = ["derive"] }
 rig-derive = "0.38"

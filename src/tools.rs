@@ -92,6 +92,23 @@ pub async fn shell(command: String) -> Result<String, rig::tool::ToolError> {
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))
 }
 
+#[rig_tool(
+    description = "Read an HTML file at path and return extracted plain text (headings, links, body text). Useful for local crate docs, cached pages, etc.",
+    required(path)
+)]
+pub async fn read_html(path: std::path::PathBuf) -> Result<String, rig::tool::ToolError> {
+    let html = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    tokio::task::spawn_blocking(move || {
+        html2text::from_read(html.as_bytes(), 80).map_err(|e| {
+            rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(e.to_string())))
+        })
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
 #[rig_tool(description = "Write content to file at path", required(path, content))]
 pub async fn write(
     path: std::path::PathBuf,
