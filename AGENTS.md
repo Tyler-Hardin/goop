@@ -45,21 +45,67 @@ other client.
 - **Desktop GUI** (`src/main.rs` `run_gui`) — opens a native `wry` webview
   pointing at `http://127.0.0.1:8187`. The existing web UI
   (`assets/index.html`) is reused verbatim.
-- **Tools** (`src/tools.rs`) — four `#[rig_tool]` functions exposed to
-  the LLM: `read`, `replace`, `write`, `shell`.
+- **Tools** (`src/tools.rs`) — `#[rig_tool]` functions exposed to
+  the LLM: `read`, `read_html`, `replace`, `write`, `shell`,
+  `web_fetch`, `screenshot`, `cursor_position`, `mouse_move`,
+  `mouse_click`, `key_type`, `key_press`, `window_list`,
+  `window_focus`, `window_get_active`, `open_url`.
+- **FileConversationMemory** (`src/memory.rs`) — implements rig's
+  `ConversationMemory` trait backed by a JSONL file on disk. Used when
+  `--session <name>` is given so the agent's conversation memory
+  survives restarts.
 
 ## Startup modes
 
 ```
-goop            terminal REPL (always WS client; auto-starts server)
-goop serve      headless server only
-goop gui        desktop GUI (primary if no server, else client webview)
+goop                    terminal REPL (always WS client; auto-starts server)
+goop -s <name>          resume/create named session
+goop serve              headless server only
+goop serve -s <name>    headless server with named session
+goop gui                desktop GUI (primary if no server, else client webview)
+goop gui -s <name>      GUI with named session
 ```
+
+All modes print the session name on startup (`● session 20260128_001`) and
+on exit (`● session closed · 20260128_001`) so you can copy/paste to resume.
 
 On launch, `goop gui` checks whether a server is already listening on
 `127.0.0.1:8187`.  If yes it opens a client webview; if no it starts the
 server in-process.  `goop` (terminal) always auto-starts a server if none is
 running, then connects as a WS client — it never owns the session directly.
+
+## History
+
+Two independent history systems:
+
+### Prompt history (global command history)
+- Lives at `~/.config/goop/history.jsonl` — JSONL format, one JSON-encoded
+  string per line. JSON escaping handles multi-line prompts safely.
+- **Write path:** the `Session` appends every prompt from every client
+  (terminal, web, GUI) to this file via `append_prompt_to_history()`.
+- **Read path:** the terminal loads the file on startup and after every
+  response completes (`sync_history_from_file` — clear + reload). This
+  picks up prompts from web/GUI clients that arrived mid-session.
+- The terminal also calls `add_history_entry` locally when the user submits
+  a prompt, so their own input is immediately available for up/down
+  navigation without waiting for the response to finish.
+- Used for up/down arrow navigation in the terminal REPL (like bash history).
+
+### Session history (per-session persistence)
+- Always active.  If `--session <name>` is given the session is stored
+  under that name; otherwise a name is auto-generated as `YYYYMMDD_NNN`
+  (e.g. `20260128_001`), picking the next free sequence number for today.
+- Two files under `~/.config/goop/sessions/`:
+  - `<name>.jsonl` — `SessionEvent` stream (JSONL). Loaded into the
+    session's `history` Vec on startup so late-joining clients see past
+    events via `subscribe_all()`. Appended to on every `emit()`.
+  - `<name>.messages.jsonl` — LLM `Message` objects (JSONL). Managed by
+    `FileConversationMemory` which implements rig's `ConversationMemory`
+    trait. The agent's internal memory loads from this file before each
+    prompt and appends after each successful turn — no replay or
+    re-execution needed.
+- When a session file exists, the agent picks up the conversation where
+  it left off.
 
 ## Key design decisions
 

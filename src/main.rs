@@ -1,4 +1,5 @@
 mod events;
+mod memory;
 mod server;
 mod session;
 mod terminal;
@@ -10,6 +11,11 @@ use session::Session;
 #[derive(Parser)]
 #[command(name = "goop")]
 struct Args {
+    /// Resume or create a named session (persisted to disk).
+    /// Auto-generated as YYYYMMDD_NNN if not given.
+    #[arg(long, short)]
+    session: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -36,12 +42,12 @@ fn main() -> anyhow::Result<()> {
     match args.command {
         Some(Command::Serve) => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_server())?;
+            rt.block_on(run_server(args.session))?;
         }
-        Some(Command::Gui) => run_gui()?,
+        Some(Command::Gui) => run_gui(args.session)?,
         None => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_terminal())?;
+            rt.block_on(run_terminal(args.session))?;
         }
     }
 
@@ -50,19 +56,20 @@ fn main() -> anyhow::Result<()> {
 
 // ── terminal mode ──────────────────────────────────────────────
 
-async fn run_terminal() -> anyhow::Result<()> {
+async fn run_terminal(session_name: Option<String>) -> anyhow::Result<()> {
     if is_server_running().await {
         tracing::info!("found existing server on :8187, connecting as client");
     } else {
         tracing::info!("no server found, starting server");
-        start_server_in_background().await?;
+        start_server_in_background(session_name).await?;
     }
     terminal::TerminalClient::run().await
 }
 
 /// Spawn the server in the background and return once it's listening.
-async fn start_server_in_background() -> anyhow::Result<()> {
-    let session = Session::new(256)?;
+async fn start_server_in_background(session_name: Option<String>) -> anyhow::Result<()> {
+    let session = Session::new(256, session_name)?;
+    tracing::info!("session · {}", session.name());
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let app = server::build_router(session);
@@ -78,7 +85,7 @@ async fn start_server_in_background() -> anyhow::Result<()> {
 
 // ── GUI mode ───────────────────────────────────────────────────
 
-fn run_gui() -> anyhow::Result<()> {
+fn run_gui(session_name: Option<String>) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     if rt.block_on(is_server_running()) {
@@ -86,13 +93,17 @@ fn run_gui() -> anyhow::Result<()> {
         run_gui_client()
     } else {
         tracing::info!("no server found, starting primary");
-        run_gui_primary(rt)
+        run_gui_primary(rt, session_name)
     }
 }
 
 /// GUI mode when we own the session + server.
-fn run_gui_primary(rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
-    let session = rt.block_on(async { Session::new(256) })?;
+fn run_gui_primary(
+    rt: tokio::runtime::Runtime,
+    session_name: Option<String>,
+) -> anyhow::Result<()> {
+    let session = rt.block_on(async { Session::new(256, session_name) })?;
+    tracing::info!("session · {}", session.name());
     let app = server::build_router(session);
 
     // Bind the TCP listener synchronously on the main thread so that
@@ -163,8 +174,9 @@ fn open_webview() -> anyhow::Result<()> {
 
 // ── server mode ────────────────────────────────────────────────
 
-async fn run_server() -> anyhow::Result<()> {
-    let session = Session::new(256)?;
+async fn run_server(session_name: Option<String>) -> anyhow::Result<()> {
+    let session = Session::new(256, session_name)?;
+    tracing::info!("session · {}", session.name());
     server::serve(session).await
 }
 

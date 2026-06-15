@@ -3,6 +3,7 @@ use rustyline::Cmd;
 use rustyline::DefaultEditor;
 use rustyline::KeyEvent;
 use rustyline::error::ReadlineError;
+use std::io::BufRead;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
@@ -10,6 +11,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::events::SessionEvent;
+use crate::memory::prompt_history_path;
 
 // ── ANSI constants ──────────────────────────────────────────────
 
@@ -91,7 +93,16 @@ impl TerminalClient {
         let (ws_tx, ws_rx) = ws_stream.split();
         let ws_tx = Arc::new(tokio::sync::Mutex::new(ws_tx));
 
+        // ── prompt history ───────────────────────────────────
+        // Load the global prompt history (JSONL, one JSON string per line).
+        // The server writes every prompt from every client here, so the
+        // terminal always sees the complete history.
+        let history_path = prompt_history_path();
+        if let Some(parent) = history_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
         let mut rl = DefaultEditor::new()?;
+        sync_history_from_file(&mut rl, &history_path);
         // Ctrl+J inserts a literal newline for multiline input.
         rl.bind_sequence(KeyEvent::ctrl('j'), Cmd::Insert(1, "\n".into()));
         let term_width = streamdown_render::terminal_width();
@@ -105,6 +116,9 @@ impl TerminalClient {
 
         // Events from WS → render task.
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
+
+        // Shared session name — captured from SessionInfo event, printed on exit.
+        let session_name: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
 
         // Render task signals main loop when output is fully rendered.
         let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
@@ -162,6 +176,9 @@ impl TerminalClient {
                                 } else {
                                     break 'outer;
                                 }
+                                // Reload history from disk so prompts from
+                                // web/GUI clients show up in up/down nav.
+                                sync_history_from_file(&mut rl, &history_path);
                                 break;
                             }
                         }
@@ -186,10 +203,12 @@ impl TerminalClient {
 
         // ── WS receive task ───────────────────────────────────
         // Reads JSON SessionEvent from the WebSocket and forwards
-        // to the render task. Filters out UserPrompt events — the
-        // terminal shows the readline prompt instead of echoing.
+        // to the render task. Filters out UserPrompt echoes — the
+        // terminal user already saw their input on the readline.
+        // Captures SessionInfo for display on exit.
         let fwd_tx = ev_tx.clone();
         let mut ws_rx = ws_rx;
+        let ws_session_name = session_name.clone();
         let fwd_handle = tokio::spawn(async move {
             while let Some(msg) = ws_rx.next().await {
                 match msg {
@@ -198,6 +217,10 @@ impl TerminalClient {
                             Ok(e) => e,
                             Err(_) => continue,
                         };
+                        // Capture session name when we see SessionInfo.
+                        if let SessionEvent::SessionInfo { ref name } = event {
+                            *ws_session_name.lock().unwrap() = Some(name.clone());
+                        }
                         // Suppress UserPrompt echoes — the terminal
                         // user already saw their input on the readline.
                         if matches!(event, SessionEvent::UserPrompt { .. }) {
@@ -234,11 +257,8 @@ impl TerminalClient {
                     {
                         let mut tx = ws_tx.lock().await;
                         if tx.send(Message::Text(payload.into())).await.is_err() {
-                            let mut stdout = tokio::io::stdout();
-                            stdout
-                                .write_all(b"\x1b[1;31mserver disconnected\x1b[0m\n")
-                                .await?;
-                            stdout.flush().await?;
+                            let name = session_name.lock().unwrap().clone();
+                            print_exit_banner(&name).await;
                             break;
                         }
                     }
@@ -254,9 +274,8 @@ impl TerminalClient {
                             _ = tokio::signal::ctrl_c() => {
                                 if cancelled {
                                     // Second Ctrl+C → exit.
-                                    let mut stdout = tokio::io::stdout();
-                                    stdout.write_all(b"\x1b[2mbye.\x1b[0m\n").await?;
-                                    stdout.flush().await?;
+                                    let name = session_name.lock().unwrap().clone();
+                                    print_exit_banner(&name).await;
                                     *ready_rx.lock().unwrap() = None;
                                     drop(ev_tx);
                                     render_handle.abort();
@@ -276,9 +295,8 @@ impl TerminalClient {
                     ready_tx.send(()).ok();
                 }
                 _ => {
-                    let mut stdout = tokio::io::stdout();
-                    stdout.write_all(b"\x1b[2mbye.\x1b[0m\n").await?;
-                    stdout.flush().await?;
+                    let name = session_name.lock().unwrap().clone();
+                    print_exit_banner(&name).await;
                     *ready_rx.lock().unwrap() = None;
                     break;
                 }
@@ -365,6 +383,14 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
 
     while let Some(event) = events.recv().await {
         match event {
+            SessionEvent::SessionInfo { ref name } => {
+                printer
+                    .lock()
+                    .unwrap()
+                    .print(format!("{DIM}  ● session {name}{RST}\n"))
+                    .ok();
+            }
+
             SessionEvent::UserPrompt {
                 ref content,
                 ref source,
@@ -505,4 +531,29 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             }
         }
     }
+}
+
+/// Clear rustyline's in-memory history and reload from the JSONL file.
+fn sync_history_from_file(rl: &mut DefaultEditor, path: &std::path::Path) {
+    let _ = rl.clear_history();
+    if let Ok(file) = std::fs::File::open(path) {
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(prompt) = serde_json::from_str::<String>(&line) {
+                rl.add_history_entry(&prompt).ok();
+            }
+        }
+    }
+}
+
+/// Print the session-closed banner with the session name for easy copy/paste.
+async fn print_exit_banner(name: &Option<String>) {
+    let mut stdout = tokio::io::stdout();
+    let display = name.as_deref().unwrap_or("unknown");
+    let _ = stdout
+        .write_all(format!("\x1b[2m  ● session closed · {display}\x1b[0m\n").as_bytes())
+        .await;
+    let _ = stdout.flush().await;
 }

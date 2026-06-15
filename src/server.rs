@@ -26,9 +26,9 @@ pub fn build_router(session: Arc<Session>) -> Router {
 /// Launch the axum HTTP + WebSocket server.
 /// Binds to 127.0.0.1:8187 — safe behind an nginx reverse proxy.
 pub async fn serve(session: Arc<Session>) -> anyhow::Result<()> {
-    let app = build_router(session);
+    let app = build_router(session.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8187").await?;
-    tracing::info!("web server on http://127.0.0.1:8187");
+    tracing::info!("web server on http://127.0.0.1:8187 · {}", session.name());
     axum::serve(listener, app).await?;
     Ok(())
 }

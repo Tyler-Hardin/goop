@@ -14,6 +14,10 @@ pub enum PromptSource {
 #[allow(dead_code)] // some variants/fields are consumed by future views
 #[serde(tag = "type", content = "data")]
 pub enum SessionEvent {
+    /// Session metadata — sent first on connect so clients know the
+    /// session name for copy/paste at exit.
+    SessionInfo { name: String },
+
     /// A user submitted a prompt.  Arrives *before* Thinking.
     UserPrompt {
         content: String,
