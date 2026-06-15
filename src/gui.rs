@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::platform::unix::WindowExtUnix;
@@ -6,7 +8,7 @@ use wry::WebViewBuilder;
 use wry::WebViewBuilderExtUnix;
 
 use crate::server;
-use crate::session::Session;
+use crate::session::SessionManager;
 
 /// Launch the desktop GUI, auto-starting a server if none is running.
 pub fn run(session_name: Option<String>) -> anyhow::Result<()> {
@@ -14,7 +16,7 @@ pub fn run(session_name: Option<String>) -> anyhow::Result<()> {
 
     if rt.block_on(crate::is_server_running()) {
         tracing::info!("found existing server on :8187, opening webview as client");
-        run_client()
+        open_webview(session_name)
     } else {
         tracing::info!("no server found, starting primary");
         run_primary(rt, session_name)
@@ -23,9 +25,16 @@ pub fn run(session_name: Option<String>) -> anyhow::Result<()> {
 
 /// GUI mode when we own the session + server.
 fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> anyhow::Result<()> {
-    let session = rt.block_on(async { Session::new(256, session_name) })?;
-    tracing::info!("session · {}", session.name());
-    let app = server::build_router(session);
+    let manager = Arc::new(SessionManager::new());
+    rt.block_on(async { manager.discover().await })?;
+
+    // If the user asked for a specific session, ensure it's loaded.
+    if let Some(ref name) = session_name {
+        let session = rt.block_on(async { manager.get_or_create(name.clone()).await })?;
+        tracing::info!("session · {}", session.name());
+    }
+
+    let app = server::build_router(manager);
 
     // Bind the TCP listener synchronously on the main thread so that
     // the server is guaranteed to be listening before the webview loads.
@@ -44,15 +53,10 @@ fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> any
 
     let _ = ready_rx.recv();
 
-    open_webview()
+    open_webview(session_name)
 }
 
-/// GUI mode when a server is already running — just open the webview.
-fn run_client() -> anyhow::Result<()> {
-    open_webview()
-}
-
-fn open_webview() -> anyhow::Result<()> {
+fn open_webview(session_name: Option<String>) -> anyhow::Result<()> {
     // GTK must be initialized before wry can embed WebKitGTK.
     // On Linux, wry requires build_gtk(window.default_vbox()) instead of
     // build(&window) — raw window handles silently produce a blank window.
@@ -69,8 +73,17 @@ fn open_webview() -> anyhow::Result<()> {
     let vbox = window
         .default_vbox()
         .expect("tao window should have a default GtkBox");
+
+    // If a session was requested, include it in the URL hash so the
+    // web UI can pre-select it.
+    let url = if let Some(name) = session_name {
+        format!("http://127.0.0.1:8187#session={name}")
+    } else {
+        String::from("http://127.0.0.1:8187")
+    };
+
     let _webview = WebViewBuilder::new()
-        .with_url("http://127.0.0.1:8187")
+        .with_url(&url)
         .with_devtools(true)
         .build_gtk(vbox)?;
 

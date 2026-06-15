@@ -1,5 +1,5 @@
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 
 use chrono::Local;
 use futures::StreamExt;
@@ -15,6 +15,21 @@ use crate::memory::FileConversationMemory;
 use crate::memory::prompt_history_path;
 use crate::preamble::build_preamble;
 use crate::tools;
+
+// ── per-session CWD ──────────────────────────────────────────────
+
+/// Global CWD registry, keyed by session name.
+///
+/// Tools read this to know which directory to operate in.  A `cd` tool
+/// updates it; `Session` registers the initial value on creation.
+pub(crate) static SESSION_CWDS: LazyLock<StdRwLock<std::collections::HashMap<String, PathBuf>>> =
+    LazyLock::new(|| StdRwLock::new(std::collections::HashMap::new()));
+
+tokio::task_local! {
+    /// Set by [`Session::run_one`] before streaming to the LLM so that
+    /// tools (e.g. `cd`, `shell`) can find their session's CWD.
+    pub(crate) static SESSION_ID: String;
+}
 
 // ── subscriber with history replay ──────────────────────────────
 
@@ -85,11 +100,20 @@ impl Session {
         std::fs::create_dir_all(&dir)?;
         let events_path = dir.join(format!("{name}.jsonl"));
         let messages_path = dir.join(format!("{name}.messages.jsonl"));
+        let cwd_path = dir.join(format!("{name}.cwd"));
         let mem = FileConversationMemory::new(messages_path)?;
         // Load pre-existing events for history replay.
         let existing_events = load_events_from_file(&events_path).unwrap_or_default();
 
-        let preamble = build_preamble();
+        // ── CWD ──────────────────────────────────────────────
+        let cwd = load_cwd(&cwd_path);
+        // Register in the global map so tools can find it.
+        SESSION_CWDS
+            .write()
+            .unwrap()
+            .insert(name.clone(), cwd.clone());
+
+        let preamble = build_preamble(&cwd.display().to_string());
 
         let agent = client
             .agent(deepseek::DEEPSEEK_V4_PRO)
@@ -97,9 +121,10 @@ impl Session {
             .tool(tools::Read)
             .tool(tools::ReadHtml)
             .tool(tools::Replace)
-            .tool(tools::Shell)
-            .tool(tools::WebFetch)
             .tool(tools::Write)
+            .tool(tools::Shell)
+            .tool(tools::Cd)
+            .tool(tools::WebFetch)
             .tool(tools::Screenshot)
             .tool(tools::CursorPosition)
             .tool(tools::MouseMove)
@@ -231,92 +256,99 @@ impl Session {
 
         self.emit(SessionEvent::Thinking).await;
 
-        let mut stream = self.agent.stream_prompt(prompt).await;
+        // Scope the session ID so tools can find their CWD via the
+        // global SESSION_CWDS map.
+        let name = self.name.clone();
+        SESSION_ID
+            .scope(name, async {
+                let mut stream = self.agent.stream_prompt(prompt).await;
 
-        loop {
-            tokio::select! {
-                // Bias: check cancel first so a queued cancel wins
-                // even if a stream item happens to be ready.
-                biased;
+                loop {
+                    tokio::select! {
+                        // Bias: check cancel first so a queued cancel wins
+                        // even if a stream item happens to be ready.
+                        biased;
 
-                _ = &mut cancel_rx => {
-                    self.emit(SessionEvent::Cancelled).await;
-                    return;
-                }
-
-                item = stream.next() => {
-                    match item {
-                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::Text(text),
-                        ))) => {
-                            self.emit(SessionEvent::AssistantText(text.text)).await;
+                        _ = &mut cancel_rx => {
+                            self.emit(SessionEvent::Cancelled).await;
+                            return;
                         }
 
-                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::ToolCall { tool_call, .. },
-                        ))) => {
-                            let args = match serde_json::from_str::<serde_json::Value>(
-                                &tool_call.function.arguments.to_string(),
-                            ) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    serde_json::Value::String(
-                                        tool_call.function.arguments.to_string(),
-                                    )
+                        item = stream.next() => {
+                            match item {
+                                Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                                    StreamedAssistantContent::Text(text),
+                                ))) => {
+                                    self.emit(SessionEvent::AssistantText(text.text)).await;
                                 }
-                            };
-                            self.emit(SessionEvent::ToolCall {
-                                name: tool_call.function.name,
-                                arguments: args,
-                            })
-                            .await;
-                        }
 
-                        Some(Ok(MultiTurnStreamItem::StreamUserItem(
-                            rig::streaming::StreamedUserContent::ToolResult {
-                                tool_result, ..
-                            },
-                        ))) => {
-                            let text: String = tool_result
-                                .content
-                                .iter()
-                                .filter_map(|c| match c {
-                                    rig::message::ToolResultContent::Text(t) => {
-                                        Some(t.text.as_str())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("");
+                                Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                                    StreamedAssistantContent::ToolCall { tool_call, .. },
+                                ))) => {
+                                    let args = match serde_json::from_str::<serde_json::Value>(
+                                        &tool_call.function.arguments.to_string(),
+                                    ) {
+                                        Ok(v) => v,
+                                        Err(_) => {
+                                            serde_json::Value::String(
+                                                tool_call.function.arguments.to_string(),
+                                            )
+                                        }
+                                    };
+                                    self.emit(SessionEvent::ToolCall {
+                                        name: tool_call.function.name,
+                                        arguments: args,
+                                    })
+                                    .await;
+                                }
 
-                            self.emit(SessionEvent::ToolResult { content: text }).await;
-                            self.emit(SessionEvent::Thinking).await;
-                        }
+                                Some(Ok(MultiTurnStreamItem::StreamUserItem(
+                                    rig::streaming::StreamedUserContent::ToolResult {
+                                        tool_result, ..
+                                    },
+                                ))) => {
+                                    let text: String = tool_result
+                                        .content
+                                        .iter()
+                                        .filter_map(|c| match c {
+                                            rig::message::ToolResultContent::Text(t) => {
+                                                Some(t.text.as_str())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("");
 
-                        Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
-                            self.clear_cancel();
-                            self.emit(SessionEvent::FinalResponse).await;
-                            return;
-                        }
+                                    self.emit(SessionEvent::ToolResult { content: text }).await;
+                                    self.emit(SessionEvent::Thinking).await;
+                                }
 
-                        Some(Ok(_)) => {}
+                                Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
+                                    self.clear_cancel();
+                                    self.emit(SessionEvent::FinalResponse).await;
+                                    return;
+                                }
 
-                        Some(Err(e)) => {
-                            self.clear_cancel();
-                            self.emit(SessionEvent::Error(e.to_string())).await;
-                            return;
-                        }
+                                Some(Ok(_)) => {}
 
-                        None => {
-                            // Stream ended without FinalResponse.
-                            self.clear_cancel();
-                            self.emit(SessionEvent::FinalResponse).await;
-                            return;
+                                Some(Err(e)) => {
+                                    self.clear_cancel();
+                                    self.emit(SessionEvent::Error(e.to_string())).await;
+                                    return;
+                                }
+
+                                None => {
+                                    // Stream ended without FinalResponse.
+                                    self.clear_cancel();
+                                    self.emit(SessionEvent::FinalResponse).await;
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
+            })
+            .await;
     }
 
     /// Remove the cancel sender for the current turn (turn ending normally).
@@ -337,15 +369,133 @@ impl Session {
     }
 }
 
+// ── session manager ───────────────────────────────────────────────
+
+/// Owns all active sessions, allowing concurrent creation, lookup,
+/// listing, and deletion. The server holds a single [`SessionManager`]
+/// and routes WebSocket connections to the right session by name.
+pub struct SessionManager {
+    sessions: tokio::sync::RwLock<std::collections::HashMap<String, Arc<Session>>>,
+}
+
+impl SessionManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Get an existing session or create one.
+    ///
+    /// If the session already exists in the map, returns it directly.
+    /// Otherwise creates a new [`Session`] — which loads events and
+    /// messages from disk if files exist for this name.
+    pub async fn get_or_create(&self, name: String) -> anyhow::Result<Arc<Session>> {
+        // Fast path: read lock.
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(s) = sessions.get(&name) {
+                return Ok(Arc::clone(s));
+            }
+        }
+        // Slow path: create the session, then insert under write lock.
+        let session = Session::new(256, Some(name.clone()))?;
+        let mut sessions = self.sessions.write().await;
+        // Double-check: another caller may have created it while we
+        // were building the session.
+        if let Some(s) = sessions.get(&name) {
+            return Ok(Arc::clone(s));
+        }
+        sessions.insert(name, Arc::clone(&session));
+        Ok(session)
+    }
+
+    /// Create a new session with an auto-generated name like `20260128_001`.
+    pub async fn create(&self, name: Option<String>) -> anyhow::Result<Arc<Session>> {
+        let name = name.unwrap_or_else(next_session_name);
+        self.get_or_create(name).await
+    }
+
+    /// List all currently loaded session names, sorted.
+    pub async fn list(&self) -> Vec<String> {
+        let sessions = self.sessions.read().await;
+        let mut names: Vec<String> = sessions.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Remove a session from memory.
+    ///
+    /// Returns `true` if the session was present.  The session's disk
+    /// files are *not* deleted — they can be reloaded later by calling
+    /// [`get_or_create`] again.
+    pub async fn delete(&self, name: &str) -> bool {
+        self.sessions.write().await.remove(name).is_some()
+    }
+
+    /// Scan the sessions directory and load all discovered sessions.
+    ///
+    /// Call once at server startup so the web UI immediately shows
+    /// every session that has persisted data.
+    pub async fn discover(&self) -> anyhow::Result<()> {
+        let dir = sessions_dir();
+        if !dir.exists() {
+            return Ok(());
+        }
+        let entries = std::fs::read_dir(&dir)?;
+        let mut names = std::collections::HashSet::new();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let fname = entry.file_name();
+            let fname = fname.to_string_lossy();
+            // Session event files look like "<name>.jsonl".
+            // Memory files look like "<name>.messages.jsonl".
+            // Strip suffixes to get the raw session name.
+            if let Some(stripped) = fname.strip_suffix(".jsonl")
+                && !stripped.ends_with(".messages")
+            {
+                names.insert(stripped.to_string());
+            }
+        }
+        for name in names {
+            // Ignore errors for individual sessions — a corrupt file
+            // shouldn't prevent the server from starting.
+            let _ = self.get_or_create(name).await;
+        }
+        Ok(())
+    }
+}
+
 // ── persistence helpers ─────────────────────────────────────────
 
 /// Directory for session files: `~/.config/goop/sessions/`
-fn sessions_dir() -> PathBuf {
+pub(crate) fn sessions_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
     PathBuf::from(home)
         .join(".config")
         .join("goop")
         .join("sessions")
+}
+
+/// Load the session's saved CWD, or fall back to the process CWD.
+fn load_cwd(path: &PathBuf) -> PathBuf {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        let trimmed = contents.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.is_dir() {
+                return p;
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Persist a session's CWD to its `<name>.cwd` file.
+pub(crate) fn save_cwd(path: &PathBuf, cwd: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{}\n", cwd.display()));
 }
 
 /// Auto-generate a session name like `20260128_001`.

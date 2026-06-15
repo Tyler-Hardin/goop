@@ -9,13 +9,10 @@
 //!   5. AGENTS.md (project context; may be edited mid-session)
 
 /// Render the agent preamble from the Tera template and env context.
-pub fn build_preamble() -> String {
+pub fn build_preamble(cwd: &str) -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| String::from("unknown"));
     let home = std::env::var("HOME").unwrap_or_else(|_| String::from("~"));
     let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| String::from("(unknown)"));
 
     // USER.md
     let user_md = if let Ok(home_dir) = std::env::var("HOME") {
@@ -48,7 +45,7 @@ pub fn build_preamble() -> String {
     context.insert("os_family", std::env::consts::OS);
     context.insert("arch", std::env::consts::ARCH);
     context.insert("os_distro", &os_release());
-    context.insert("cwd", &cwd);
+    context.insert("cwd", cwd);
     context.insert("user_md", &user_md);
     if let Some(ref amd) = agents_md {
         context.insert("agents_md", amd);

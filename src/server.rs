@@ -2,33 +2,37 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use crate::events::PromptSource;
-use crate::session::Session;
+use crate::session::{Session, SessionManager};
 
 const PAGE: &str = include_str!("../assets/index.html");
 
 /// Build the axum router (exposed so GUI mode can bind the listener
 /// synchronously before opening the webview).
-pub fn build_router(session: Arc<Session>) -> Router {
-    let state = Arc::new(ServerState { session });
+pub fn build_router(manager: Arc<SessionManager>) -> Router {
+    let state = Arc::new(ServerState { manager });
     Router::new()
         .route("/", get(index))
         .route("/ws", get(ws_handler))
+        .route("/api/sessions", get(list_sessions).post(create_session))
+        .route("/api/sessions/{name}", delete(delete_session))
         .with_state(state)
 }
 
 /// Launch the axum HTTP + WebSocket server.
 /// Binds to 127.0.0.1:8187 — safe behind an nginx reverse proxy.
-pub async fn serve(session: Arc<Session>) -> anyhow::Result<()> {
-    let app = build_router(session.clone());
+pub async fn serve(manager: Arc<SessionManager>) -> anyhow::Result<()> {
+    let app = build_router(manager);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8187").await?;
-    tracing::info!("web server on http://127.0.0.1:8187 · {}", session.name());
+    tracing::info!("web server on http://127.0.0.1:8187");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -36,7 +40,7 @@ pub async fn serve(session: Arc<Session>) -> anyhow::Result<()> {
 // ── state ───────────────────────────────────────────────────────
 
 struct ServerState {
-    session: Arc<Session>,
+    manager: Arc<SessionManager>,
 }
 
 // ── routes ──────────────────────────────────────────────────────
@@ -45,26 +49,71 @@ async fn index() -> Html<&'static str> {
     Html(PAGE)
 }
 
+// ── REST API ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateSessionBody {
+    name: Option<String>,
+}
+
+async fn list_sessions(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    let names = state.manager.list().await;
+    axum::Json(names)
+}
+
+async fn create_session(
+    State(state): State<Arc<ServerState>>,
+    axum::Json(body): axum::Json<CreateSessionBody>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session = state
+        .manager
+        .create(body.name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "name": session.name() })))
+}
+
+async fn delete_session(
+    State(state): State<Arc<ServerState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if state.manager.delete(&name).await {
+        axum::Json(serde_json::json!({ "deleted": true })).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({ "error": "session not found" })),
+        )
+            .into_response()
+    }
+}
+
+// ── websocket ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct WsParams {
+    /// Optional session name. If absent, a new auto-named session is
+    /// created for this connection.
+    session: Option<String>,
+}
+
 /// Upgrade to WebSocket after validating the Origin header.
-/// Rejects requests from unexpected origins to prevent CSWSH.
+/// Routes to the correct session based on `?session=<name>`.
 async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
-    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    Query(params): Query<WsParams>,
+    State(state): State<Arc<ServerState>>,
 ) -> Response {
     // Only allow requests whose Origin matches the Host we're proxied behind,
     // or whose origin is null (GUI webview with `with_html`).
-    // When nginx proxies, the browser sends Origin = https://your.domain,
-    // and nginx forwards Host = your.domain.  We check they agree.
     if let (Some(origin), Some(host)) = (
         headers.get("origin").and_then(|v| v.to_str().ok()),
         headers.get("host").and_then(|v| v.to_str().ok()),
     ) {
-        // Allow null origin (e.g. webview loaded via with_html).
         if origin == "null" {
-            return ws.on_upgrade(move |socket| handle_socket(socket, state));
+            return resolve_and_upgrade(ws, state, params.session);
         }
-        // Strip scheme from origin for comparison (origin = "https://foo.com", host = "foo.com")
         let origin_host = origin
             .trim_start_matches("https://")
             .trim_start_matches("http://")
@@ -74,16 +123,42 @@ async fn ws_handler(
         }
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    resolve_and_upgrade(ws, state, params.session)
 }
 
-// ── websocket ───────────────────────────────────────────────────
+/// Resolve (or create) the requested session, then upgrade.
+fn resolve_and_upgrade(
+    ws: WebSocketUpgrade,
+    state: Arc<ServerState>,
+    session_name: Option<String>,
+) -> Response {
+    let manager = Arc::clone(&state.manager);
+    ws.on_upgrade(move |socket| async move {
+        let session = match session_name {
+            Some(name) => match manager.get_or_create(name).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("failed to get or create session: {e}");
+                    return;
+                }
+            },
+            None => match manager.create(None).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("failed to create session: {e}");
+                    return;
+                }
+            },
+        };
+        handle_socket(socket, session).await;
+    })
+}
 
-async fn handle_socket(ws: WebSocket, state: Arc<ServerState>) {
+async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
     let (mut tx, mut rx) = ws.split();
 
-    // Subscribe with full history replay so the phone sees the whole chat.
-    let mut events = state.session.subscribe_all().await;
+    // Subscribe with full history replay so the client sees the whole chat.
+    let mut events = session.subscribe_all().await;
 
     // Spawn a task that reads session events and writes them to the socket.
     let mut send_task = tokio::spawn(async move {
@@ -106,7 +181,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<ServerState>) {
     });
 
     // Read incoming messages (prompts) from the client.
-    let session = Arc::clone(&state.session);
+    let session = Arc::clone(&session);
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = rx.next().await {
             match msg {

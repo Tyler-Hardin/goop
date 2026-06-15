@@ -87,9 +87,10 @@ pub struct TerminalClient;
 
 impl TerminalClient {
     /// Connect to a running goop server and start the terminal REPL.
-    pub async fn run() -> anyhow::Result<()> {
+    pub async fn run(session_name: &str) -> anyhow::Result<()> {
         // ── connect to server ────────────────────────────────
-        let (ws_stream, _) = connect_async("ws://127.0.0.1:8187/ws").await?;
+        let url = format!("ws://127.0.0.1:8187/ws?session={session_name}");
+        let (ws_stream, _) = connect_async(&url).await?;
         let (ws_tx, ws_rx) = ws_stream.split();
         let ws_tx = Arc::new(tokio::sync::Mutex::new(ws_tx));
 

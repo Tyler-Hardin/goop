@@ -1,4 +1,5 @@
 use rig_derive::rig_tool;
+use std::path::PathBuf;
 
 #[rig_tool(
     description = "Read file at path, optionally with start_line and end_line (both 1-indexed, inclusive). Returns line-numbered content.",
@@ -9,6 +10,7 @@ pub async fn read(
     start_line: Option<u64>,
     end_line: Option<u64>,
 ) -> Result<String, rig::tool::ToolError> {
+    let path = resolve_path(path);
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
@@ -52,6 +54,7 @@ pub async fn replace(
     old_str: String,
     new_str: String,
 ) -> Result<String, rig::tool::ToolError> {
+    let path = resolve_path(path);
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
@@ -75,9 +78,11 @@ pub async fn replace(
 
 #[rig_tool(description = "Run command in shell", required(command))]
 pub async fn shell(command: String) -> Result<String, rig::tool::ToolError> {
+    let cwd = current_session_cwd();
     tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&command)
+        .current_dir(&cwd)
         .output()
         .await
         .map(|out| {
@@ -93,10 +98,104 @@ pub async fn shell(command: String) -> Result<String, rig::tool::ToolError> {
 }
 
 #[rig_tool(
+    description = "Change the session's working directory. Affects all future shell, read, write, and other file operations. The path can be absolute, relative (to current CWD), '~' for home, or '..' for parent. Returns the new absolute path.",
+    required(path)
+)]
+pub async fn cd(path: String) -> Result<String, rig::tool::ToolError> {
+    let session_id = crate::session::SESSION_ID
+        .try_with(|s| s.clone())
+        .map_err(|_| {
+            rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(
+                "cd: no session context (are you calling this outside an active turn?)",
+            )))
+        })?;
+
+    let current = current_session_cwd();
+
+    // Resolve the new path.
+    let new_path = if path == "~" || path == "~/" {
+        home_dir().ok_or_else(|| {
+            rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(
+                "cd: cannot determine home directory",
+            )))
+        })?
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home_dir().map(|h| h.join(rest)).ok_or_else(|| {
+            rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(
+                "cd: cannot determine home directory",
+            )))
+        })?
+    } else if path.starts_with('/') {
+        PathBuf::from(&path)
+    } else {
+        current.join(&path)
+    };
+
+    // Resolve symlinks, .., etc.
+    let canonical = std::fs::canonicalize(&new_path).map_err(|e| {
+        rig::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(format!(
+            "cd: {}: {}",
+            new_path.display(),
+            e
+        ))))
+    })?;
+
+    if !canonical.is_dir() {
+        return Err(rig::tool::ToolError::ToolCallError(Box::new(
+            std::io::Error::other(format!("cd: not a directory: {}", canonical.display())),
+        )));
+    }
+
+    // Persist to disk.
+    let cwd_path = crate::session::sessions_dir().join(format!("{session_id}.cwd"));
+    crate::session::save_cwd(&cwd_path, &canonical);
+
+    // Update the global map.
+    crate::session::SESSION_CWDS
+        .write()
+        .unwrap()
+        .insert(session_id, canonical.clone());
+
+    Ok(format!(
+        "Changed working directory to {}",
+        canonical.display()
+    ))
+}
+
+/// Read the current session's CWD from the global map.
+fn current_session_cwd() -> PathBuf {
+    crate::session::SESSION_ID
+        .try_with(|id| {
+            crate::session::SESSION_CWDS
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Resolve `path` against the session CWD if it's relative.
+fn resolve_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        current_session_cwd().join(path)
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+#[rig_tool(
     description = "Read an HTML file at path and return extracted plain text (headings, links, body text). Useful for local crate docs, cached pages, etc.",
     required(path)
 )]
 pub async fn read_html(path: std::path::PathBuf) -> Result<String, rig::tool::ToolError> {
+    let path = resolve_path(path);
     let html = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
@@ -179,6 +278,7 @@ pub async fn write(
     path: std::path::PathBuf,
     content: String,
 ) -> Result<String, rig::tool::ToolError> {
+    let path = resolve_path(path);
     tokio::fs::write(&path, &content)
         .await
         .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
