@@ -1,7 +1,8 @@
 # AGENTS.md — goop
 
-**goop** is an AI agent REPL — a terminal and desktop GUI that wraps a DeepSeek
-LLM with tools for reading, writing, and shell access.
+**goop** is an AI agent REPL — a terminal and desktop GUI that wraps an LLM
+(via rig, supporting multiple providers) with tools for reading, writing, and
+shell access.
 
 ## Architecture
 
@@ -9,6 +10,7 @@ LLM with tools for reading, writing, and shell access.
                   ┌─────────────────────────────────┐
                   │        SessionManager            │
                   │  HashMap<name, Arc<Session>>      │
+                  │  + Config                        │
                   └──────────────┬──────────────────┘
                                  │
                   ┌─────────────────────────────────┐
@@ -29,12 +31,21 @@ The server manages multiple sessions concurrently.  Each WebSocket connection
 routes to exactly one session via the `?session=<name>` query parameter.
 The web UI shows a session sidebar for switching between sessions.
 
-- **`SessionManager`** (`src/session.rs`) — owns a `RwLock<HashMap<String, Arc<Session>>>`.
-  Creates sessions lazily (via `get_or_create`), discovers persisted sessions from disk
-  on startup, and supports listing and deletion.
-- **`Session`** (`src/session.rs`) — owns the DeepSeek agent, a broadcast
-  channel for events, and a FIFO prompt queue. Multiple views can submit
-  prompts concurrently; the session drains them one at a time.
+- **`SessionManager`** (`src/session.rs`) — owns a `RwLock<HashMap<String, Arc<Session>>>`
+  and a `Config`. Creates sessions lazily (via `get_or_create`), discovers
+  persisted sessions from disk on startup, and supports listing and deletion.
+- **`Session`** (`src/session.rs`) — owns an `AnyAgent` (multi-provider agent
+  abstraction), a broadcast channel for events, and a FIFO prompt queue.
+  Multiple views can submit prompts concurrently; the session drains them
+  one at a time.
+- **`Config`** (`src/config.rs`) — provider selection, model name, and tuning
+  knobs. Reads from `~/.config/goop/config.toml` with env-var overrides
+  (`GOOP_PROVIDER`, `GOOP_MODEL`). Falls back to DeepSeek defaults.
+- **`model`** (`src/model.rs`) — provider abstraction layer. Wraps rig's
+  type-level providers (DeepSeek, OpenAI, OpenRouter, Groq, Ollama,
+  Anthropic) behind enums so one binary works with any provider. The
+  `AnyAgent` enum owns the rig `Agent`; `AnyStream` unifies the
+  provider-specific stream types via mapping.
 - **`SessionEvent`** (`src/events.rs`) — enum of all events the session
   emits: `UserPrompt`, `Thinking`, `AssistantText`, `ToolCall`,
   `ToolResult`, `FinalResponse`, `Error`, `Cancelled`.  Serialized as
@@ -90,8 +101,47 @@ running, then connects as a WS client — it never owns the session directly.
 
 ## Multi-session design
 
-The server owns a `SessionManager`, not a single session.  All sessions
-share one DeepSeek client (created per-session from env).
+The server owns a `SessionManager`, not a single session.  The provider and
+model are chosen once at startup via config; all sessions share that choice.
+
+### Provider configuration
+
+Configuration lives at `~/.config/goop/config.toml`:
+
+```toml
+provider = "deepseek"   # deepseek | openai | openrouter | groq | ollama | anthropic
+model = "deepseek-v4-pro"
+max_tokens = 100000
+default_max_turns = 100
+```
+
+Environment variables override the config file:
+- `GOOP_PROVIDER` — provider name
+- `GOOP_MODEL` — model name
+- Provider-specific API keys: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`,
+  `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`
+  (Ollama reads `OLLAMA_API_BASE_URL` and optional `OLLAMA_API_KEY`)
+
+If no config file exists and no env vars are set, goop defaults to
+DeepSeek (`deepseek-v4-pro`) for backward compatibility.
+
+The provider abstraction lives in `src/model.rs`. Rig's providers are
+type-level (each has its own `Client` and `CompletionModel` type), so
+goop wraps them behind three enums:
+
+- **`AnyAgent`** — holds a rig `Agent` for any supported provider.
+  `stream_prompt()` returns `AnyStream`.
+- **`AnyStream`** — wraps each provider's `StreamingResult` behind a
+  single `Stream` impl. Maps `MultiTurnStreamItem<R>` items to a
+  common `AnyStreamingResponse` type for the `StreamedAssistantContent::Final`
+  variant (which the session ignores).
+- **`AnyStreamingResponse`** — opaque holder for provider-specific
+  streaming response types.
+
+The mapping adds zero overhead in practice: `StreamingResult` is already
+`Pin<Box<dyn Stream>>`, so the enum dispatch is just one extra match per
+poll.  The tool list is wired via the `with_goop_tools!` macro to avoid
+duplication across the six match arms in `build_agent()`.
 
 ### Session lifecycle
 - **Creation:** `SessionManager::create(name)` → `Session::new(256, Some(name))`.
@@ -241,14 +291,25 @@ Two independent history systems:
 ## Building & running
 
 ```bash
+# DeepSeek (default)
+DEEPSEEK_API_KEY=… cargo run
+
+# OpenAI
+GOOP_PROVIDER=openai OPENAI_API_KEY=… cargo run
+
+# OpenRouter (200+ models via one API key)
+GOOP_PROVIDER=openrouter GOOP_MODEL=openai/gpt-4o OPENROUTER_API_KEY=… cargo run
+
+# Ollama (local)
+GOOP_PROVIDER=ollama GOOP_MODEL=llama3.2 cargo run
+
+# Anthropic
+GOOP_PROVIDER=anthropic ANTHROPIC_API_KEY=… cargo run
+
 # Start the server in the background, then connect terminal + GUI
 DEEPSEEK_API_KEY=… cargo run -- serve &
 DEEPSEEK_API_KEY=… cargo run              # terminal REPL (auto-connects)
 DEEPSEEK_API_KEY=… cargo run -- gui       # desktop GUI (auto-connects)
-
-# Or just run one — it'll auto-start the server
-DEEPSEEK_API_KEY=… cargo run              # terminal REPL
-DEEPSEEK_API_KEY=… cargo run -- gui       # desktop GUI
 
 # Nix (all deps included)
 nix build

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+agent-client-protocol = "0.14.0"
 anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = "0.12"
@@ -29,6 +30,7 @@ tao = { version = "0.35.3", default-features = false, features = ["x11", "rwh_06
 tera = "1.20.1"
 tokio = { version = "1.52", features = ["full"] }
 tokio-tungstenite = "0.29.0"
+toml = "1.1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 wry = "0.55.1"

@@ -4,17 +4,16 @@ use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use chrono::Local;
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
-use rig::client::{CompletionClient, ProviderClient};
-use rig::providers::deepseek;
-use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+use rig::streaming::StreamedAssistantContent;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
+use crate::config::Config;
 use crate::events::{PromptSource, SessionEvent};
 use crate::memory::FileConversationMemory;
 use crate::memory::prompt_history_path;
+use crate::model;
 use crate::preamble::build_preamble;
-use crate::tools;
 use crate::transport::Transport;
 
 // ── per-session CWD ──────────────────────────────────────────────
@@ -63,7 +62,7 @@ impl SessionSubscriber {
 pub struct Session {
     /// Session name (user-supplied or auto-generated like `20260128_001`).
     name: String,
-    agent: Arc<rig::agent::Agent<deepseek::CompletionModel>>,
+    agent: Arc<crate::model::AnyAgent>,
     tx: broadcast::Sender<SessionEvent>,
     history: Mutex<Vec<SessionEvent>>,
 
@@ -80,7 +79,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a new session backed by a DeepSeek agent.
+    /// Create a new session backed by the configured provider.
     ///
     /// `capacity` controls how many live events the broadcast channel
     /// can buffer between the slowest and fastest subscriber.
@@ -92,9 +91,11 @@ impl Session {
     ///
     /// A background task is spawned to drain the prompt queue — the
     /// tokio runtime must already be running.
-    pub fn new(capacity: usize, session_name: Option<String>) -> anyhow::Result<Arc<Self>> {
-        let client = deepseek::Client::from_env()?;
-
+    pub fn new(
+        config: &Config,
+        capacity: usize,
+        session_name: Option<String>,
+    ) -> anyhow::Result<Arc<Self>> {
         // ── persistence paths ──────────────────────────────────
         let name = session_name.unwrap_or_else(next_session_name);
         let dir = sessions_dir();
@@ -116,33 +117,7 @@ impl Session {
 
         let preamble = build_preamble(&cwd.display().to_string());
 
-        let agent = client
-            .agent(deepseek::DEEPSEEK_V4_PRO)
-            .preamble(&preamble)
-            .tool(tools::Read)
-            .tool(tools::ReadHtml)
-            .tool(tools::Replace)
-            .tool(tools::Write)
-            .tool(tools::Shell)
-            .tool(tools::Cd)
-            .tool(tools::Ssh)
-            .tool(tools::Disconnect)
-            .tool(tools::WebFetch)
-            .tool(tools::Screenshot)
-            .tool(tools::CursorPosition)
-            .tool(tools::MouseMove)
-            .tool(tools::MouseClick)
-            .tool(tools::KeyType)
-            .tool(tools::KeyPress)
-            .tool(tools::WindowList)
-            .tool(tools::WindowFocus)
-            .tool(tools::WindowGetActive)
-            .tool(tools::OpenUrl)
-            .max_tokens(100_000)
-            .default_max_turns(100)
-            .conversation_id("default")
-            .memory(mem)
-            .build();
+        let agent = model::build_agent(config, &preamble, mem)?;
 
         let (tx, _) = broadcast::channel(capacity);
         let (submit_tx, submit_rx) = mpsc::unbounded_channel();
@@ -163,7 +138,7 @@ impl Session {
 
         let this = Arc::new(Self {
             name: name.clone(),
-            agent: Arc::new(agent),
+            agent,
             tx,
             history: Mutex::new(existing_events),
             submit_tx,
@@ -379,12 +354,14 @@ impl Session {
 /// and routes WebSocket connections to the right session by name.
 pub struct SessionManager {
     sessions: tokio::sync::RwLock<std::collections::HashMap<String, Arc<Session>>>,
+    config: Config,
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
             sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            config,
         }
     }
 
@@ -405,7 +382,7 @@ impl SessionManager {
             }
         }
         // Slow path: create the session, then insert under write lock.
-        let session = Session::new(256, Some(name.clone()))?;
+        let session = Session::new(&self.config, 256, Some(name.clone()))?;
         let mut sessions = self.sessions.write().await;
         // Double-check: another caller may have created it while we
         // were building the session.

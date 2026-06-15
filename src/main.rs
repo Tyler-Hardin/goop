@@ -1,6 +1,8 @@
+mod config;
 mod events;
 mod gui;
 mod memory;
+mod model;
 mod preamble;
 mod server;
 mod session;
@@ -76,7 +78,8 @@ async fn run_terminal(session_name: Option<String>) -> anyhow::Result<()> {
 
 /// Spawn the server in the background and return once it's listening.
 async fn start_server_in_background() -> anyhow::Result<()> {
-    let manager = Arc::new(SessionManager::new());
+    let config = config::load_config()?;
+    let manager = Arc::new(SessionManager::new(config));
     manager.discover().await?;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -94,7 +97,8 @@ async fn start_server_in_background() -> anyhow::Result<()> {
 // ── server mode ────────────────────────────────────────────────
 
 async fn run_server(session_name: Option<String>) -> anyhow::Result<()> {
-    let manager = Arc::new(SessionManager::new());
+    let config = config::load_config()?;
+    let manager = Arc::new(SessionManager::new(config));
     manager.discover().await?;
     // If the user asked for a specific session, ensure it's loaded.
     if let Some(name) = session_name {

@@ -47,7 +47,8 @@ fn fetch_latest_session() -> Option<String> {
 
 /// GUI mode when we own the session + server.
 fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> anyhow::Result<()> {
-    let manager = Arc::new(SessionManager::new());
+    let config = crate::config::load_config()?;
+    let manager = Arc::new(SessionManager::new(config));
     rt.block_on(async { manager.discover().await })?;
 
     // If the user asked for a specific session, ensure it's loaded.
