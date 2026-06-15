@@ -225,25 +225,18 @@ impl TerminalView {
 
             match raw {
                 Some(Some(line)) => {
-                    // Submit — the session's done signal tells us
-                    // when the LLM has finished, but the render
-                    // task may still be flushing.  We wait for
-                    // the render task's done signal instead.
-                    let session_done = self.session.submit(&line, PromptSource::Terminal);
-                    // Wait for session to finish generating.
-                    session_done.await.ok();
-
-                    // Wait for render to finish, but allow Ctrl+C
-                    // to cancel the running LLM.
+                    let mut session_done = self.session.submit(&line, PromptSource::Terminal);
                     let mut cancelled = false;
+
+                    // ── phase 1: wait for session, cancel on Ctrl+C ──
                     loop {
                         tokio::select! {
-                            _ = done_rx.recv() => {
-                                break; // LLM finished (or cancel completed)
+                            _ = &mut session_done => {
+                                break; // session finished (normally or via cancel)
                             }
                             _ = tokio::signal::ctrl_c() => {
                                 if cancelled {
-                                    // Second Ctrl+C: exit.
+                                    // Second Ctrl+C during session → exit.
                                     let mut stdout = tokio::io::stdout();
                                     stdout.write_all(b"\x1b[2mbye.\x1b[0m\n").await?;
                                     stdout.flush().await?;
@@ -256,9 +249,27 @@ impl TerminalView {
                                 // First Ctrl+C: cancel the LLM.
                                 self.session.cancel();
                                 cancelled = true;
-                                // Loop back to wait for render to
-                                // finish flushing the cancellation.
+                                // Loop back; session_done will fire
+                                // once the cancellation propagates.
                             }
+                        }
+                    }
+
+                    // ── phase 2: wait for render flush ──
+                    tokio::select! {
+                        _ = done_rx.recv() => {
+                            // render finished
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            // Ctrl+C during render flush → exit.
+                            let mut stdout = tokio::io::stdout();
+                            stdout.write_all(b"\x1b[2mbye.\x1b[0m\n").await?;
+                            stdout.flush().await?;
+                            *ready_rx.lock().unwrap() = None;
+                            drop(ev_tx);
+                            render_handle.abort();
+                            fwd_handle.abort();
+                            return Ok(());
                         }
                     }
                     ready_tx.send(()).ok();
