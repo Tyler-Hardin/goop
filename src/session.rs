@@ -180,6 +180,7 @@ impl Session {
     ///
     /// Use this for views that have been present since session creation
     /// and don't need a history replay.
+    #[allow(dead_code)] // useful for future views that don't need history replay
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.tx.subscribe()
     }

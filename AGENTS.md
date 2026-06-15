@@ -6,37 +6,60 @@ LLM with tools for reading, writing, and shell access.
 ## Architecture
 
 ```
-┌──────────────┐     ┌─────────────────────┐     ┌──────────────┐
-│ TerminalView │────▶│      Session         │────▶│  Web Server  │◀──┐
-│  (rustyline) │     │  (agent + history)   │     │  (axum/WS)   │   │
-└──────────────┘     └─────────────────────┘     └──────────────┘   │
-                                                         │          │
-                                                         ▼          │
-                                                  ┌───────────┐     │
-                                                  │ WebView   │─────┘
-                                                  │ (wry/tao) │
-                                                  └───────────┘
+                  ┌─────────────────────────────────┐
+                  │          Session                 │
+                  │    (agent + history + queue)      │
+                  └──────────────┬──────────────────┘
+                                 │ broadcast
+                                 ▼
+                  ┌─────────────────────────────────┐
+                  │        Web Server (axum/WS)       │
+                  │      127.0.0.1:8187               │
+                  └────┬──────────┬──────────┬───────┘
+                       │          │          │
+                  WS   │     WS   │     WS   │
+              ┌────────┐  ┌────────┐  ┌──────────────┐
+              │Terminal│  │WebView │  │  Browser /    │
+              │ Client │  │(wry)   │  │  Phone / etc  │
+              └────────┘  └────────┘  └──────────────┘
 ```
+
+All clients connect to the server via WebSocket.  The terminal is no longer
+hard-wired to a local `Session` — it talks to the server just like every
+other client.
 
 - **`Session`** (`src/session.rs`) — owns the DeepSeek agent, a broadcast
   channel for events, and a FIFO prompt queue. Multiple views can submit
   prompts concurrently; the session drains them one at a time.
 - **`SessionEvent`** (`src/events.rs`) — enum of all events the session
   emits: `UserPrompt`, `Thinking`, `AssistantText`, `ToolCall`,
-  `ToolResult`, `FinalResponse`, `Error`, `Cancelled`.
-- **`TerminalView`** (`src/terminal.rs`) — a rustyline REPL with
-  streamdown markdown rendering. Uses a single background render task
-  that receives events and drives the streamdown parser + renderer.
+  `ToolResult`, `FinalResponse`, `Error`, `Cancelled`.  Serialized as
+  tagged JSON over the WebSocket.
 - **Server** (`src/server.rs`) — axum HTTP + WebSocket server bound to
   `127.0.0.1:8187`. Serves `assets/index.html` and upgrades to WS for
-  full event streaming with history replay. `build_router()` is exposed
-  separately so GUI mode can bind the listener synchronously.
-- **Desktop GUI** (`src/main.rs` `run_gui`) — when invoked with `--gui`,
-  spawns the server on a tokio runtime and opens a native `wry` webview
-  window pointing at `http://127.0.0.1:8187`. The existing web UI
+  full event streaming with history replay.
+- **TerminalClient** (`src/terminal.rs`) — a rustyline REPL with streamdown
+  markdown rendering. Always connects to the server via WebSocket. Uses a
+  single background render task (`render_loop`) that receives events and
+  drives the streamdown parser + renderer.
+- **Desktop GUI** (`src/main.rs` `run_gui`) — opens a native `wry` webview
+  pointing at `http://127.0.0.1:8187`. The existing web UI
   (`assets/index.html`) is reused verbatim.
 - **Tools** (`src/tools.rs`) — four `#[rig_tool]` functions exposed to
   the LLM: `read`, `replace`, `write`, `shell`.
+
+## Startup modes
+
+```
+goop            terminal REPL (always WS client; auto-starts server)
+goop serve      headless server only
+goop gui        desktop GUI (primary if no server, else client webview)
+```
+
+On launch, `goop gui` checks whether a server is already listening on
+`127.0.0.1:8187`.  If yes it opens a client webview; if no it starts the
+server in-process.  `goop` (terminal) always auto-starts a server if none is
+running, then connects as a WS client — it never owns the session directly.
 
 ## Key design decisions
 
@@ -51,29 +74,36 @@ LLM with tools for reading, writing, and shell access.
 - **History replay.** `subscribe_all()` returns a `SessionSubscriber`
   that replays all past events before yielding live ones. This lets
   late-joining web clients catch up.
-- **GUI mode.** `--gui` runs the server on a background tokio runtime
-  and opens a native OS webview (WKWebView on macOS, WebView2 on
-  Windows, WebKitGTK on Linux). The web UI is shared between browser
-  and native window.
+- **All clients are equal.** The terminal, GUI, and web clients all connect
+  to the server via WebSocket.  Even when `goop` starts the server itself,
+  it immediately connects as a WS client — it never owns the session
+  directly.
+- **GUI mode.** `goop gui` runs the server on a background tokio runtime
+  (if primary) and opens a native OS webview (WKWebView on macOS,
+  WebView2 on Windows, WebKitGTK on Linux).
 
 ## Building & running
 
 ```bash
-# Native (requires system webview libs on Linux)
-cargo build
-DEEPSEEK_API_KEY=… cargo run            # terminal REPL
-DEEPSEEK_API_KEY=… cargo run -- --gui    # desktop GUI
+# Start the server in the background, then connect terminal + GUI
+DEEPSEEK_API_KEY=… cargo run -- serve &
+DEEPSEEK_API_KEY=… cargo run              # terminal REPL (auto-connects)
+DEEPSEEK_API_KEY=… cargo run -- gui       # desktop GUI (auto-connects)
+
+# Or just run one — it'll auto-start the server
+DEEPSEEK_API_KEY=… cargo run              # terminal REPL
+DEEPSEEK_API_KEY=… cargo run -- gui       # desktop GUI
 
 # Nix (all deps included)
 nix build
-DEEPSEEK_API_KEY=… ./result/bin/goop --gui
+DEEPSEEK_API_KEY=… ./result/bin/goop serve &
+DEEPSEEK_API_KEY=… ./result/bin/goop gui
 
 # Dev shell
 nix develop
 ```
 
-The terminal REPL starts immediately in default mode. The web server
-binds to `127.0.0.1:8187` in both modes (designed to sit behind nginx
+The web server binds to `127.0.0.1:8187` (designed to sit behind nginx
 with origin validation).
 
 ## Coding conventions

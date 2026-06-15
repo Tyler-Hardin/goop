@@ -1,13 +1,15 @@
+use futures::{SinkExt, StreamExt};
+use rustyline::Cmd;
 use rustyline::DefaultEditor;
+use rustyline::KeyEvent;
 use rustyline::error::ReadlineError;
 use std::sync::{Arc, Mutex as StdMutex};
-use streamdown_parser::Parser;
-use streamdown_render::Renderer;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 
-use crate::events::{PromptSource, SessionEvent};
-use crate::session::Session;
+use crate::events::SessionEvent;
 
 // ── ANSI constants ──────────────────────────────────────────────
 
@@ -77,39 +79,37 @@ impl<P: rustyline::ExternalPrinter> std::io::Write for PrinterWriter<P> {
     }
 }
 
-// ── terminal view ───────────────────────────────────────────────
+// ── terminal client (connects to server via WS) ─────────────────
 
-pub struct TerminalView {
-    session: Arc<Session>,
-}
+pub struct TerminalClient;
 
-impl TerminalView {
-    pub fn new(session: Arc<Session>) -> Self {
-        Self { session }
-    }
+impl TerminalClient {
+    /// Connect to a running goop server and start the terminal REPL.
+    pub async fn run() -> anyhow::Result<()> {
+        // ── connect to server ────────────────────────────────
+        let (ws_stream, _) = connect_async("ws://127.0.0.1:8187/ws").await?;
+        let (ws_tx, ws_rx) = ws_stream.split();
+        let ws_tx = Arc::new(tokio::sync::Mutex::new(ws_tx));
 
-    pub async fn run(&self) -> anyhow::Result<()> {
         let mut rl = DefaultEditor::new()?;
+        // Ctrl+J inserts a literal newline for multiline input.
+        rl.bind_sequence(KeyEvent::ctrl('j'), Cmd::Insert(1, "\n".into()));
         let term_width = streamdown_render::terminal_width();
 
         let printer = Arc::new(StdMutex::new(rl.create_external_printer()?));
 
         // ── channel plumbing ──────────────────────────────────
-        // Input from readline thread → main loop.
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Option<String>>();
         let (ready_tx, ready_rx) = mpsc::unbounded_channel::<()>();
         let ready_rx = Arc::new(StdMutex::new(Some(ready_rx)));
 
-        // Main loop forwards broadcast events to the render task.
+        // Events from WS → render task.
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
-        // Render task signals main loop when a terminal prompt's
-        // output has been fully rendered.
+        // Render task signals main loop when output is fully rendered.
         let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
 
-        // ── banner ────────────────────────────────────────
-        // Print this *before* spawning the readline thread so the
-        // prompt doesn't race ahead and appear first.
+        // ── banner ────────────────────────────────────────────
         {
             let mut stdout = tokio::io::stdout();
             stdout
@@ -124,16 +124,12 @@ impl TerminalView {
         }
 
         // ── permanent readline thread ──────────────────────────
-        // Supports multiline input via trailing-backslash
-        // continuation (like bash / POSIX shell).
         let thread_ready = ready_rx.clone();
         std::thread::spawn(move || {
             'outer: loop {
                 let mut buffer = String::new();
                 let mut first = true;
 
-                // Inner loop: accumulate lines as long as the user
-                // ends the current line with a backslash.
                 loop {
                     let prompt = if first {
                         "\x1b[1;33m»\x1b[0m "
@@ -149,12 +145,9 @@ impl TerminalView {
                             first = false;
 
                             if line.ends_with('\\') {
-                                // Strip trailing backslash, insert
-                                // newline, and keep reading.
                                 let (stripped, _) = line.split_at(line.len() - 1);
                                 buffer.push_str(stripped);
                                 buffer.push('\n');
-                                // Continue inner loop for next line.
                             } else {
                                 buffer.push_str(&line);
                                 let trimmed = buffer.trim().to_string();
@@ -169,7 +162,7 @@ impl TerminalView {
                                 } else {
                                     break 'outer;
                                 }
-                                break; // submit
+                                break;
                             }
                         }
                         Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
@@ -186,29 +179,40 @@ impl TerminalView {
         });
 
         // ── single render task ────────────────────────────────
-        // This is the *only* rendering pipeline — all terminal
-        // output goes through it for the entire session.
         let render_printer = printer.clone();
         let render_handle = tokio::spawn(async move {
             render_loop(render_printer, ev_rx, done_tx, term_width).await;
         });
 
-        // ── event forwarder ────────────────────────────────────
-        // Drains the session broadcast channel and forwards every
-        // event to the render task.
-        let fwd_session = Arc::clone(&self.session);
+        // ── WS receive task ───────────────────────────────────
+        // Reads JSON SessionEvent from the WebSocket and forwards
+        // to the render task. Filters out UserPrompt events — the
+        // terminal shows the readline prompt instead of echoing.
         let fwd_tx = ev_tx.clone();
+        let mut ws_rx = ws_rx;
         let fwd_handle = tokio::spawn(async move {
-            let mut rx = fwd_session.subscribe();
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
+            while let Some(msg) = ws_rx.next().await {
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        let event: SessionEvent = match serde_json::from_str(&text) {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+                        // Suppress UserPrompt echoes — the terminal
+                        // user already saw their input on the readline.
+                        if matches!(event, SessionEvent::UserPrompt { .. }) {
+                            continue;
+                        }
                         if fwd_tx.send(event).is_err() {
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Ok(Message::Close(_)) => break,
+                    Err(e) => {
+                        tracing::error!("ws recv error: {e}");
+                        break;
+                    }
+                    _ => {}
                 }
             }
         });
@@ -218,25 +222,38 @@ impl TerminalView {
             let raw = tokio::select! {
                 r = input_rx.recv() => r,
                 _ = tokio::signal::ctrl_c() => {
-                    // Ctrl+C at the prompt → exit.
                     None
                 }
             };
 
             match raw {
                 Some(Some(line)) => {
-                    let mut session_done = self.session.submit(&line, PromptSource::Terminal);
+                    // Send prompt over WebSocket.
+                    let payload =
+                        serde_json::json!({"type": "prompt", "content": &line}).to_string();
+                    {
+                        let mut tx = ws_tx.lock().await;
+                        if tx.send(Message::Text(payload.into())).await.is_err() {
+                            let mut stdout = tokio::io::stdout();
+                            stdout
+                                .write_all(b"\x1b[1;31mserver disconnected\x1b[0m\n")
+                                .await?;
+                            stdout.flush().await?;
+                            break;
+                        }
+                    }
+
                     let mut cancelled = false;
 
-                    // ── phase 1: wait for session, cancel on Ctrl+C ──
+                    // Wait for render flush, handling Ctrl+C for cancel.
                     loop {
                         tokio::select! {
-                            _ = &mut session_done => {
-                                break; // session finished (normally or via cancel)
+                            _ = done_rx.recv() => {
+                                break; // session finished
                             }
                             _ = tokio::signal::ctrl_c() => {
                                 if cancelled {
-                                    // Second Ctrl+C during session → exit.
+                                    // Second Ctrl+C → exit.
                                     let mut stdout = tokio::io::stdout();
                                     stdout.write_all(b"\x1b[2mbye.\x1b[0m\n").await?;
                                     stdout.flush().await?;
@@ -246,32 +263,16 @@ impl TerminalView {
                                     fwd_handle.abort();
                                     return Ok(());
                                 }
-                                // First Ctrl+C: cancel the LLM.
-                                self.session.cancel();
+                                // First Ctrl+C: send cancel over WS.
+                                let cancel_msg =
+                                    serde_json::json!({"type": "cancel"}).to_string();
+                                let mut tx = ws_tx.lock().await;
+                                let _ = tx.send(Message::Text(cancel_msg.into())).await;
                                 cancelled = true;
-                                // Loop back; session_done will fire
-                                // once the cancellation propagates.
                             }
                         }
                     }
 
-                    // ── phase 2: wait for render flush ──
-                    tokio::select! {
-                        _ = done_rx.recv() => {
-                            // render finished
-                        }
-                        _ = tokio::signal::ctrl_c() => {
-                            // Ctrl+C during render flush → exit.
-                            let mut stdout = tokio::io::stdout();
-                            stdout.write_all(b"\x1b[2mbye.\x1b[0m\n").await?;
-                            stdout.flush().await?;
-                            *ready_rx.lock().unwrap() = None;
-                            drop(ev_tx);
-                            render_handle.abort();
-                            fwd_handle.abort();
-                            return Ok(());
-                        }
-                    }
                     ready_tx.send(()).ok();
                 }
                 _ => {
@@ -303,12 +304,16 @@ impl TerminalView {
 // `()` on `done_tx` so the main loop knows the output is fully
 // visible and it's safe to show the next readline prompt.
 
-async fn render_loop<P: rustyline::ExternalPrinter>(
+pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
     printer: Arc<StdMutex<P>>,
     mut events: mpsc::UnboundedReceiver<SessionEvent>,
     done_tx: mpsc::UnboundedSender<()>,
     term_width: usize,
 ) {
+    use crate::events::PromptSource;
+    use streamdown_parser::Parser;
+    use streamdown_render::Renderer;
+
     let mut parser = Parser::new();
 
     // The renderer owns its writer.  We recreate the pair at turn

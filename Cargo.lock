@@ -3599,6 +3599,7 @@ dependencies = [
  "tao",
  "tera",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "tracing",
  "tracing-subscriber",
  "wry",

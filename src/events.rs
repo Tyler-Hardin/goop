@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Which view submitted this prompt.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[allow(dead_code)]
 pub enum PromptSource {
     Terminal,
@@ -10,7 +10,7 @@ pub enum PromptSource {
 
 /// Events emitted by the session as the agent processes a prompt.
 /// Views (terminal, web, phone, …) subscribe and render in their own way.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // some variants/fields are consumed by future views
 #[serde(tag = "type", content = "data")]
 pub enum SessionEvent {
