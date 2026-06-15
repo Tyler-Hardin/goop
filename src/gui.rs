@@ -11,16 +11,34 @@ use crate::server;
 use crate::session::SessionManager;
 
 /// Launch the desktop GUI, auto-starting a server if none is running.
+///
+/// - **Primary** (no server running): creates a new auto-named session
+///   by default so the user can start typing immediately.
+/// - **Secondary** (server already running): opens the latest session
+///   (by name) so the user resumes where they left off.
+/// - If `--session <name>` is given, that name is always used verbatim.
 pub fn run(session_name: Option<String>) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     if rt.block_on(crate::is_server_running()) {
         tracing::info!("found existing server on :8187, opening webview as client");
-        open_webview(session_name)
+        // Secondary: if no --session, pick the latest existing session.
+        let name = session_name.or_else(fetch_latest_session);
+        open_webview(name)
     } else {
         tracing::info!("no server found, starting primary");
-        run_primary(rt, session_name)
+        // Primary: if no --session, create a fresh session.
+        let name = session_name.unwrap_or_else(crate::session::next_session_name);
+        run_primary(rt, Some(name))
     }
+}
+
+/// Query the running server for its session list and return the
+/// most-recently named session (date-based names sort naturally).
+fn fetch_latest_session() -> Option<String> {
+    let resp = reqwest::blocking::get("http://127.0.0.1:8187/api/sessions").ok()?;
+    let names: Vec<String> = resp.json().ok()?;
+    names.into_iter().last()
 }
 
 /// GUI mode when we own the session + server.
