@@ -77,15 +77,8 @@ async fn delete_session(
     State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if state.manager.delete(&name).await {
-        axum::Json(serde_json::json!({ "deleted": true })).into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({ "error": "session not found" })),
-        )
-            .into_response()
-    }
+    state.manager.delete(&name).await;
+    axum::Json(serde_json::json!({ "deleted": true })).into_response()
 }
 
 // ── websocket ───────────────────────────────────────────────────

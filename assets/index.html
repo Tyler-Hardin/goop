@@ -877,12 +877,6 @@
       }
 
       async function deleteSession(name) {
-        if (
-          !confirm(
-            `Delete session "${name}"?\n\nFiles on disk are preserved and can be reloaded later.`,
-          )
-        )
-          return;
         const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, {
           method: "DELETE",
         });

@@ -148,19 +148,23 @@ duplication across the six match arms in `build_agent()`.
   The session loads events and messages from disk if files exist.
 - **Discovery:** On server start, `SessionManager::discover()` scans
   `~/.config/goop/sessions/` for `*.jsonl` files, extracts session names,
-  and calls `get_or_create` for each.  Existing sessions become immediately
-  available.
-- **Deletion:** `DELETE /api/sessions/{name}` removes the session from the
-  in-memory map.  Disk files are preserved — calling `get_or_create` again
-  will reload them.
+  and calls `get_or_create` for each **except** those listed in
+  `~/.config/goop/closed_sessions.json`.  Existing sessions become
+  immediately available.
+- **Closing (sidebar ×):** `DELETE /api/sessions/{name}` removes the session
+  from the in-memory map and adds its name to `closed_sessions.json`.  Disk
+  files are preserved — the session won't reappear on restart.  To reopen,
+  create a new session with the exact same name, which removes it from the
+  closed list and reloads all history from disk.
 - **WebSocket routing:** The WS URL is `/ws?session=<name>`.  The handler
   calls `manager.get_or_create(name)` before upgrading.  If the session
-  doesn't exist, it's created (loading from disk or fresh).
+  doesn't exist, it's created (loading from disk or fresh).  If the name
+  was previously closed, it's automatically un-closed.
 
 ### REST API
-- `GET /api/sessions` — returns sorted list of session names
+- `GET /api/sessions` — returns sorted list of active session names
 - `POST /api/sessions` — create a new session; body `{"name": "optional"}`
-- `DELETE /api/sessions/{name}` — remove from memory
+- `DELETE /api/sessions/{name}` — close session (remove from memory, mark as closed in `closed_sessions.json`; disk files preserved)
 
 ### Session working directory (CWD)
 

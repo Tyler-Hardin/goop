@@ -391,6 +391,9 @@ impl SessionManager {
         }
         sessions.insert(name.clone(), Arc::clone(&session));
 
+        // If this session was previously closed, un-close it now.
+        remove_closed_session(&name);
+
         // If this session was previously SSH'd, auto-reconnect in the
         // background so the transport is warm when the first prompt
         // arrives.
@@ -455,16 +458,24 @@ impl SessionManager {
         names
     }
 
-    /// Remove a session from memory.
+    /// Remove a session from memory and mark it as closed.
     ///
-    /// Returns `true` if the session was present.  The session's disk
-    /// files are *not* deleted — they can be reloaded later by calling
-    /// [`get_or_create`] again.
+    /// The session's disk files are *not* deleted.  The session is
+    /// added to the closed list so it won't reappear in the sidebar on
+    /// restart.  To bring it back, create a new session with the exact
+    /// same name.
+    ///
+    /// Always writes to the closed list — even if the session isn't
+    /// currently in memory.  This ensures stale sidebar clicks and
+    /// sessions that were pruned from the map still get persisted.
     pub async fn delete(&self, name: &str) -> bool {
-        self.sessions.write().await.remove(name).is_some()
+        let removed = self.sessions.write().await.remove(name).is_some();
+        add_closed_session(name);
+        removed
     }
 
-    /// Scan the sessions directory and load all discovered sessions.
+    /// Scan the sessions directory and load all discovered sessions
+    /// that haven't been explicitly closed by the user.
     ///
     /// Call once at server startup so the web UI immediately shows
     /// every session that has persisted data.
@@ -473,6 +484,7 @@ impl SessionManager {
         if !dir.exists() {
             return Ok(());
         }
+        let closed = load_closed_sessions();
         let entries = std::fs::read_dir(&dir)?;
         let mut names = std::collections::HashSet::new();
         for entry in entries.filter_map(|e| e.ok()) {
@@ -488,6 +500,10 @@ impl SessionManager {
             }
         }
         for name in names {
+            // Skip sessions the user has explicitly closed.
+            if closed.contains(&name) {
+                continue;
+            }
             // Ignore errors for individual sessions — a corrupt file
             // shouldn't prevent the server from starting.
             let _ = self.get_or_create(name).await;
@@ -498,13 +514,63 @@ impl SessionManager {
 
 // ── persistence helpers ─────────────────────────────────────────
 
+/// Directory for the goop config: `~/.config/goop/`
+fn goop_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
+    PathBuf::from(home).join(".config").join("goop")
+}
+
 /// Directory for session files: `~/.config/goop/sessions/`
 pub(crate) fn sessions_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
-    PathBuf::from(home)
-        .join(".config")
-        .join("goop")
-        .join("sessions")
+    goop_dir().join("sessions")
+}
+
+/// Path to the closed-sessions list: `~/.config/goop/closed_sessions.json`
+fn closed_sessions_path() -> PathBuf {
+    goop_dir().join("closed_sessions.json")
+}
+
+/// Load the set of session names the user has explicitly closed.
+fn load_closed_sessions() -> std::collections::HashSet<String> {
+    let path = closed_sessions_path();
+    if !path.exists() {
+        return std::collections::HashSet::new();
+    }
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    serde_json::from_str::<Vec<String>>(&contents)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Persist a session name to the closed list.
+fn add_closed_session(name: &str) {
+    let mut closed = load_closed_sessions();
+    closed.insert(name.to_string());
+    save_closed_sessions(&closed);
+}
+
+/// Remove a session name from the closed list (un-close).
+fn remove_closed_session(name: &str) {
+    let mut closed = load_closed_sessions();
+    if closed.remove(name) {
+        save_closed_sessions(&closed);
+    }
+}
+
+fn save_closed_sessions(closed: &std::collections::HashSet<String>) {
+    let path = closed_sessions_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut names: Vec<&String> = closed.iter().collect();
+    names.sort();
+    if let Ok(json) = serde_json::to_string_pretty(&names) {
+        let _ = std::fs::write(&path, json);
+    }
 }
 
 /// Load the session's saved CWD, or fall back to the process CWD.
