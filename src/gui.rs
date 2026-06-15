@@ -82,11 +82,12 @@ fn open_webview(session_name: Option<String>) -> anyhow::Result<()> {
         String::from("http://127.0.0.1:8187")
     };
 
-    let _webview = WebViewBuilder::new()
+    let webview = WebViewBuilder::new()
         .with_url(&url)
         .with_devtools(true)
         .build_gtk(vbox)?;
 
+    let mut webview = Some(webview);
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         if let Event::WindowEvent {
@@ -94,6 +95,11 @@ fn open_webview(session_name: Option<String>) -> anyhow::Result<()> {
             ..
         } = event
         {
+            // Destroy the webview before the event loop exits so GTK
+            // and WebKit can tear down cleanly — otherwise the implicit
+            // drop at closure destruction races with the event loop
+            // unwind and can corrupt the C heap.
+            drop(webview.take());
             *control_flow = ControlFlow::Exit;
         }
     });
