@@ -190,7 +190,7 @@ pub async fn write(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Computer-use tools (Linux/X11)
+// Computer-use helpers
 // ═══════════════════════════════════════════════════════════════════
 
 /// Run a command synchronously and return (stdout, stderr, exit_status).
@@ -209,6 +209,43 @@ fn require_bin(bin: &str) -> Result<(), rig::tool::ToolError> {
         ))),
     }
 }
+
+/// Run a synchronous command, auto-wrapping I/O errors into ToolError.
+fn run_tool_cmd(bin: &str, args: &[&str]) -> Result<std::process::Output, rig::tool::ToolError> {
+    run_cmd(bin, args).map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))
+}
+
+/// Check a command's exit status. Returns `ok_msg` on success, or a
+/// ToolError with stderr on failure.
+fn check_cmd(
+    out: std::process::Output,
+    ok_msg: impl Into<String>,
+) -> Result<String, rig::tool::ToolError> {
+    if out.status.success() {
+        Ok(ok_msg.into())
+    } else {
+        Err(rig::tool::ToolError::ToolCallError(Box::new(
+            std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
+        )))
+    }
+}
+
+/// Run a closure on the blocking thread pool after verifying `bin` is
+/// installed.  The single helper replaces the repeated `require_bin` +
+/// `spawn_blocking` + join-error boilerplate in every computer-use tool.
+async fn tool_blocking<F>(bin: &str, f: F) -> Result<String, rig::tool::ToolError>
+where
+    F: FnOnce() -> Result<String, rig::tool::ToolError> + Send + 'static,
+{
+    require_bin(bin)?;
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Computer-use tools (Linux/X11)
+// ═══════════════════════════════════════════════════════════════════
 
 #[rig_tool(
     description = "Take a screenshot of the current desktop and run OCR (tesseract) to extract visible text. Saves the image to the given path (default: /tmp/goop_screenshot.png). Set ocr=false to skip OCR. Requires scrot and tesseract.",
@@ -266,7 +303,7 @@ pub async fn screenshot(
                         }
                     }
                     Err(e) => {
-                        result.push_str(&format!("\n(OCR output unreadable: {e})"));
+                        result.push_str(&format!("\n(OCR output unreadable: {e}"));
                     }
                 }
             }
@@ -285,12 +322,9 @@ pub async fn screenshot(
     required(command)
 )]
 pub async fn cursor_position() -> Result<String, rig::tool::ToolError> {
-    require_bin("xdotool")?;
-    tokio::task::spawn_blocking(|| {
-        let out = run_cmd("xdotool", &["getmouselocation", "--shell"])
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    tool_blocking("xdotool", || {
+        let out = run_tool_cmd("xdotool", &["getmouselocation", "--shell"])?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        // Parse X=… Y=… from shell format
         let mut x = None;
         let mut y = None;
         for line in stdout.lines() {
@@ -309,7 +343,6 @@ pub async fn cursor_position() -> Result<String, rig::tool::ToolError> {
         }
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
 #[rig_tool(
@@ -317,20 +350,13 @@ pub async fn cursor_position() -> Result<String, rig::tool::ToolError> {
     required(command)
 )]
 pub async fn mouse_move(x: i32, y: i32) -> Result<String, rig::tool::ToolError> {
-    require_bin("xdotool")?;
-    tokio::task::spawn_blocking(move || {
-        let out = run_cmd("xdotool", &["mousemove", &x.to_string(), &y.to_string()])
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
-        if out.status.success() {
-            Ok(format!("Moved cursor to ({x}, {y})"))
-        } else {
-            Err(rig::tool::ToolError::ToolCallError(Box::new(
-                std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
-            )))
-        }
+    tool_blocking("xdotool", move || {
+        check_cmd(
+            run_tool_cmd("xdotool", &["mousemove", &x.to_string(), &y.to_string()])?,
+            format!("Moved cursor to ({x}, {y})"),
+        )
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
 #[rig_tool(
@@ -342,12 +368,11 @@ pub async fn mouse_click(
     x: Option<i32>,
     y: Option<i32>,
 ) -> Result<String, rig::tool::ToolError> {
-    require_bin("xdotool")?;
-    tokio::task::spawn_blocking(move || {
+    tool_blocking("xdotool", move || {
         let btn = match button.as_deref() {
             Some("right") => "3",
             Some("middle") => "2",
-            _ => "1", // left is default
+            _ => "1",
         };
         let btn_name = match btn {
             "3" => "right",
@@ -356,33 +381,21 @@ pub async fn mouse_click(
         };
 
         if let (Some(x), Some(y)) = (x, y) {
-            // Move then click
-            let out = run_cmd(
-                "xdotool",
-                &["mousemove", &x.to_string(), &y.to_string(), "click", btn],
+            check_cmd(
+                run_tool_cmd(
+                    "xdotool",
+                    &["mousemove", &x.to_string(), &y.to_string(), "click", btn],
+                )?,
+                format!("Clicked {btn_name} at ({x}, {y})"),
             )
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
-            if out.status.success() {
-                Ok(format!("Clicked {btn_name} at ({x}, {y})"))
-            } else {
-                Err(rig::tool::ToolError::ToolCallError(Box::new(
-                    std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
-                )))
-            }
         } else {
-            let out = run_cmd("xdotool", &["click", btn])
-                .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
-            if out.status.success() {
-                Ok(format!("Clicked {btn_name} at current position"))
-            } else {
-                Err(rig::tool::ToolError::ToolCallError(Box::new(
-                    std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
-                )))
-            }
+            check_cmd(
+                run_tool_cmd("xdotool", &["click", btn])?,
+                format!("Clicked {btn_name} at current position"),
+            )
         }
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
 #[rig_tool(
@@ -390,20 +403,13 @@ pub async fn mouse_click(
     required(command)
 )]
 pub async fn key_type(text: String) -> Result<String, rig::tool::ToolError> {
-    require_bin("xdotool")?;
-    tokio::task::spawn_blocking(move || {
-        let out = run_cmd("xdotool", &["type", "--", &text])
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
-        if out.status.success() {
-            Ok(format!("Typed: {text}"))
-        } else {
-            Err(rig::tool::ToolError::ToolCallError(Box::new(
-                std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
-            )))
-        }
+    tool_blocking("xdotool", move || {
+        check_cmd(
+            run_tool_cmd("xdotool", &["type", "--", &text])?,
+            format!("Typed: {text}"),
+        )
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
 #[rig_tool(
@@ -411,20 +417,13 @@ pub async fn key_type(text: String) -> Result<String, rig::tool::ToolError> {
     required(command)
 )]
 pub async fn key_press(combo: String) -> Result<String, rig::tool::ToolError> {
-    require_bin("xdotool")?;
-    tokio::task::spawn_blocking(move || {
-        let out = run_cmd("xdotool", &["key", &combo])
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
-        if out.status.success() {
-            Ok(format!("Pressed: {combo}"))
-        } else {
-            Err(rig::tool::ToolError::ToolCallError(Box::new(
-                std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
-            )))
-        }
+    tool_blocking("xdotool", move || {
+        check_cmd(
+            run_tool_cmd("xdotool", &["key", &combo])?,
+            format!("Pressed: {combo}"),
+        )
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
 #[rig_tool(
@@ -432,10 +431,8 @@ pub async fn key_press(combo: String) -> Result<String, rig::tool::ToolError> {
     required(command)
 )]
 pub async fn window_list() -> Result<String, rig::tool::ToolError> {
-    require_bin("wmctrl")?;
-    tokio::task::spawn_blocking(|| {
-        let out = run_cmd("wmctrl", &["-lx"])
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    tool_blocking("wmctrl", || {
+        let out = run_tool_cmd("wmctrl", &["-lx"])?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
 
         if stdout.trim().is_empty() {
@@ -462,7 +459,6 @@ pub async fn window_list() -> Result<String, rig::tool::ToolError> {
         Ok(lines.join("\n"))
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
 #[rig_tool(
@@ -473,34 +469,17 @@ pub async fn window_focus(
     title: Option<String>,
     class: Option<String>,
 ) -> Result<String, rig::tool::ToolError> {
-    require_bin("wmctrl")?;
-    tokio::task::spawn_blocking(move || {
+    tool_blocking("wmctrl", move || {
         if let Some(ref cls) = class {
-            // Match by WM_CLASS
-            let out = run_cmd("wmctrl", &["-x", "-a", cls])
-                .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
-            if !out.status.success() {
-                return Err(rig::tool::ToolError::ToolCallError(Box::new(
-                    std::io::Error::other(format!(
-                        "wmctrl failed for class '{cls}': {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    )),
-                )));
-            }
-            Ok(format!("Focused window by class '{cls}'"))
+            check_cmd(
+                run_tool_cmd("wmctrl", &["-x", "-a", cls])?,
+                format!("Focused window by class '{cls}'"),
+            )
         } else if let Some(ref t) = title {
-            // Match by title substring
-            let out = run_cmd("wmctrl", &["-a", t])
-                .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
-            if !out.status.success() {
-                return Err(rig::tool::ToolError::ToolCallError(Box::new(
-                    std::io::Error::other(format!(
-                        "wmctrl failed for title '{t}': {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    )),
-                )));
-            }
-            Ok(format!("Focused window by title '{t}'"))
+            check_cmd(
+                run_tool_cmd("wmctrl", &["-a", t])?,
+                format!("Focused window by title '{t}'"),
+            )
         } else {
             Err(rig::tool::ToolError::ToolCallError(Box::new(
                 std::io::Error::other("Must provide either `title` or `class`"),
@@ -508,7 +487,6 @@ pub async fn window_focus(
         }
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
 #[rig_tool(
@@ -516,10 +494,8 @@ pub async fn window_focus(
     required(command)
 )]
 pub async fn window_get_active() -> Result<String, rig::tool::ToolError> {
-    require_bin("xdotool")?;
-    tokio::task::spawn_blocking(|| {
-        let id_out = run_cmd("xdotool", &["getactivewindow"])
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    tool_blocking("xdotool", || {
+        let id_out = run_tool_cmd("xdotool", &["getactivewindow"])?;
         let id = String::from_utf8_lossy(&id_out.stdout).trim().to_string();
         if id.is_empty() {
             return Err(rig::tool::ToolError::ToolCallError(Box::new(
@@ -566,19 +542,15 @@ pub async fn window_get_active() -> Result<String, rig::tool::ToolError> {
         ))
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
 
 #[rig_tool(
     description = "Open a URL in the default web browser using xdg-open.",
     required(url)
 )]
-#[allow(dead_code)]
 pub async fn open_url(url: String) -> Result<String, rig::tool::ToolError> {
-    require_bin("xdg-open")?;
-    tokio::task::spawn_blocking(move || {
-        let out = run_cmd("xdg-open", &[&url])
-            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+    tool_blocking("xdg-open", move || {
+        let out = run_tool_cmd("xdg-open", &[&url])?;
         if out.status.success() {
             Ok(format!("Opened {url}"))
         } else {
@@ -592,5 +564,4 @@ pub async fn open_url(url: String) -> Result<String, rig::tool::ToolError> {
         }
     })
     .await
-    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
 }
