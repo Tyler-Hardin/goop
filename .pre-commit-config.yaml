@@ -15,6 +15,14 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      - id: nixfmt
+        name: nixfmt
+        entry: nixfmt
+        language: system
+        types: [file]
+        files: \.nix$
+        pass_filenames: true
+
       - id: prettier
         name: prettier
         entry: prettier --check

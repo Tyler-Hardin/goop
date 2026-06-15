@@ -188,3 +188,409 @@ pub async fn write(
         path.display()
     ))
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Computer-use tools (Linux/X11)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Run a command synchronously and return (stdout, stderr, exit_status).
+fn run_cmd(bin: &str, args: &[&str]) -> Result<std::process::Output, std::io::Error> {
+    std::process::Command::new(bin).args(args).output()
+}
+
+/// Check that a binary exists; return a ToolError if not.
+fn require_bin(bin: &str) -> Result<(), rig::tool::ToolError> {
+    match std::process::Command::new("which").arg(bin).output() {
+        Ok(out) if out.status.success() => Ok(()),
+        _ => Err(rig::tool::ToolError::ToolCallError(Box::new(
+            std::io::Error::other(format!(
+                "{bin} not found — install it with your package manager (e.g. nix-shell -p {bin})"
+            )),
+        ))),
+    }
+}
+
+#[rig_tool(
+    description = "Take a screenshot of the current desktop and run OCR (tesseract) to extract visible text. Saves the image to the given path (default: /tmp/goop_screenshot.png). Set ocr=false to skip OCR. Requires scrot and tesseract.",
+    required(command)
+)]
+pub async fn screenshot(
+    path: Option<std::path::PathBuf>,
+    ocr: Option<bool>,
+) -> Result<String, rig::tool::ToolError> {
+    require_bin("scrot")?;
+    let ocr = ocr.unwrap_or(true);
+
+    let img_path = path.unwrap_or_else(|| std::path::PathBuf::from("/tmp/goop_screenshot.png"));
+
+    tokio::task::spawn_blocking(move || {
+        // Take screenshot
+        let out = run_cmd("scrot", &["--overwrite", &img_path.to_string_lossy()])
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        if !out.status.success() {
+            return Err(rig::tool::ToolError::ToolCallError(Box::new(
+                std::io::Error::other(format!(
+                    "scrot failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )),
+            )));
+        }
+
+        let mut result = format!("Screenshot saved to {}", img_path.display());
+
+        if ocr {
+            if require_bin("tesseract").is_err() {
+                result.push_str("\n(OCR skipped: tesseract not installed)");
+                return Ok(result);
+            }
+            let base = img_path.with_extension("");
+            let out = run_cmd(
+                "tesseract",
+                &[&img_path.to_string_lossy(), &base.to_string_lossy()],
+            )
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+            if !out.status.success() {
+                result.push_str(&format!(
+                    "\n(OCR failed: {})",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            } else {
+                let txt_path = base.with_extension("txt");
+                match std::fs::read_to_string(&txt_path) {
+                    Ok(ocr_text) => {
+                        let trimmed = ocr_text.trim();
+                        if trimmed.is_empty() {
+                            result.push_str("\n(OCR returned no text)");
+                        } else {
+                            result.push_str(&format!("\n\nOCR text:\n{trimmed}"));
+                        }
+                    }
+                    Err(e) => {
+                        result.push_str(&format!("\n(OCR output unreadable: {e})"));
+                    }
+                }
+            }
+        } else {
+            result.push_str(" (OCR disabled)");
+        }
+
+        Ok(result)
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "Get current mouse cursor position. Returns 'x y' coordinates (origin top-left).",
+    required(command)
+)]
+pub async fn cursor_position() -> Result<String, rig::tool::ToolError> {
+    require_bin("xdotool")?;
+    tokio::task::spawn_blocking(|| {
+        let out = run_cmd("xdotool", &["getmouselocation", "--shell"])
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // Parse X=… Y=… from shell format
+        let mut x = None;
+        let mut y = None;
+        for line in stdout.lines() {
+            if let Some(v) = line.strip_prefix("X=") {
+                x = Some(v.to_string());
+            }
+            if let Some(v) = line.strip_prefix("Y=") {
+                y = Some(v.to_string());
+            }
+        }
+        match (x, y) {
+            (Some(x), Some(y)) => Ok(format!("{x} {y}")),
+            _ => Err(rig::tool::ToolError::ToolCallError(Box::new(
+                std::io::Error::other(format!("unexpected xdotool output: {stdout}")),
+            ))),
+        }
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "Move mouse cursor to absolute screen coordinates (x, y). Origin is top-left corner.",
+    required(command)
+)]
+pub async fn mouse_move(x: i32, y: i32) -> Result<String, rig::tool::ToolError> {
+    require_bin("xdotool")?;
+    tokio::task::spawn_blocking(move || {
+        let out = run_cmd("xdotool", &["mousemove", &x.to_string(), &y.to_string()])
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        if out.status.success() {
+            Ok(format!("Moved cursor to ({x}, {y})"))
+        } else {
+            Err(rig::tool::ToolError::ToolCallError(Box::new(
+                std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
+            )))
+        }
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "Click a mouse button. button: 'left' (default), 'right', or 'middle'. If x,y are given, moves cursor there first then clicks. Otherwise clicks at current position.",
+    required(command)
+)]
+pub async fn mouse_click(
+    button: Option<String>,
+    x: Option<i32>,
+    y: Option<i32>,
+) -> Result<String, rig::tool::ToolError> {
+    require_bin("xdotool")?;
+    tokio::task::spawn_blocking(move || {
+        let btn = match button.as_deref() {
+            Some("right") => "3",
+            Some("middle") => "2",
+            _ => "1", // left is default
+        };
+        let btn_name = match btn {
+            "3" => "right",
+            "2" => "middle",
+            _ => "left",
+        };
+
+        if let (Some(x), Some(y)) = (x, y) {
+            // Move then click
+            let out = run_cmd(
+                "xdotool",
+                &["mousemove", &x.to_string(), &y.to_string(), "click", btn],
+            )
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+            if out.status.success() {
+                Ok(format!("Clicked {btn_name} at ({x}, {y})"))
+            } else {
+                Err(rig::tool::ToolError::ToolCallError(Box::new(
+                    std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
+                )))
+            }
+        } else {
+            let out = run_cmd("xdotool", &["click", btn])
+                .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+            if out.status.success() {
+                Ok(format!("Clicked {btn_name} at current position"))
+            } else {
+                Err(rig::tool::ToolError::ToolCallError(Box::new(
+                    std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
+                )))
+            }
+        }
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "Type a string of text via the keyboard. Use for entering text into the focused window.",
+    required(command)
+)]
+pub async fn key_type(text: String) -> Result<String, rig::tool::ToolError> {
+    require_bin("xdotool")?;
+    tokio::task::spawn_blocking(move || {
+        let out = run_cmd("xdotool", &["type", "--", &text])
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        if out.status.success() {
+            Ok(format!("Typed: {text}"))
+        } else {
+            Err(rig::tool::ToolError::ToolCallError(Box::new(
+                std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
+            )))
+        }
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "Press a key combination like 'ctrl+c', 'alt+Tab', 'super', 'Return', 'Escape', etc. Keys are xdotool key names.",
+    required(command)
+)]
+pub async fn key_press(combo: String) -> Result<String, rig::tool::ToolError> {
+    require_bin("xdotool")?;
+    tokio::task::spawn_blocking(move || {
+        let out = run_cmd("xdotool", &["key", &combo])
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        if out.status.success() {
+            Ok(format!("Pressed: {combo}"))
+        } else {
+            Err(rig::tool::ToolError::ToolCallError(Box::new(
+                std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()),
+            )))
+        }
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "List all open windows with their IDs, WM_CLASS (stable identifier like 'Navigator.firefox'), and titles. Use with window_focus to switch to a specific window.",
+    required(command)
+)]
+pub async fn window_list() -> Result<String, rig::tool::ToolError> {
+    require_bin("wmctrl")?;
+    tokio::task::spawn_blocking(|| {
+        let out = run_cmd("wmctrl", &["-lx"])
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+        if stdout.trim().is_empty() {
+            return Ok(String::from("No windows found."));
+        }
+
+        // wmctrl -lx format: WINDOW_ID  DESKTOP  WM_CLASS  HOSTNAME  TITLE
+        let lines: Vec<String> = stdout
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim();
+                let cols = trimmed.split_whitespace().collect::<Vec<_>>();
+                if cols.len() >= 5 {
+                    let id = cols[0];
+                    let class = cols[2];
+                    let title = cols[4..].join(" ");
+                    format!("{id}  class={class}  \"{title}\"")
+                } else {
+                    trimmed.to_string()
+                }
+            })
+            .collect();
+
+        Ok(lines.join("\n"))
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "Focus (raise and activate) a window by searching its title or WM_CLASS. Uses substring match. Prefer `class` (e.g. 'Navigator.firefox') for stable matching across page title changes.",
+    required(command)
+)]
+pub async fn window_focus(
+    title: Option<String>,
+    class: Option<String>,
+) -> Result<String, rig::tool::ToolError> {
+    require_bin("wmctrl")?;
+    tokio::task::spawn_blocking(move || {
+        if let Some(ref cls) = class {
+            // Match by WM_CLASS
+            let out = run_cmd("wmctrl", &["-x", "-a", cls])
+                .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+            if !out.status.success() {
+                return Err(rig::tool::ToolError::ToolCallError(Box::new(
+                    std::io::Error::other(format!(
+                        "wmctrl failed for class '{cls}': {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
+                )));
+            }
+            Ok(format!("Focused window by class '{cls}'"))
+        } else if let Some(ref t) = title {
+            // Match by title substring
+            let out = run_cmd("wmctrl", &["-a", t])
+                .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+            if !out.status.success() {
+                return Err(rig::tool::ToolError::ToolCallError(Box::new(
+                    std::io::Error::other(format!(
+                        "wmctrl failed for title '{t}': {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
+                )));
+            }
+            Ok(format!("Focused window by title '{t}'"))
+        } else {
+            Err(rig::tool::ToolError::ToolCallError(Box::new(
+                std::io::Error::other("Must provide either `title` or `class`"),
+            )))
+        }
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "Get the currently active (focused) window: its ID, title, and geometry (position and size).",
+    required(command)
+)]
+pub async fn window_get_active() -> Result<String, rig::tool::ToolError> {
+    require_bin("xdotool")?;
+    tokio::task::spawn_blocking(|| {
+        let id_out = run_cmd("xdotool", &["getactivewindow"])
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        let id = String::from_utf8_lossy(&id_out.stdout).trim().to_string();
+        if id.is_empty() {
+            return Err(rig::tool::ToolError::ToolCallError(Box::new(
+                std::io::Error::other("No active window"),
+            )));
+        }
+
+        let name = String::from_utf8_lossy(
+            &run_cmd("xdotool", &["getwindowname", &id])
+                .map(|o| o.stdout)
+                .unwrap_or_default(),
+        )
+        .trim()
+        .to_string();
+
+        let geom_raw = String::from_utf8_lossy(
+            &run_cmd("xdotool", &["getwindowgeometry", "--shell", &id])
+                .map(|o| o.stdout)
+                .unwrap_or_default(),
+        )
+        .into_owned();
+
+        let mut x = "";
+        let mut y = "";
+        let mut w = "";
+        let mut h = "";
+        for line in geom_raw.lines() {
+            if let Some(v) = line.strip_prefix("X=") {
+                x = v;
+            }
+            if let Some(v) = line.strip_prefix("Y=") {
+                y = v;
+            }
+            if let Some(v) = line.strip_prefix("WIDTH=") {
+                w = v;
+            }
+            if let Some(v) = line.strip_prefix("HEIGHT=") {
+                h = v;
+            }
+        }
+
+        Ok(format!(
+            "Window {id}: \"{name}\" — position=({x},{y}) size={w}x{h}"
+        ))
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
+
+#[rig_tool(
+    description = "Open a URL in the default web browser using xdg-open.",
+    required(url)
+)]
+#[allow(dead_code)]
+pub async fn open_url(url: String) -> Result<String, rig::tool::ToolError> {
+    require_bin("xdg-open")?;
+    tokio::task::spawn_blocking(move || {
+        let out = run_cmd("xdg-open", &[&url])
+            .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?;
+        if out.status.success() {
+            Ok(format!("Opened {url}"))
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // xdg-open often succeeds even with stderr output, so just note it
+            if stderr.is_empty() {
+                Ok(format!("Opened {url}"))
+            } else {
+                Ok(format!("Opened {url} (stderr: {stderr})"))
+            }
+        }
+    })
+    .await
+    .map_err(|e| rig::tool::ToolError::ToolCallError(Box::new(e)))?
+}
