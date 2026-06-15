@@ -1,5 +1,6 @@
 mod events;
 mod memory;
+mod preamble;
 mod server;
 mod session;
 mod terminal;
