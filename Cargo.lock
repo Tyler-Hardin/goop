@@ -4141,6 +4141,7 @@ dependencies = [
  "clap",
  "figment",
  "futures",
+ "glob",
  "gtk",
  "html2text",
  "log",

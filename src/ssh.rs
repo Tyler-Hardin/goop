@@ -131,46 +131,10 @@ impl SshConfig {
 impl HostBlock {
     /// Check whether any pattern in this block matches `host`.
     fn matches(&self, host: &str) -> bool {
-        self.patterns.iter().any(|pat| glob_match(pat, host))
+        self.patterns
+            .iter()
+            .any(|pat| glob::Pattern::new(pat).is_ok_and(|p| p.matches(host)))
     }
-}
-
-/// Simple glob matching: `*` matches any sequence, `?` matches any single
-/// character.  Does NOT handle `!` negation, character classes, or `**`.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    // "*" matches everything.
-    if pattern == "*" {
-        return true;
-    }
-
-    let pat: Vec<char> = pattern.chars().collect();
-    let txt: Vec<char> = text.chars().collect();
-    let plen = pat.len();
-    let tlen = txt.len();
-
-    // dp[i][j] = does pat[..i] match txt[..j]?
-    let mut dp = vec![vec![false; tlen + 1]; plen + 1];
-    dp[0][0] = true;
-
-    // Leading stars match empty text.
-    for i in 1..=plen {
-        if pat[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-
-    for i in 1..=plen {
-        for j in 1..=tlen {
-            if pat[i - 1] == '*' {
-                // Star matches zero chars (dp[i-1][j]) or one+ chars (dp[i][j-1]).
-                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
-            } else if pat[i - 1] == '?' || pat[i - 1] == txt[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1];
-            }
-        }
-    }
-
-    dp[plen][tlen]
 }
 
 /// Parse a `key value` / `key = value` / `key=value` line.
@@ -584,26 +548,6 @@ fn expand_tilde(s: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_glob_match() {
-        // Exact.
-        assert!(glob_match("hello", "hello"));
-        assert!(!glob_match("hello", "world"));
-
-        // Star.
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("*.example.com", "foo.example.com"));
-        assert!(glob_match("*.example.com", ".example.com"));
-        assert!(!glob_match("*.example.com", "foo.example.org"));
-        assert!(glob_match("foo*bar", "fooxxxbar"));
-        assert!(glob_match("foo*bar", "foobar"));
-
-        // Question mark.
-        assert!(glob_match("h?llo", "hello"));
-        assert!(glob_match("h?llo", "hallo"));
-        assert!(!glob_match("h?llo", "hllo"));
-    }
 
     #[test]
     fn test_parse_config_basic() {
