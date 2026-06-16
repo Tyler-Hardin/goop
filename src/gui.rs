@@ -75,8 +75,14 @@ fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> any
         let _ = ready_tx.send(());
         tracing::info!("web server on http://127.0.0.1:8187");
         axum::serve(listener, app)
+            .with_graceful_shutdown(server::shutdown_signal())
             .await
             .expect("server exited unexpectedly");
+        // If restart was requested, spawn the new binary.  The GUI
+        // webview will reconnect automatically.
+        if server::is_restart_requested() {
+            server::spawn_new_binary();
+        }
     });
 
     let _ = ready_rx.recv();

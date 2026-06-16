@@ -61,6 +61,14 @@ The web UI shows a session sidebar for switching between sessions.
   `127.0.0.1:8187`. Serves `assets/index.html`, a REST API for session
   management (`GET/POST /api/sessions`, `DELETE /api/sessions/{name}`),
   and WS upgrade at `/ws?session=<name>` with full history replay.
+  Supports graceful self-restart: the `restart` tool sets a flag on
+  `SessionState`; after the current prompt completes, the drain loop
+  fires a global shutdown signal.  `axum::serve` uses
+  `with_graceful_shutdown` to close the TCP listener cleanly, then
+  spawns the new binary as a detached child process before returning.
+  This lets the agent modify the source, run `cargo build`, call
+  `restart`, and have the changes take effect without losing any
+  session state (everything is persisted to disk beforehand).
 - **TerminalClient** (`src/terminal.rs`) — a rustyline REPL with streamdown
   markdown rendering. Always connects to the server via WebSocket. Uses a
   single background render task (`render_loop`) that receives events and
@@ -73,7 +81,7 @@ The web UI shows a session sidebar for switching between sessions.
 - **Tools** (`src/tools/`) — each tool implements `rig::tool::Tool` on a
   struct that holds an `Arc<SessionState>`.  Tools are organised by group:
   `file.rs` (read, write, replace, read_html, cd), `shell.rs` (shell),
-  `ssh_tool.rs` (ssh, disconnect), `web.rs` (web_fetch),
+  `restart.rs` (restart), `ssh_tool.rs` (ssh, disconnect), `web.rs` (web_fetch),
   `computer.rs` (screenshot, cursor_position, mouse_*, key_*, window_*,
   open_url).  The active set is built in `build_tools()` based on
   `Config::enabled_tool_groups` and passed to the agent via the builder's
@@ -437,3 +445,6 @@ enabled_tool_groups = ["file_ops", "shell", "ssh", "web_fetch", "computer_use"]
 
 Available groups: `file_ops`, `shell`, `ssh`, `web_fetch`, `computer_use`.
 Default: all except `computer_use`.
+
+The `shell` group includes the `restart` tool (no args — schedules a
+graceful server restart after the current prompt completes).

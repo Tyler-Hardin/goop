@@ -320,6 +320,14 @@ impl Session {
             if let Some(tx) = done {
                 let _ = tx.send(());
             }
+
+            // If the restart tool was called during this prompt, the
+            // flag is now set.  Signal the server to shut down gracefully
+            // and stop processing further prompts.
+            if crate::server::is_restart_requested() {
+                crate::server::notify_shutdown();
+                break;
+            }
         }
     }
 

@@ -86,14 +86,16 @@ async fn start_server_in_background() -> anyhow::Result<()> {
     manager.discover().await?;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let app = server::build_router(manager);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:8187")
-            .await
-            .expect("failed to bind to 127.0.0.1:8187");
         let _ = ready_tx.send(());
-        axum::serve(listener, app)
-            .await
-            .expect("server exited unexpectedly");
+        if let Err(e) = server::serve(manager).await {
+            tracing::error!("server exited: {e}");
+        }
+        // If restart was requested, spawn the new server binary.
+        // The current process continues running (terminal client
+        // will reconnect automatically).
+        if server::is_restart_requested() {
+            server::spawn_new_binary();
+        }
     });
     ready_rx.await?;
     Ok(())
@@ -111,7 +113,16 @@ async fn run_server(session_name: Option<String>) -> anyhow::Result<()> {
         let session = manager.get_or_create(name).await?;
         tracing::info!("session · {}", session.name());
     }
-    server::serve(manager).await
+    server::serve(manager).await?;
+
+    // If restart was requested, spawn the new server and exit.
+    // The new process takes over the :8187 port.
+    if server::is_restart_requested() {
+        server::spawn_new_binary();
+        std::process::exit(0);
+    }
+
+    Ok(())
 }
 
 // ── helpers ────────────────────────────────────────────────────

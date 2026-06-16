@@ -626,6 +626,14 @@ pub fn state_path(name: &str) -> PathBuf {
 
 // ── misc ──────────────────────────────────────────────────────────────
 
+/// Check whether `cwd` is the goop source tree by looking for the
+/// `AGENTS.md` marker file.  Used to gate the `restart` tool.
+pub(crate) fn is_goop_project_dir(cwd: &Path) -> bool {
+    std::fs::read_to_string(cwd.join("AGENTS.md"))
+        .map(|s| s.starts_with("# AGENTS.md — goop"))
+        .unwrap_or(false)
+}
+
 /// Turn a URL into a safe filename fragment.
 fn slugify(url: &str) -> String {
     url.chars()
@@ -637,4 +645,20 @@ fn slugify(url: &str) -> String {
         .chars()
         .take(120)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_goop_project_dir_detects_self() {
+        // We're running from the goop source tree — the marker file exists.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            is_goop_project_dir(&cwd),
+            "expected to detect goop project at {}",
+            cwd.display()
+        );
+    }
 }

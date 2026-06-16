@@ -7,6 +7,7 @@
 
 pub(crate) mod computer;
 pub(crate) mod file;
+pub(crate) mod restart;
 pub(crate) mod shell;
 pub(crate) mod ssh_tool;
 pub(crate) mod web;
@@ -164,6 +165,9 @@ pub(crate) fn build_tools(config: &Config, state: &Arc<SessionState>) -> Vec<Box
     }
     if config.has_tool_group(ToolGroup::Shell) {
         tools.push(Box::new(shell::Shell::new(s())));
+        if crate::session_state::is_goop_project_dir(&std::env::current_dir().unwrap_or_default()) {
+            tools.push(Box::new(restart::Restart::new(s())));
+        }
     }
     if config.has_tool_group(ToolGroup::Ssh) {
         tools.push(Box::new(ssh_tool::Ssh::new(s())));

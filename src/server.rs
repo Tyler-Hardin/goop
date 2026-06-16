@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -8,7 +10,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use crate::events::PromptSource;
 use crate::session::{Session, SessionManager};
@@ -17,6 +19,97 @@ const PAGE: &str = include_str!("../assets/index.html");
 const MANIFEST: &str = include_str!("../assets/manifest.json");
 const SERVICE_WORKER: &str = include_str!("../assets/sw.js");
 const ICON: &[u8] = include_bytes!("../assets/goop_icon_full.png");
+
+// ── restart machinery ──────────────────────────────────────────────
+
+/// Set to true by the `restart` tool.  The session drain loop checks
+/// this after each prompt completes; when true it notifies the shutdown
+/// signal and the server closes its TCP listener gracefully.
+static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Fires when the server should shut down (restart or Ctrl+C).
+static SHUTDOWN_NOTIFY: OnceLock<Notify> = OnceLock::new();
+
+fn shutdown_notify() -> &'static Notify {
+    SHUTDOWN_NOTIFY.get_or_init(Notify::new)
+}
+
+/// Called by the `restart` tool.  Sets a flag; the current prompt
+/// completes normally, then the server shuts down gracefully.
+pub fn trigger_restart() {
+    RESTART_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Checked by the session drain loop after each prompt finishes.
+pub fn is_restart_requested() -> bool {
+    RESTART_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Called by the session drain loop to begin the graceful shutdown.
+pub fn notify_shutdown() {
+    shutdown_notify().notify_one();
+}
+
+/// Returns a future that resolves when the server should shut down.
+pub async fn shutdown_signal() {
+    shutdown_notify().notified().await;
+}
+
+/// Spawn the newly-compiled binary as a detached child.
+///
+/// Checks `current_exe`, `target/debug/goop`, and `target/release/goop`,
+/// picks the one with the newest modification time, and spawns it.
+/// Returns `true` on success.  Does **not** call `process::exit` — the
+/// caller decides whether to exit after spawning.
+pub fn spawn_new_binary() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+
+    let candidates: [std::path::PathBuf; 3] = [
+        std::env::current_exe().unwrap_or_else(|_| "goop".into()),
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join("target/debug/goop"),
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join("target/release/goop"),
+    ];
+
+    // Pick the newest candidate that actually exists.
+    let newest = candidates
+        .iter()
+        .filter_map(|p| {
+            std::fs::metadata(p)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| (p, t))
+        })
+        .max_by_key(|(_, t)| *t);
+
+    let exe = match newest {
+        Some((exe, _)) => exe,
+        None => {
+            tracing::error!("could not find goop binary to restart — tried: {candidates:?}");
+            return false;
+        }
+    };
+
+    match std::process::Command::new(exe)
+        .args(&args[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+    {
+        Ok(_) => {
+            tracing::info!("new server spawned from {}", exe.display());
+            true
+        }
+        Err(e) => {
+            tracing::error!("failed to spawn {}: {e}", exe.display());
+            false
+        }
+    }
+}
 
 /// Build the axum router (exposed so GUI mode can bind the listener
 /// synchronously before opening the webview).
@@ -36,11 +129,15 @@ pub fn build_router(manager: Arc<SessionManager>) -> Router {
 
 /// Launch the axum HTTP + WebSocket server.
 /// Binds to 127.0.0.1:8187 — safe behind an nginx reverse proxy.
+///
+/// Returns when the shutdown signal fires (restart tool or Ctrl+C).
 pub async fn serve(manager: Arc<SessionManager>) -> anyhow::Result<()> {
     let app = build_router(manager);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8187").await?;
     tracing::info!("web server on http://127.0.0.1:8187");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
