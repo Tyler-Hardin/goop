@@ -818,6 +818,7 @@
       let running = false;
       let lastToolEl = null;
       let userAtBottom = true; // tracks whether user has scrolled away
+      let programmaticScroll = false; // guard: ignore scroll events from our own scrollTo
 
       // ── sidebar toggle (mobile) ─────────────────────
       menuBtn.addEventListener("click", () => {
@@ -1120,17 +1121,25 @@
 
       function scrollDown(force) {
         if (force || userAtBottom) {
+          programmaticScroll = true;
+          log.scrollTo({ top: log.scrollHeight, behavior: "auto" });
           requestAnimationFrame(() => {
-            log.scrollTo({ top: log.scrollHeight, behavior: "auto" });
+            // RAF fires before the next paint, but the scroll event may
+            // fire asynchronously on some browsers. Double-RAF to be safe.
+            requestAnimationFrame(() => {
+              programmaticScroll = false;
+            });
           });
         }
       }
 
       // Track whether the user is scrolled to the bottom.  The scroll
       // event fires on both user-initiated and programmatic scrolls, so
-      // this stays correct regardless of who moved the viewport.
+      // we guard against our own scrollTo calls.  Threshold is 2 px to
+      // tolerate sub-pixel rounding on HiDPI screens.
       log.addEventListener("scroll", () => {
-        const threshold = 50;
+        if (programmaticScroll) return;
+        const threshold = 2;
         userAtBottom =
           log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
       });
