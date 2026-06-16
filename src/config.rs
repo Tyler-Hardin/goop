@@ -5,9 +5,9 @@
 //! Falls back to DeepSeek defaults for backward compatibility.
 //!
 //! Configuration layering (highest wins):
-//! 1. CLI flags (`--model`, `--provider`)
-//! 2. Environment variables (`GOOP_PROVIDER`, `GOOP_MODEL`)
-//! 3. Session config (`<name>.state.json` → `config`)
+//! 1. CLI flags (`--model`)
+//! 2. Environment variables (`GOOP_MODEL`)
+//! 3. Session config (`<name>.state.toml` → `config`)
 //! 4. Global config (`~/.config/goop/config.toml`)
 //! 5. Hard-coded defaults
 
@@ -35,8 +35,7 @@ pub fn global_config_path() -> PathBuf {
 // ── provider ────────────────────────────────────────────────────────
 
 /// Supported LLM providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Provider {
     #[default]
     DeepSeek,
@@ -48,6 +47,19 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// Parse a provider from the first segment of a `provider/model` string.
+    pub fn from_model_prefix(s: &str) -> Option<Self> {
+        match s {
+            "deepseek" => Some(Provider::DeepSeek),
+            "openai" => Some(Provider::OpenAI),
+            "openrouter" => Some(Provider::OpenRouter),
+            "groq" => Some(Provider::Groq),
+            "ollama" => Some(Provider::Ollama),
+            "anthropic" => Some(Provider::Anthropic),
+            _ => None,
+        }
+    }
+
     /// Environment variable name for this provider's API key.
     pub fn api_key_env(self) -> &'static str {
         match self {
@@ -60,15 +72,15 @@ impl Provider {
         }
     }
 
-    /// Default model for this provider when none is specified.
+    /// Default model (provider/model format) for this provider when none is specified.
     pub fn default_model(self) -> &'static str {
         match self {
-            Provider::DeepSeek => "deepseek-v4-pro",
-            Provider::OpenAI => "gpt-4o",
-            Provider::OpenRouter => "openai/gpt-4o",
-            Provider::Groq => "llama-3.2-70b-versatile",
-            Provider::Ollama => "llama3.2",
-            Provider::Anthropic => "claude-sonnet-4-6",
+            Provider::DeepSeek => "deepseek/deepseek-v4-pro",
+            Provider::OpenAI => "openai/gpt-4o",
+            Provider::OpenRouter => "openrouter/openai/gpt-4o",
+            Provider::Groq => "groq/llama-3.2-70b-versatile",
+            Provider::Ollama => "ollama/llama3.2",
+            Provider::Anthropic => "anthropic/claude-sonnet-4-6",
         }
     }
 
@@ -83,6 +95,30 @@ impl Provider {
             Provider::Anthropic => "Anthropic",
         }
     }
+}
+
+// ── model parsing ────────────────────────────────────────────────────
+
+/// Parse a litellm-style `provider/model` string into its parts.
+///
+/// Returns `(provider, model_name)` where model_name is everything
+/// after the first `/`.  e.g. `"openrouter/openai/gpt-4o"` →
+/// `(Provider::OpenRouter, "openai/gpt-4o")`.
+pub fn parse_model(s: &str) -> Result<(Provider, &str), String> {
+    let (prefix, model_name) = s.split_once('/').ok_or_else(|| {
+        format!(
+            "invalid model format: {s:?} — expected provider/model (e.g. deepseek/deepseek-v4-pro)"
+        )
+    })?;
+
+    let provider = Provider::from_model_prefix(prefix)
+        .ok_or_else(|| format!("unknown provider: {prefix:?} — supported: deepseek, openai, openrouter, groq, ollama, anthropic"))?;
+
+    if model_name.is_empty() {
+        return Err("model name is empty after provider prefix".into());
+    }
+
+    Ok((provider, model_name))
 }
 
 // ── tool groups ─────────────────────────────────────────────────────
@@ -121,17 +157,19 @@ pub struct Config {
     #[serde(skip, default = "home_dir")]
     pub home_dir: PathBuf,
 
-    #[serde(default)]
-    pub provider: Provider,
-    /// Model name.  `None` means "use the provider default".
-    #[serde(default)]
-    pub model: Option<String>,
+    /// Model in litellm-style `provider/model` format, e.g. `"deepseek/deepseek-v4-pro"`.
+    #[serde(default = "default_model")]
+    pub model: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
     #[serde(default = "default_max_turns")]
     pub default_max_turns: usize,
     #[serde(default = "default_tool_groups")]
     pub enabled_tool_groups: Vec<ToolGroup>,
+}
+
+fn default_model() -> String {
+    Provider::DeepSeek.default_model().to_string()
 }
 
 fn default_max_tokens() -> u64 {
@@ -146,8 +184,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             home_dir: home_dir(),
-            provider: Provider::default(),
-            model: None,
+            model: default_model(),
             max_tokens: default_max_tokens(),
             default_max_turns: default_max_turns(),
             enabled_tool_groups: default_tool_groups(),
@@ -161,11 +198,24 @@ impl Config {
         self.enabled_tool_groups.contains(&group)
     }
 
-    /// Resolve the effective model name (provider default if none set).
-    pub fn effective_model(&self) -> String {
-        self.model
-            .clone()
-            .unwrap_or_else(|| self.provider.default_model().to_string())
+    /// Parse the provider from the model string.
+    ///
+    /// # Panics
+    /// Panics if the model string is malformed (should be validated at load time).
+    pub fn provider(&self) -> Provider {
+        parse_model(&self.model)
+            .map(|(p, _)| p)
+            .unwrap_or_else(|e| panic!("invalid config model: {e}"))
+    }
+
+    /// Extract the model name (everything after the first `/`).
+    ///
+    /// # Panics
+    /// Panics if the model string is malformed (should be validated at load time).
+    pub fn model_name(&self) -> &str {
+        parse_model(&self.model)
+            .map(|(_, m)| m)
+            .unwrap_or_else(|e| panic!("invalid config model: {e}"))
     }
 }
 
@@ -175,8 +225,7 @@ impl Config {
 /// `None` means "defer to the global config".
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<Provider>,
+    /// Override the model (provider/model format).  `None` means "defer to global".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,11 +240,8 @@ impl SessionConfig {
     /// Merge these overrides into a [`Config`].  Any `Some` value here
     /// replaces the corresponding field in `config`.
     pub fn merge_into(&self, config: &mut Config) {
-        if let Some(p) = self.provider {
-            config.provider = p;
-        }
         if let Some(ref m) = self.model {
-            config.model = Some(m.clone());
+            config.model = m.clone();
         }
         if let Some(t) = self.max_tokens {
             config.max_tokens = t;
@@ -215,8 +261,6 @@ impl SessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CliOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<Provider>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
@@ -225,9 +269,9 @@ pub struct CliOverrides {
 /// Load configuration by merging all layers.
 ///
 /// Precedence (highest wins):
-/// 1. `cli` — CLI flags (`--model`, `--provider`)
-/// 2. `GOOP_PROVIDER`, `GOOP_MODEL` env vars
-/// 3. Session state file (`<name>.state.json` → `config` section)
+/// 1. `cli` — CLI flags (`--model`)
+/// 2. `GOOP_MODEL` env var
+/// 3. Session state file (`<name>.state.toml` → `config` section)
 /// 4. Global config file (`~/.config/goop/config.toml`)
 /// 5. Hard-coded defaults
 ///
@@ -255,7 +299,7 @@ pub fn load_config(
         // Layer 4: global config file
         .merge(Toml::file(&global_path));
 
-    // Layer 3: session config (from <name>.state.json)
+    // Layer 3: session config (from <name>.state.toml)
     if let Some(name) = session_name {
         let state_path = crate::session::session_state_path(name);
         if state_path.exists() {
@@ -279,6 +323,9 @@ pub fn load_config(
     // home_dir is never in any provider — set it explicitly.
     config.home_dir = home_dir();
 
+    // Validate the model string.
+    parse_model(&config.model).map_err(|e| anyhow::anyhow!("invalid model in config: {e}"))?;
+
     Ok(config)
 }
 
@@ -294,8 +341,6 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
         std::fs::create_dir_all(parent)?;
     }
 
-    let model = config.effective_model();
-
     let groups: Vec<&str> = config
         .enabled_tool_groups
         .iter()
@@ -309,8 +354,7 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
         .collect();
 
     let mut context = tera::Context::new();
-    context.insert("provider", serde_lowercase(&config.provider));
-    context.insert("model", &model);
+    context.insert("model", &config.model);
     context.insert("max_tokens", &config.max_tokens);
     context.insert("default_max_turns", &config.default_max_turns);
     context.insert("groups", &groups);
@@ -322,18 +366,6 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
     std::fs::write(path, contents)?;
     tracing::info!("Wrote default config to {}", path.display());
     Ok(())
-}
-
-/// Return the serde-expected lowercase name for a provider.
-fn serde_lowercase(p: &Provider) -> &'static str {
-    match p {
-        Provider::DeepSeek => "deepseek",
-        Provider::OpenAI => "openai",
-        Provider::OpenRouter => "openrouter",
-        Provider::Groq => "groq",
-        Provider::Ollama => "ollama",
-        Provider::Anthropic => "anthropic",
-    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -348,7 +380,7 @@ pub fn api_key_for(provider: Provider) -> anyhow::Result<String> {
     }
     std::env::var(var).map_err(|_| {
         anyhow::anyhow!(
-            "{var} environment variable not set. Set it or use a different provider (GOOP_PROVIDER=...)"
+            "{var} environment variable not set. Set it or use a different model (GOOP_MODEL=provider/model)"
         )
     })
 }
@@ -357,9 +389,75 @@ pub fn api_key_for(provider: Provider) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    // ── parse_model ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_model_basic() {
+        let (p, m) = parse_model("deepseek/deepseek-v4-pro").unwrap();
+        assert_eq!(p, Provider::DeepSeek);
+        assert_eq!(m, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn parse_model_nested() {
+        let (p, m) = parse_model("openrouter/openai/gpt-4o").unwrap();
+        assert_eq!(p, Provider::OpenRouter);
+        assert_eq!(m, "openai/gpt-4o");
+    }
+
+    #[test]
+    fn parse_model_all_providers() {
+        for (input, expected) in [
+            ("deepseek/x", Provider::DeepSeek),
+            ("openai/x", Provider::OpenAI),
+            ("openrouter/x", Provider::OpenRouter),
+            ("groq/x", Provider::Groq),
+            ("ollama/x", Provider::Ollama),
+            ("anthropic/x", Provider::Anthropic),
+        ] {
+            let (p, _) = parse_model(input).unwrap();
+            assert_eq!(p, expected);
+        }
+    }
+
+    #[test]
+    fn parse_model_unknown_provider() {
+        assert!(parse_model("foobar/gpt-4").is_err());
+    }
+
+    #[test]
+    fn parse_model_no_slash() {
+        assert!(parse_model("deepseek-v4-pro").is_err());
+    }
+
+    #[test]
+    fn parse_model_empty_model() {
+        assert!(parse_model("deepseek/").is_err());
+    }
+
+    // ── Config methods ────────────────────────────────────────────
+
+    #[test]
+    fn config_provider_and_model_name() {
+        let config = Config {
+            model: "openai/gpt-4o-mini".into(),
+            ..Config::default()
+        };
+        assert_eq!(config.provider(), Provider::OpenAI);
+        assert_eq!(config.model_name(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn default_config_uses_deepseek() {
+        let config = Config::default();
+        assert_eq!(config.provider(), Provider::DeepSeek);
+        assert_eq!(config.model_name(), "deepseek-v4-pro");
+    }
+
+    // ── default config file round-trip ────────────────────────────
+
     #[test]
     fn default_config_round_trips() {
-        // Simulate what happens on first run: create defaults, write, re-parse.
         let defaults = Config::default();
 
         let tmp = std::env::temp_dir().join("goop-test-config.toml");
@@ -370,45 +468,65 @@ mod tests {
 
         // Must be valid TOML and parse back to Config.
         let parsed: Config = toml::from_str(&contents).unwrap();
-        assert_eq!(parsed.provider, Provider::DeepSeek);
-        assert_eq!(parsed.model.as_deref().unwrap(), "deepseek-v4-pro");
+        assert_eq!(parsed.model, "deepseek/deepseek-v4-pro");
         assert_eq!(parsed.max_tokens, 100_000);
         assert_eq!(parsed.default_max_turns, 100);
         assert_eq!(parsed.enabled_tool_groups.len(), 4);
         assert!(parsed.has_tool_group(ToolGroup::FileOps));
         assert!(parsed.has_tool_group(ToolGroup::Shell));
 
-        // The file should contain comments we wrote.
+        // The file should contain the model in litellm format.
         assert!(contents.contains("goop configuration"));
-        assert!(contents.contains("GOOP_PROVIDER"));
-        assert!(contents.contains("deepseek"));
+        assert!(contents.contains("GOOP_MODEL"));
+        assert!(contents.contains("deepseek/deepseek-v4-pro"));
     }
+
+    // ── session config merge ──────────────────────────────────────
 
     #[test]
     fn session_config_merge() {
         let mut config = Config::default();
-        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.model, "deepseek/deepseek-v4-pro");
 
         let session = SessionConfig {
-            provider: Some(Provider::OpenAI),
-            model: Some("gpt-4o-mini".into()),
+            model: Some("openai/gpt-4o-mini".into()),
             ..Default::default()
         };
         session.merge_into(&mut config);
 
-        assert_eq!(config.provider, Provider::OpenAI);
-        assert_eq!(config.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(config.model, "openai/gpt-4o-mini");
+        assert_eq!(config.provider(), Provider::OpenAI);
+        assert_eq!(config.model_name(), "gpt-4o-mini");
         // Unset fields retain defaults.
         assert_eq!(config.max_tokens, 100_000);
     }
 
     #[test]
-    fn load_config_layering() {
-        // With no env vars set and no session, we get defaults.
-        let config = load_config(None, None).unwrap();
-        assert_eq!(config.provider, Provider::DeepSeek);
-        // The default config file writes the resolved model, so it's
-        // Some on load (not None waiting for lazy resolution).
-        assert_eq!(config.effective_model(), "deepseek-v4-pro");
+    fn session_config_partial_merge() {
+        let mut config = Config::default();
+        let session = SessionConfig {
+            max_tokens: Some(50_000),
+            ..Default::default()
+        };
+        session.merge_into(&mut config);
+
+        // Model unchanged.
+        assert_eq!(config.model, "deepseek/deepseek-v4-pro");
+        // Max tokens overridden.
+        assert_eq!(config.max_tokens, 50_000);
+    }
+
+    // ── TOML deserialization of Config ────────────────────────────
+
+    #[test]
+    fn deserialize_config_minimal() {
+        let toml_str = r#"model = "openai/gpt-4o""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.model, "openai/gpt-4o");
+        assert_eq!(config.provider(), Provider::OpenAI);
+        assert_eq!(config.model_name(), "gpt-4o");
+        // Defaults for omitted fields.
+        assert_eq!(config.max_tokens, 100_000);
+        assert_eq!(config.enabled_tool_groups.len(), 4);
     }
 }

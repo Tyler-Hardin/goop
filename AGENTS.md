@@ -129,11 +129,11 @@ override them through its `SessionConfig` in `<name>.state.toml`.
 Configuration is merged from five layers via [`figment`](https://crates.io/crates/figment)
 (highest precedence wins):
 
-1. **CLI flags** — `--model`, `--provider` (via `CliOverrides`)
-2. **Environment** — `GOOP_PROVIDER`, `GOOP_MODEL`
+1. **CLI flags** — `--model` (via `CliOverrides`)
+2. **Environment** — `GOOP_MODEL`
 3. **Session config** — `<name>.state.toml` → `config` section
 4. **Global config** — `~/.config/goop/config.toml`
-5. **Hard defaults** — DeepSeek, `deepseek-v4-pro`, all tool groups except `computer_use`
+5. **Hard defaults** — DeepSeek, `deepseek/deepseek-v4-pro`, all tool groups except `computer_use`
 
 ### Provider configuration
 
@@ -145,15 +145,13 @@ Tera at runtime, embedded via `include_str!` at compile time):
 ```toml
 # goop configuration — ~/.config/goop/config.toml
 #
-# Environment variables override this file:
-#   GOOP_PROVIDER  — provider name
-#   GOOP_MODEL     — model name
+# Environment variable overrides this file:
+#   GOOP_MODEL  — model in provider/model format
 
-# LLM provider: deepseek | openai | openrouter | groq | ollama | anthropic
-provider = "deepseek"
-
-# Model name.  If omitted the provider default (shown below) is used.
-model = "deepseek-v4-pro"
+# LLM model in litellm-style provider/model format.
+# Provider is the first segment, model is everything after.
+# Supported providers: deepseek | openai | openrouter | groq | ollama | anthropic
+model = "deepseek/deepseek-v4-pro"
 
 # Maximum tokens per response.
 max_tokens = 100000
@@ -167,14 +165,13 @@ enabled_tool_groups = ["file_ops", "shell", "ssh", "web_fetch"]
 ```
 
 Environment variables override the config file:
-- `GOOP_PROVIDER` — provider name
-- `GOOP_MODEL` — model name
+- `GOOP_MODEL` — model in `provider/model` format (e.g. `openai/gpt-4o`, `openrouter/openai/gpt-4o`)
 - Provider-specific API keys: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`,
   `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`
   (Ollama reads `OLLAMA_API_BASE_URL` and optional `OLLAMA_API_KEY`)
 
 If no config file exists and no env vars are set, goop defaults to
-DeepSeek (`deepseek-v4-pro`) for backward compatibility.
+DeepSeek (`deepseek/deepseek-v4-pro`).
 
 The provider abstraction lives in `src/model.rs`. Rig's providers are
 type-level (each has its own `Client` and `CompletionModel` type), so
@@ -356,16 +353,16 @@ Two independent history systems:
 DEEPSEEK_API_KEY=… cargo run
 
 # OpenAI
-GOOP_PROVIDER=openai OPENAI_API_KEY=… cargo run
+GOOP_MODEL=openai/gpt-4o OPENAI_API_KEY=… cargo run
 
 # OpenRouter (200+ models via one API key)
-GOOP_PROVIDER=openrouter GOOP_MODEL=openai/gpt-4o OPENROUTER_API_KEY=… cargo run
+GOOP_MODEL=openrouter/openai/gpt-4o OPENROUTER_API_KEY=… cargo run
 
 # Ollama (local)
-GOOP_PROVIDER=ollama GOOP_MODEL=llama3.2 cargo run
+GOOP_MODEL=ollama/llama3.2 cargo run
 
 # Anthropic
-GOOP_PROVIDER=anthropic ANTHROPIC_API_KEY=… cargo run
+GOOP_MODEL=anthropic/claude-sonnet-4-6 ANTHROPIC_API_KEY=… cargo run
 
 # Start the server in the background, then connect terminal + GUI
 DEEPSEEK_API_KEY=… cargo run -- serve &

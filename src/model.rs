@@ -184,17 +184,15 @@ pub fn build_agent(
     memory: FileConversationMemory,
     state: Arc<SessionState>,
 ) -> anyhow::Result<Arc<AnyAgent>> {
-    let api_key = config::api_key_for(config.provider)?;
-    let model_name = config
-        .model
-        .as_deref()
-        .unwrap_or(config.provider.default_model());
+    let provider = config.provider();
+    let model_name = config.model_name();
+    let api_key = config::api_key_for(provider)?;
 
     let tools = crate::tools::build_tools(config, &state);
 
     let mut memory = Some(memory);
 
-    let any_agent = match config.provider {
+    let any_agent = match provider {
         Provider::DeepSeek => {
             let client = deepseek::Client::new(&api_key)?;
             AnyAgent::DeepSeek(finish_agent(
@@ -251,11 +249,7 @@ pub fn build_agent(
         }
     };
 
-    tracing::info!(
-        "● provider · {}  model · {}",
-        config.provider.label(),
-        model_name
-    );
+    tracing::info!("● provider · {}  model · {}", provider.label(), model_name);
 
     Ok(Arc::new(any_agent))
 }
