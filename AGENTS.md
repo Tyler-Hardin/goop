@@ -118,13 +118,33 @@ model are chosen once at startup via config; all sessions share that choice.
 
 ### Provider configuration
 
-Configuration lives at `~/.config/goop/config.toml`:
+Configuration lives at `~/.config/goop/config.toml`.  If no config file
+exists on startup, goop writes a well-commented default file before
+proceeding.  The template is `assets/default_config.toml` (rendered with
+Tera at runtime, embedded via `include_str!` at compile time):
 
 ```toml
-provider = "deepseek"   # deepseek | openai | openrouter | groq | ollama | anthropic
+# goop configuration — ~/.config/goop/config.toml
+#
+# Environment variables override this file:
+#   GOOP_PROVIDER  — provider name
+#   GOOP_MODEL     — model name
+
+# LLM provider: deepseek | openai | openrouter | groq | ollama | anthropic
+provider = "deepseek"
+
+# Model name.  If omitted the provider default (shown below) is used.
 model = "deepseek-v4-pro"
+
+# Maximum tokens per response.
 max_tokens = 100000
+
+# Maximum tool-calling turns per prompt (safety limit).
 default_max_turns = 100
+
+# Tool groups enabled for the agent.
+# Available: file_ops, shell, ssh, web_fetch, computer_use
+enabled_tool_groups = ["file_ops", "shell", "ssh", "web_fetch"]
 ```
 
 Environment variables override the config file:

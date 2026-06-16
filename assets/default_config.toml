@@ -1,0 +1,21 @@
+# goop configuration — ~/.config/goop/config.toml
+#
+# Environment variables override this file:
+#   GOOP_PROVIDER  — provider name
+#   GOOP_MODEL     — model name
+
+# LLM provider: deepseek | openai | openrouter | groq | ollama | anthropic
+provider = "{{ provider }}"
+
+# Model name.  If omitted the provider default (shown below) is used.
+model = "{{ model }}"
+
+# Maximum tokens per response.
+max_tokens = {{ max_tokens }}
+
+# Maximum tool-calling turns per prompt (safety limit).
+default_max_turns = {{ default_max_turns }}
+
+# Tool groups enabled for the agent.
+# Available: file_ops, shell, ssh, web_fetch, computer_use
+enabled_tool_groups = [{% for g in groups %}"{{ g }}"{% if not loop.last %}, {% endif %}{% endfor %}]
