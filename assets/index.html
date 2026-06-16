@@ -157,9 +157,12 @@
       }
 
       nav .sidebar-footer {
-        padding: 10px 14px;
+        padding: 12px 14px;
         border-top: 1px solid var(--border);
         flex-shrink: 0;
+        min-height: 71px;
+        display: flex;
+        align-items: center;
       }
       nav .new-btn {
         width: 100%;
@@ -195,7 +198,7 @@
       /* ── header ───────────────────────────────────── */
 
       header {
-        padding: 11px 20px;
+        padding: 13px 20px;
         border-bottom: 1px solid var(--border);
         display: flex;
         align-items: center;
@@ -558,6 +561,7 @@
         display: flex;
         gap: 10px;
         background: var(--surface);
+        min-height: 71px;
       }
       footer textarea {
         flex: 1;
@@ -699,6 +703,7 @@
         footer {
           padding: 10px 14px;
           gap: 8px;
+          min-height: 0;
         }
         footer textarea {
           font-size: 16px;
@@ -706,6 +711,9 @@
         footer button {
           padding: 11px 16px;
           font-size: 14px;
+        }
+        nav .sidebar-footer {
+          min-height: 0;
         }
       }
 
