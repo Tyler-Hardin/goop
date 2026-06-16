@@ -203,7 +203,7 @@ fn resolve_destination(destination: &str) -> Result<ResolvedHost, anyhow::Error>
 
     let identity_files: Vec<PathBuf> = opts
         .get("identityfile")
-        .map(|v| v.iter().map(|s| expand_tilde(s)).collect())
+        .map(|v| v.iter().map(|s| expand_ssh_tilde(s)).collect())
         .unwrap_or_default();
 
     let proxy_jumps: Vec<String> = opts
@@ -350,7 +350,15 @@ async fn connect_via_jumps(
     jumps: &[String],
     resolved: &ResolvedHost,
     password: Option<&str>,
-) -> Result<(russh::client::Handle<SshHandler>, SftpSession, PathBuf), anyhow::Error> {
+) -> Result<
+    (
+        russh::client::Handle<SshHandler>,
+        SftpSession,
+        PathBuf,
+        PathBuf,
+    ),
+    anyhow::Error,
+> {
     if jumps.is_empty() {
         return direct_connect(resolved, password).await;
     }
@@ -377,7 +385,8 @@ async fn connect_via_jumps(
         // We tunnelled to the next jump. Now connect SSH over the tunnel and
         // recurse through the rest. Use the identity files from the next jump's config.
         let next_resolved = resolve_destination(&remaining[0])?;
-        let (mut next_handle, _, _) = connect_over_tunnel(stream, &next_resolved, password).await?;
+        let (mut next_handle, _, _, _) =
+            connect_over_tunnel(stream, &next_resolved, password).await?;
 
         // Recurse: tunnel from here through the remaining jumps to the target.
         let final_stream = open_tunnel(&mut next_handle, &resolved.host, resolved.port).await?;
@@ -403,7 +412,15 @@ async fn connect_over_tunnel(
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     resolved: &ResolvedHost,
     password: Option<&str>,
-) -> Result<(russh::client::Handle<SshHandler>, SftpSession, PathBuf), anyhow::Error> {
+) -> Result<
+    (
+        russh::client::Handle<SshHandler>,
+        SftpSession,
+        PathBuf,
+        PathBuf,
+    ),
+    anyhow::Error,
+> {
     let config = Arc::new(russh::client::Config::default());
     let handler = SshHandler {
         host: resolved.host.clone(),
@@ -453,14 +470,24 @@ async fn connect_over_tunnel(
     let remote_cwd_str: String = sftp.canonicalize(".").await?;
     let remote_cwd = PathBuf::from(remote_cwd_str);
 
-    Ok((handle, sftp, remote_cwd))
+    let home = remote_home_dir(&mut handle).await?;
+
+    Ok((handle, sftp, remote_cwd, home))
 }
 
 /// Direct TCP connection (no ProxyJump).
 async fn direct_connect(
     resolved: &ResolvedHost,
     password: Option<&str>,
-) -> Result<(russh::client::Handle<SshHandler>, SftpSession, PathBuf), anyhow::Error> {
+) -> Result<
+    (
+        russh::client::Handle<SshHandler>,
+        SftpSession,
+        PathBuf,
+        PathBuf,
+    ),
+    anyhow::Error,
+> {
     let config = Arc::new(russh::client::Config::default());
     let handler = SshHandler {
         host: resolved.host.clone(),
@@ -478,7 +505,9 @@ async fn direct_connect(
     let remote_cwd_str: String = sftp.canonicalize(".").await?;
     let remote_cwd = PathBuf::from(remote_cwd_str);
 
-    Ok((handle, sftp, remote_cwd))
+    let home = remote_home_dir(&mut handle).await?;
+
+    Ok((handle, sftp, remote_cwd, home))
 }
 
 /// Connect to a host via russh (used for ProxyJump chain).
@@ -516,7 +545,7 @@ pub async fn ssh_connect(
     let resolved = resolve_destination(destination)?;
     let label = format!("{}@{}:{}", resolved.user, resolved.host, resolved.port);
 
-    let (handle, sftp, remote_cwd) = if !resolved.proxy_jumps.is_empty() {
+    let (handle, sftp, remote_cwd, remote_home) = if !resolved.proxy_jumps.is_empty() {
         connect_via_jumps(&resolved.proxy_jumps, &resolved, password).await?
     } else {
         direct_connect(&resolved, password).await?
@@ -526,13 +555,16 @@ pub async fn ssh_connect(
         handle: Mutex::new(handle),
         sftp: Mutex::new(sftp),
         remote_cwd: Mutex::new(remote_cwd),
+        remote_home_dir: remote_home,
         label,
     })))
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-fn expand_tilde(s: &str) -> PathBuf {
+/// Expand `~` and `~/…` using the local home directory (for SSH config
+/// paths like `IdentityFile`, which are always local).
+fn expand_ssh_tilde(s: &str) -> PathBuf {
     let home = crate::config::home_dir();
     if s == "~" {
         home
@@ -541,6 +573,35 @@ fn expand_tilde(s: &str) -> PathBuf {
     } else {
         PathBuf::from(s)
     }
+}
+
+/// Run `echo $HOME` on the remote host to discover the user's home
+/// directory.  Returns an error if the output is empty or the command fails.
+async fn remote_home_dir(
+    handle: &mut russh::client::Handle<SshHandler>,
+) -> Result<PathBuf, anyhow::Error> {
+    let mut channel = handle.channel_open_session().await?;
+    channel.exec(true, b"echo $HOME".to_vec()).await?;
+    channel.eof().await?;
+    let output = {
+        let mut reader = channel.make_reader();
+        read_to_string(&mut reader).await.unwrap_or_default()
+    };
+    let _ = channel.wait().await;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("remote echo \\$HOME returned empty output"));
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+async fn read_to_string<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<String, std::io::Error> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = String::new();
+    reader.read_to_string(&mut buf).await?;
+    Ok(buf)
 }
 
 // ── tests ────────────────────────────────────────────────────────────
@@ -671,8 +732,8 @@ Host target
     #[test]
     fn test_expand_tilde() {
         let home = crate::config::home_dir();
-        assert_eq!(expand_tilde("~"), home);
-        assert_eq!(expand_tilde("~/foo"), home.join("foo"));
-        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_ssh_tilde("~"), home);
+        assert_eq!(expand_ssh_tilde("~/foo"), home.join("foo"));
+        assert_eq!(expand_ssh_tilde("/abs/path"), PathBuf::from("/abs/path"));
     }
 }

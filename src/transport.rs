@@ -100,7 +100,8 @@ impl Handler for SshHandler {
 
 // ── SSH connection state ───────────────────────────────────────────
 
-/// Holds the SSH connection, SFTP session, and remote CWD for a session.
+/// Holds the SSH connection, SFTP session, remote CWD, and remote home
+/// directory for a session.
 pub struct SshState {
     /// The russh handle, used for opening exec channels (shell commands).
     pub(crate) handle: Mutex<russh::client::Handle<SshHandler>>,
@@ -108,6 +109,8 @@ pub struct SshState {
     pub(crate) sftp: Mutex<SftpSession>,
     /// Current working directory on the remote host.
     pub remote_cwd: Mutex<PathBuf>,
+    /// Remote user's home directory (set once on connect, never changes).
+    pub remote_home_dir: PathBuf,
     /// Display name for the connection (e.g. "user@host:22").
     pub label: String,
 }

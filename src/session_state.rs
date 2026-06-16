@@ -30,8 +30,9 @@ use crate::transport::Transport;
 pub struct SessionState {
     /// Session name (user-supplied or auto-generated).
     pub name: String,
-    /// User's home directory (from [`Config`](crate::config::Config)).
-    pub home_dir: PathBuf,
+    /// Local user home directory — always the machine goop is running on.
+    /// Used for finding config files, session storage, `~/.ssh/config`, etc.
+    pub local_home_dir: PathBuf,
     /// Current working directory for this session.
     pub cwd: StdMutex<PathBuf>,
     /// Current transport (local or SSH).
@@ -41,10 +42,10 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(name: String, home_dir: PathBuf, cwd: PathBuf, state_path: PathBuf) -> Self {
+    pub fn new(name: String, local_home_dir: PathBuf, cwd: PathBuf, state_path: PathBuf) -> Self {
         Self {
             name,
-            home_dir,
+            local_home_dir,
             cwd: StdMutex::new(cwd),
             transport: StdMutex::new(Transport::Local),
             state_path,
@@ -73,6 +74,17 @@ impl SessionState {
     }
 
     // ── convenience accessors ──────────────────────────────────────
+
+    /// Home directory from the transport's perspective.  Equals
+    /// [`local_home_dir`] when operating locally; returns the remote
+    /// user's `$HOME` when SSH'd.  Derived from the current transport,
+    /// so it can never be out of sync.
+    pub fn transport_home_dir(&self) -> PathBuf {
+        match &*self.transport.lock().unwrap() {
+            Transport::Ssh(ssh) => ssh.remote_home_dir.clone(),
+            Transport::Local => self.local_home_dir.clone(),
+        }
+    }
 
     /// Snapshot of the current CWD.
     pub fn cwd(&self) -> PathBuf {
@@ -105,12 +117,15 @@ impl SessionState {
         }
     }
 
-    /// Expand `~` and `~/…` prefixes using `home_dir`.
+    /// Expand `~` and `~/…` prefixes using the transport-aware home
+    /// directory.  When SSH'd this is the remote `$HOME`; otherwise it
+    /// is [`local_home_dir`].
     pub fn expand_tilde(&self, path: &str) -> PathBuf {
+        let home = self.transport_home_dir();
         if path == "~" || path == "~/" {
-            self.home_dir.clone()
+            home
         } else if let Some(rest) = path.strip_prefix("~/") {
-            self.home_dir.join(rest)
+            home.join(rest)
         } else {
             PathBuf::from(path)
         }
