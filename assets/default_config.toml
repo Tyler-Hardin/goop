@@ -22,3 +22,22 @@ enabled_tool_groups = [{% for g in groups %}"{{ g }}"{% if not loop.last %}, {% 
 # Base URL for the Ollama API.  Only used when provider is ollama.
 # Set this if Ollama runs on a nonstandard port or remote host.
 # ollama_base_url = "{{ ollama_base_url }}"
+
+# ── MCP servers (Model Context Protocol) ─────────────────────────────
+# Define named MCP servers here.  Enable them globally (enabled_mcp_servers)
+# or per-session in <name>.state.toml.
+#
+# HTTP transport:
+# [mcp_servers.example]
+# type = "http"
+# url = "http://localhost:8080"
+# shared = true          # spin up one instance, share across sessions
+#
+# Stdio transport:
+# [mcp_servers.code_indexer]
+# type = "stdio"
+# command = "my-code-indexer"
+# args = ["--project", "."]
+
+# MCP servers enabled for all sessions.
+# enabled_mcp_servers = []

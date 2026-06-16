@@ -18,7 +18,8 @@ gtk = { version = "0.18.2", features = ["v3_24"] }
 html2text = "0.17.1"
 log = "0.4"
 reqwest = { version = "0.13.4", features = ["blocking"] }
-rig = { version = "0.38", features = ["derive"] }
+rig = { version = "0.38", features = ["derive", "rmcp"] }
+rmcp = { version = "1", features = ["client", "macros", "transport-streamable-http-client-reqwest", "transport-child-process"] }
 rig-derive = "0.38"
 russh = "0.61"
 russh-sftp = "2.3"

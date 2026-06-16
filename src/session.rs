@@ -9,7 +9,7 @@ use rig::streaming::StreamedAssistantContent;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, McpServerDef};
 use crate::events::{PromptSource, SessionEvent};
 use crate::memory::FileConversationMemory;
 use crate::memory::prompt_history_path;
@@ -74,6 +74,11 @@ pub struct Session {
 
     /// If set, every event is appended to this file as JSONL.
     events_file: Option<PathBuf>,
+
+    /// Per-session MCP manager — kept alive so peer connections stay open
+    /// for tool invocation. Shared MCP servers live in [`SessionManager`].
+    #[allow(dead_code)]
+    session_mcp: Arc<crate::mcp::McpManager>,
 }
 
 impl Session {
@@ -98,6 +103,7 @@ impl Session {
         config: &Config,
         capacity: usize,
         session_name: Option<String>,
+        shared_mcp_manager: Arc<crate::mcp::McpManager>,
     ) -> anyhow::Result<Arc<Self>> {
         // ── persistence paths ──────────────────────────────────
         let name = session_name.unwrap_or_else(next_session_name);
@@ -177,7 +183,26 @@ impl Session {
             &config.home_dir,
         );
 
-        let agent = model::build_agent(&merged_config, &preamble, mem, state.clone())?;
+        // ── MCP servers ────────────────────────────────────────
+        // Resolve which servers to enable: global ∪ session overrides.
+        let session_names = crate::mcp::resolve(config, persisted.config.mcp_server_names());
+
+        // Build the list of (name, def) pairs for per-session servers.
+        let session_servers: Vec<(String, McpServerDef)> = session_names
+            .iter()
+            .filter_map(|n| config.mcp_servers.get(n).map(|d| (n.clone(), d.clone())))
+            .collect();
+
+        // Connect per-session MCP servers (always creates a manager, even
+        // if the list is empty — empty manager is a no-op sentinel).
+        let session_mcp_manager = crate::mcp::McpManager::connect(&session_servers).await;
+
+        // Collect MCP tool proxies from shared and session managers.
+        let mut mcp_tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+        mcp_tools.extend(shared_mcp_manager.build_tools());
+        mcp_tools.extend(session_mcp_manager.build_tools());
+
+        let agent = model::build_agent(&merged_config, &preamble, mem, state.clone(), mcp_tools)?;
 
         let (tx, _) = broadcast::channel(capacity);
         let (submit_tx, submit_rx) = mpsc::unbounded_channel();
@@ -206,6 +231,7 @@ impl Session {
             cancel_tx: Mutex::new(None),
             is_running: AtomicBool::new(false),
             events_file: Some(events_path),
+            session_mcp: session_mcp_manager,
         });
 
         // Spawn the background worker that serializes prompt processing.
@@ -423,6 +449,10 @@ impl Session {
 pub struct SessionManager {
     sessions: tokio::sync::RwLock<std::collections::HashMap<String, Arc<Session>>>,
     config: Config,
+    /// Shared MCP manager — holds connections to all `shared = true`
+    /// servers enabled globally.  Always present (empty manager when
+    /// no shared servers are configured).  Cloned into each new session.
+    global_mcp: tokio::sync::RwLock<Arc<crate::mcp::McpManager>>,
 }
 
 impl SessionManager {
@@ -430,7 +460,35 @@ impl SessionManager {
         Self {
             sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             config,
+            global_mcp: tokio::sync::RwLock::new(crate::mcp::McpManager::empty()),
         }
+    }
+
+    /// Connect to all globally-enabled shared MCP servers.
+    ///
+    /// Must be called after construction and before any session uses them.
+    /// Replaces the empty sentinel manager even if no servers are configured.
+    pub async fn init_global_mcp(&self) {
+        let servers: Vec<(String, McpServerDef)> = self
+            .config
+            .enabled_mcp_servers
+            .iter()
+            .filter_map(|name| {
+                let def = self.config.mcp_servers.get(name)?;
+                if !def.shared {
+                    return None;
+                }
+                Some((name.clone(), def.clone()))
+            })
+            .collect();
+
+        let manager = crate::mcp::McpManager::connect(&servers).await;
+        tracing::info!(
+            "MCP shared — {} server(s), {} tool(s) total",
+            servers.len(),
+            manager.build_tools().len(),
+        );
+        *self.global_mcp.write().await = manager;
     }
 
     /// Get an existing session or create one.
@@ -453,7 +511,8 @@ impl SessionManager {
         }
         // Slow path: create the session (may await SSH reconnect),
         // then insert under write lock.
-        let session = Session::new(&self.config, 256, Some(name.clone())).await?;
+        let shared_mcp = Arc::clone(&*self.global_mcp.read().await);
+        let session = Session::new(&self.config, 256, Some(name.clone()), shared_mcp).await?;
         let mut sessions = self.sessions.write().await;
         // Double-check: another caller may have created it while we
         // were building the session.

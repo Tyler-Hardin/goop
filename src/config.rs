@@ -150,6 +150,44 @@ fn default_tool_groups() -> Vec<ToolGroup> {
     ]
 }
 
+// ── MCP server definition ──────────────────────────────────────────
+
+/// Transport for an MCP server — either HTTP or stdio subprocess.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpTransport {
+    /// Streamable HTTP endpoint.
+    Http { url: String },
+    /// Spawn a child process, communicate over stdio.
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+    },
+}
+
+/// A named MCP server entry in the config registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerDef {
+    /// Transport configuration.
+    #[serde(flatten)]
+    pub transport: McpTransport,
+    /// Whether this server should be instantiated once and shared across
+    /// all sessions that enable it (default: false).
+    #[serde(default)]
+    pub shared: bool,
+}
+
+fn default_mcp_servers() -> std::collections::HashMap<String, McpServerDef> {
+    std::collections::HashMap::new()
+}
+
+fn default_enabled_mcp_servers() -> Vec<String> {
+    Vec::new()
+}
+
 // ── config ──────────────────────────────────────────────────────────
 
 /// Effective configuration, built by merging all layers.
@@ -173,6 +211,14 @@ pub struct Config {
     /// Override via `GOOP_OLLAMA_BASE_URL` env var or `ollama_base_url` in config.toml.
     #[serde(default = "default_ollama_base_url")]
     pub ollama_base_url: String,
+
+    /// MCP server registry — maps server names to their definitions.
+    #[serde(default = "default_mcp_servers")]
+    pub mcp_servers: std::collections::HashMap<String, McpServerDef>,
+
+    /// Names of MCP servers to enable globally (for all sessions).
+    #[serde(default = "default_enabled_mcp_servers")]
+    pub enabled_mcp_servers: Vec<String>,
 }
 
 fn default_model() -> String {
@@ -200,6 +246,8 @@ impl Default for Config {
             default_max_turns: default_max_turns(),
             enabled_tool_groups: default_tool_groups(),
             ollama_base_url: default_ollama_base_url(),
+            mcp_servers: default_mcp_servers(),
+            enabled_mcp_servers: default_enabled_mcp_servers(),
         }
     }
 }
@@ -249,6 +297,10 @@ pub struct SessionConfig {
     /// Override the Ollama base URL.  `None` means "defer to global".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_base_url: Option<String>,
+    /// Names of MCP servers to enable for this session (adds to the
+    /// global list — no need to repeat globally-enabled names here).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_mcp_servers: Option<Vec<String>>,
 }
 
 impl SessionConfig {
@@ -270,6 +322,13 @@ impl SessionConfig {
         if let Some(ref u) = self.ollama_base_url {
             config.ollama_base_url = u.clone();
         }
+        // enabled_mcp_servers is NOT merged here — it's a union
+        // (global + session) computed in Session::new.
+    }
+
+    /// Return the session-level MCP server enablement, if any.
+    pub fn mcp_server_names(&self) -> &[String] {
+        self.enabled_mcp_servers.as_deref().unwrap_or(&[])
     }
 }
 
@@ -547,5 +606,67 @@ mod tests {
         // Defaults for omitted fields.
         assert_eq!(config.max_tokens, 100_000);
         assert_eq!(config.enabled_tool_groups.len(), 4);
+    }
+
+    // ── MCP config deserialization ─────────────────────────────────
+
+    #[test]
+    fn deserialize_mcp_http() {
+        let toml_str = r#"
+model = "openai/gpt-4o"
+
+[mcp_servers.telegram]
+type = "http"
+url = "http://localhost:8080"
+shared = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let def = config.mcp_servers.get("telegram").unwrap();
+        assert!(def.shared);
+        match &def.transport {
+            McpTransport::Http { url } => assert_eq!(url, "http://localhost:8080"),
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_mcp_stdio() {
+        let toml_str = r#"
+model = "openai/gpt-4o"
+
+[mcp_servers.code_indexer]
+type = "stdio"
+command = "my-indexer"
+args = ["--project", "."]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let def = config.mcp_servers.get("code_indexer").unwrap();
+        assert!(!def.shared); // default
+        match &def.transport {
+            McpTransport::Stdio { command, args, .. } => {
+                assert_eq!(command, "my-indexer");
+                assert_eq!(args, &vec!["--project", "."]);
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_mcp_enabled_servers() {
+        let toml_str = r#"
+model = "openai/gpt-4o"
+enabled_mcp_servers = ["telegram", "code_indexer"]
+
+[mcp_servers.telegram]
+type = "http"
+url = "http://localhost:8080"
+
+[mcp_servers.code_indexer]
+type = "stdio"
+command = "my-indexer"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.enabled_mcp_servers, vec!["telegram", "code_indexer"]);
+        assert_eq!(config.mcp_servers.len(), 2);
     }
 }

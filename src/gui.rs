@@ -49,7 +49,10 @@ fn fetch_latest_session() -> Option<String> {
 fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> anyhow::Result<()> {
     let config = crate::config::load_config(None, None)?;
     let manager = Arc::new(SessionManager::new(config));
-    rt.block_on(async { manager.discover().await })?;
+    rt.block_on(async {
+        manager.init_global_mcp().await;
+        manager.discover().await
+    })?;
 
     // If the user asked for a specific session, ensure it's loaded.
     if let Some(ref name) = session_name {

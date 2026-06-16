@@ -177,27 +177,31 @@ fn map_assistant<R>(
 // ── agent construction ───────────────────────────────────────────
 
 /// Build an agent for the configured provider, attaching tools from
-/// the supplied [`SessionState`].
+/// the supplied [`SessionState`] and MCP proxy tools.
 pub fn build_agent(
     config: &Config,
     preamble: &str,
     memory: FileConversationMemory,
     state: Arc<SessionState>,
+    mcp_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
 ) -> anyhow::Result<Arc<AnyAgent>> {
     let provider = config.provider();
     let model_name = config.model_name();
 
     let tools = crate::tools::build_tools(config, &state);
+    let mut all_tools = tools;
+    all_tools.extend(mcp_tools);
 
     /// One arm body — constructs a provider-specific client and wraps it.
+    /// `all_tools` is moved into the first (and only) executing match arm.
     macro_rules! arm {
         ($variant:ident, $new_client:expr) => {{
             let client = $new_client;
             AnyAgent::$variant(finish_agent(
                 client.agent(model_name).preamble(preamble),
                 config,
-                memory,
-                tools,
+                memory.clone(),
+                all_tools,
             ))
         }};
     }
