@@ -12,8 +12,41 @@
 //! 5. Hard-coded defaults
 
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+// ── error type ───────────────────────────────────────────────────────
+
+/// Errors that can occur during configuration loading and parsing.
+#[derive(thiserror::Error, Debug)]
+pub enum ConfigError {
+    /// The model string is not in `provider/model` format, or the
+    /// provider is unknown, or the model name is empty.
+    #[error("invalid model: {0}")]
+    InvalidModel(String),
+
+    /// An environment variable required for the chosen provider is
+    /// missing (e.g. `DEEPSEEK_API_KEY`).
+    #[error("missing API key: {0}")]
+    MissingApiKey(String),
+
+    /// I/O error reading or writing config files.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The config file is not valid TOML.
+    #[error("TOML parse error: {0}")]
+    Toml(#[from] toml::de::Error),
+
+    /// Failed to render the default config template.
+    #[error("template error: {0}")]
+    Template(String),
+
+    /// Catch-all for figment extraction errors.
+    #[error("config extraction: {0}")]
+    Extraction(String),
+}
 
 // ── paths ───────────────────────────────────────────────────────────
 
@@ -62,6 +95,18 @@ impl Provider {
         }
     }
 
+    /// The provider segment as it appears in a `provider/model` string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::DeepSeek => "deepseek",
+            Provider::OpenAI => "openai",
+            Provider::OpenRouter => "openrouter",
+            Provider::Groq => "groq",
+            Provider::Ollama => "ollama",
+            Provider::Anthropic => "anthropic",
+        }
+    }
+
     /// Environment variable name for this provider's API key.
     pub fn api_key_env(self) -> &'static str {
         match self {
@@ -74,8 +119,8 @@ impl Provider {
         }
     }
 
-    /// Default model (provider/model format) for this provider when none is specified.
-    pub fn default_model(self) -> &'static str {
+    /// Default model for this provider when none is specified.
+    pub fn default_model_str(self) -> &'static str {
         match self {
             Provider::DeepSeek => "deepseek/deepseek-v4-pro",
             Provider::OpenAI => "openai/gpt-4o",
@@ -84,6 +129,23 @@ impl Provider {
             Provider::Ollama => "ollama/llama3.2",
             Provider::Anthropic => "anthropic/claude-sonnet-4-6",
         }
+    }
+
+    /// Default [`Model`] for this provider.
+    pub fn default_model(self) -> Model {
+        Model {
+            provider: self,
+            name: self.model_name_from_default(),
+        }
+    }
+
+    /// Extract the model-name portion from [`default_model_str`].
+    fn model_name_from_default(self) -> String {
+        let full = self.default_model_str();
+        full.split_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(full)
+            .to_string()
     }
 
     /// Human-readable label for logging.
@@ -99,28 +161,90 @@ impl Provider {
     }
 }
 
-// ── model parsing ────────────────────────────────────────────────────
+// ── model newtype ───────────────────────────────────────────────────
 
-/// Parse a litellm-style `provider/model` string into its parts.
+/// A validated, parsed model identifier in `provider/model` format.
 ///
-/// Returns `(provider, model_name)` where model_name is everything
-/// after the first `/`.  e.g. `"openrouter/openai/gpt-4o"` →
-/// `(Provider::OpenRouter, "openai/gpt-4o")`.
-pub fn parse_model(s: &str) -> Result<(Provider, &str), String> {
-    let (prefix, model_name) = s.split_once('/').ok_or_else(|| {
-        format!(
-            "invalid model format: {s:?} — expected provider/model (e.g. deepseek/deepseek-v4-pro)"
-        )
-    })?;
+/// Construct via [`FromStr`] (or `"deepseek/deepseek-v4-pro".parse()`).
+/// The provider and model-name portions are parsed and validated at
+/// construction time — once you have a `Model`, the provider and name
+/// accessors are infallible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Model {
+    provider: Provider,
+    name: String,
+}
 
-    let provider = Provider::from_model_prefix(prefix)
-        .ok_or_else(|| format!("unknown provider: {prefix:?} — supported: deepseek, openai, openrouter, groq, ollama, anthropic"))?;
-
-    if model_name.is_empty() {
-        return Err("model name is empty after provider prefix".into());
+impl Model {
+    /// The provider portion (e.g. [`Provider::DeepSeek`]).
+    pub fn provider(&self) -> Provider {
+        self.provider
     }
 
-    Ok((provider, model_name))
+    /// The model-name portion — everything after the first `/`.
+    /// e.g. `"deepseek-v4-pro"` or `"openai/gpt-4o"`.
+    pub fn model_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::fmt::Display for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.provider.as_str(), self.name)
+    }
+}
+
+impl FromStr for Model {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (prefix, model_name) = s.split_once('/').ok_or_else(|| {
+            ConfigError::InvalidModel(format!(
+                "{s:?} — expected provider/model (e.g. deepseek/deepseek-v4-pro)"
+            ))
+        })?;
+
+        let provider = Provider::from_model_prefix(prefix).ok_or_else(|| {
+            ConfigError::InvalidModel(format!(
+                "unknown provider {prefix:?} — supported: deepseek, openai, \
+                 openrouter, groq, ollama, anthropic"
+            ))
+        })?;
+
+        if model_name.is_empty() {
+            return Err(ConfigError::InvalidModel(
+                "model name is empty after provider prefix".into(),
+            ));
+        }
+
+        Ok(Model {
+            provider,
+            name: model_name.to_string(),
+        })
+    }
+}
+
+// ── serde for Model ─────────────────────────────────────────────────
+//
+// Model serializes as a plain string like "deepseek/deepseek-v4-pro"
+// so existing config files remain valid.
+
+impl Serialize for Model {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.to_string().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Model {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 // ── tool groups ─────────────────────────────────────────────────────
@@ -197,9 +321,10 @@ pub struct Config {
     #[serde(skip, default = "home_dir")]
     pub home_dir: PathBuf,
 
-    /// Model in litellm-style `provider/model` format, e.g. `"deepseek/deepseek-v4-pro"`.
+    /// Model in litellm-style `provider/model` format — parsed on
+    /// deserialization via [`Model`]'s [`Deserialize`] impl.
     #[serde(default = "default_model")]
-    pub model: String,
+    pub model: Model,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
     #[serde(default = "default_max_turns")]
@@ -221,8 +346,8 @@ pub struct Config {
     pub enabled_mcp_servers: Vec<String>,
 }
 
-fn default_model() -> String {
-    Provider::DeepSeek.default_model().to_string()
+fn default_model() -> Model {
+    Provider::DeepSeek.default_model()
 }
 
 fn default_max_tokens() -> u64 {
@@ -258,24 +383,14 @@ impl Config {
         self.enabled_tool_groups.contains(&group)
     }
 
-    /// Parse the provider from the model string.
-    ///
-    /// # Panics
-    /// Panics if the model string is malformed (should be validated at load time).
+    /// The parsed provider.
     pub fn provider(&self) -> Provider {
-        parse_model(&self.model)
-            .map(|(p, _)| p)
-            .unwrap_or_else(|e| panic!("invalid config model: {e}"))
+        self.model.provider()
     }
 
-    /// Extract the model name (everything after the first `/`).
-    ///
-    /// # Panics
-    /// Panics if the model string is malformed (should be validated at load time).
+    /// The model name (everything after the first `/`).
     pub fn model_name(&self) -> &str {
-        parse_model(&self.model)
-            .map(|(_, m)| m)
-            .unwrap_or_else(|e| panic!("invalid config model: {e}"))
+        self.model.model_name()
     }
 }
 
@@ -304,26 +419,35 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
-    /// Merge these overrides into a [`Config`].  Any `Some` value here
-    /// replaces the corresponding field in `config`.
-    pub fn merge_into(&self, config: &mut Config) {
+    /// Merge these overrides into a clone of `config`, returning a new
+    /// [`Config`].  Any `Some` value here replaces the corresponding
+    /// field from `config`.
+    pub fn merge(&self, config: &Config) -> Config {
+        let mut merged = config.clone();
+
         if let Some(ref m) = self.model {
-            config.model = m.clone();
+            // Parse the session-level model string; fall back to
+            // the global model if parsing fails.
+            if let Ok(parsed) = m.parse::<Model>() {
+                merged.model = parsed;
+            }
         }
         if let Some(t) = self.max_tokens {
-            config.max_tokens = t;
+            merged.max_tokens = t;
         }
         if let Some(t) = self.default_max_turns {
-            config.default_max_turns = t;
+            merged.default_max_turns = t;
         }
         if let Some(ref g) = self.enabled_tool_groups {
-            config.enabled_tool_groups = g.clone();
+            merged.enabled_tool_groups = g.clone();
         }
         if let Some(ref u) = self.ollama_base_url {
-            config.ollama_base_url = u.clone();
+            merged.ollama_base_url = u.clone();
         }
         // enabled_mcp_servers is NOT merged here — it's a union
         // (global + session) computed in Session::new.
+
+        merged
     }
 
     /// Return the session-level MCP server enablement, if any.
@@ -343,7 +467,7 @@ pub struct CliOverrides {
 
 // ── loading ─────────────────────────────────────────────────────────
 
-/// Load configuration by merging all layers.
+/// Load configuration by merging all layers, then validate.
 ///
 /// Precedence (highest wins):
 /// 1. `cli` — CLI flags (`--model`)
@@ -357,7 +481,7 @@ pub struct CliOverrides {
 pub fn load_config(
     cli: Option<&CliOverrides>,
     session_name: Option<&str>,
-) -> anyhow::Result<Config> {
+) -> std::result::Result<Config, anyhow::Error> {
     let global_path = global_config_path();
 
     // Write a default global config if none exists.
@@ -395,13 +519,12 @@ pub fn load_config(
         fig = fig.merge(Serialized::from(cli, figment::Profile::Default));
     }
 
-    let mut config: Config = fig.extract()?;
+    let mut config: Config = fig
+        .extract()
+        .map_err(|e| ConfigError::Extraction(e.to_string()))?;
 
     // home_dir is never in any provider — set it explicitly.
     config.home_dir = home_dir();
-
-    // Validate the model string.
-    parse_model(&config.model).map_err(|e| anyhow::anyhow!("invalid model in config: {e}"))?;
 
     Ok(config)
 }
@@ -413,7 +536,10 @@ pub fn load_config(
 ///
 /// The template lives in `assets/default_config.toml` and is embedded at
 /// compile time via `include_str!`, then rendered with Tera.
-fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Result<()> {
+fn write_default_config(
+    path: &std::path::Path,
+    config: &Config,
+) -> std::result::Result<(), anyhow::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -431,7 +557,7 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
         .collect();
 
     let mut context = tera::Context::new();
-    context.insert("model", &config.model);
+    context.insert("model", &config.model.to_string());
     context.insert("max_tokens", &config.max_tokens);
     context.insert("default_max_turns", &config.default_max_turns);
     context.insert("groups", &groups);
@@ -439,7 +565,7 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
 
     let template = include_str!("../assets/default_config.toml");
     let contents = tera::Tera::one_off(template, &context, false)
-        .map_err(|e| anyhow::anyhow!("Failed to render default config template: {e}"))?;
+        .map_err(|e| ConfigError::Template(e.to_string()))?;
 
     std::fs::write(path, contents)?;
     tracing::info!("Wrote default config to {}", path.display());
@@ -450,16 +576,17 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
 
 /// Read the API key for the configured provider from its environment variable.
 /// Returns an error if the env var is missing (except for Ollama which needs no key).
-pub fn api_key_for(provider: Provider) -> anyhow::Result<String> {
+pub fn api_key_for(provider: Provider) -> std::result::Result<String, ConfigError> {
     let var = provider.api_key_env();
     if var.is_empty() {
         // Ollama — no key needed.
         return Ok(String::new());
     }
     std::env::var(var).map_err(|_| {
-        anyhow::anyhow!(
-            "{var} environment variable not set. Set it or use a different model (GOOP_MODEL=provider/model)"
-        )
+        ConfigError::MissingApiKey(format!(
+            "{var} environment variable not set. Set it or use a different \
+             model (GOOP_MODEL=provider/model)"
+        ))
     })
 }
 
@@ -467,50 +594,73 @@ pub fn api_key_for(provider: Provider) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
-    // ── parse_model ────────────────────────────────────────────────
+    // ── Model ──────────────────────────────────────────────────────
 
     #[test]
-    fn parse_model_basic() {
-        let (p, m) = parse_model("deepseek/deepseek-v4-pro").unwrap();
-        assert_eq!(p, Provider::DeepSeek);
-        assert_eq!(m, "deepseek-v4-pro");
+    fn model_parse_basic() {
+        let m: Model = "deepseek/deepseek-v4-pro".parse().unwrap();
+        assert_eq!(m.provider(), Provider::DeepSeek);
+        assert_eq!(m.model_name(), "deepseek-v4-pro");
     }
 
     #[test]
-    fn parse_model_nested() {
-        let (p, m) = parse_model("openrouter/openai/gpt-4o").unwrap();
-        assert_eq!(p, Provider::OpenRouter);
-        assert_eq!(m, "openai/gpt-4o");
+    fn model_parse_nested() {
+        let m: Model = "openrouter/openai/gpt-4o".parse().unwrap();
+        assert_eq!(m.provider(), Provider::OpenRouter);
+        assert_eq!(m.model_name(), "openai/gpt-4o");
     }
 
     #[test]
-    fn parse_model_all_providers() {
-        for (input, expected) in [
-            ("deepseek/x", Provider::DeepSeek),
-            ("openai/x", Provider::OpenAI),
-            ("openrouter/x", Provider::OpenRouter),
-            ("groq/x", Provider::Groq),
-            ("ollama/x", Provider::Ollama),
-            ("anthropic/x", Provider::Anthropic),
+    fn model_parse_all_providers() {
+        for input in [
+            "deepseek/x",
+            "openai/x",
+            "openrouter/x",
+            "groq/x",
+            "ollama/x",
+            "anthropic/x",
         ] {
-            let (p, _) = parse_model(input).unwrap();
-            assert_eq!(p, expected);
+            let m: Model = input.parse().unwrap();
+            assert_eq!(m.to_string(), input);
         }
     }
 
     #[test]
-    fn parse_model_unknown_provider() {
-        assert!(parse_model("foobar/gpt-4").is_err());
+    fn model_parse_unknown_provider() {
+        assert!(matches!(
+            "foobar/gpt-4".parse::<Model>().unwrap_err(),
+            ConfigError::InvalidModel(_)
+        ));
     }
 
     #[test]
-    fn parse_model_no_slash() {
-        assert!(parse_model("deepseek-v4-pro").is_err());
+    fn model_parse_no_slash() {
+        assert!(matches!(
+            "deepseek-v4-pro".parse::<Model>().unwrap_err(),
+            ConfigError::InvalidModel(_)
+        ));
     }
 
     #[test]
-    fn parse_model_empty_model() {
-        assert!(parse_model("deepseek/").is_err());
+    fn model_parse_empty_name() {
+        assert!(matches!(
+            "deepseek/".parse::<Model>().unwrap_err(),
+            ConfigError::InvalidModel(_)
+        ));
+    }
+
+    #[test]
+    fn model_display_roundtrips() {
+        let inputs = [
+            "deepseek/deepseek-v4-pro",
+            "openai/gpt-4o",
+            "openrouter/openai/gpt-4o",
+            "ollama/llama3.2",
+        ];
+        for input in inputs {
+            let m: Model = input.parse().unwrap();
+            assert_eq!(m.to_string(), input);
+        }
     }
 
     // ── Config methods ────────────────────────────────────────────
@@ -518,7 +668,7 @@ mod tests {
     #[test]
     fn config_provider_and_model_name() {
         let config = Config {
-            model: "openai/gpt-4o-mini".into(),
+            model: "openai/gpt-4o-mini".parse().unwrap(),
             ..Config::default()
         };
         assert_eq!(config.provider(), Provider::OpenAI);
@@ -530,6 +680,17 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.provider(), Provider::DeepSeek);
         assert_eq!(config.model_name(), "deepseek-v4-pro");
+    }
+
+    // ── serde round-trip ──────────────────────────────────────────
+
+    #[test]
+    fn model_serialize_deserialize() {
+        let m: Model = "openai/gpt-4o".parse().unwrap();
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#""openai/gpt-4o""#);
+        let m2: Model = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, m2);
     }
 
     // ── default config file round-trip ────────────────────────────
@@ -546,7 +707,7 @@ mod tests {
 
         // Must be valid TOML and parse back to Config.
         let parsed: Config = toml::from_str(&contents).unwrap();
-        assert_eq!(parsed.model, "deepseek/deepseek-v4-pro");
+        assert_eq!(parsed.model.to_string(), "deepseek/deepseek-v4-pro");
         assert_eq!(parsed.max_tokens, 100_000);
         assert_eq!(parsed.default_max_turns, 100);
         assert_eq!(parsed.enabled_tool_groups.len(), 4);
@@ -563,35 +724,49 @@ mod tests {
 
     #[test]
     fn session_config_merge() {
-        let mut config = Config::default();
-        assert_eq!(config.model, "deepseek/deepseek-v4-pro");
+        let config = Config::default();
+        assert_eq!(config.model.to_string(), "deepseek/deepseek-v4-pro");
 
         let session = SessionConfig {
             model: Some("openai/gpt-4o-mini".into()),
             ..Default::default()
         };
-        session.merge_into(&mut config);
+        let merged = session.merge(&config);
 
-        assert_eq!(config.model, "openai/gpt-4o-mini");
-        assert_eq!(config.provider(), Provider::OpenAI);
-        assert_eq!(config.model_name(), "gpt-4o-mini");
+        assert_eq!(merged.model.to_string(), "openai/gpt-4o-mini");
+        assert_eq!(merged.provider(), Provider::OpenAI);
+        assert_eq!(merged.model_name(), "gpt-4o-mini");
         // Unset fields retain defaults.
-        assert_eq!(config.max_tokens, 100_000);
+        assert_eq!(merged.max_tokens, 100_000);
+        // Original is unchanged.
+        assert_eq!(config.model.to_string(), "deepseek/deepseek-v4-pro");
     }
 
     #[test]
     fn session_config_partial_merge() {
-        let mut config = Config::default();
+        let config = Config::default();
         let session = SessionConfig {
             max_tokens: Some(50_000),
             ..Default::default()
         };
-        session.merge_into(&mut config);
+        let merged = session.merge(&config);
 
         // Model unchanged.
-        assert_eq!(config.model, "deepseek/deepseek-v4-pro");
+        assert_eq!(merged.model.to_string(), "deepseek/deepseek-v4-pro");
         // Max tokens overridden.
-        assert_eq!(config.max_tokens, 50_000);
+        assert_eq!(merged.max_tokens, 50_000);
+    }
+
+    #[test]
+    fn session_config_merge_preserves_original() {
+        let config = Config::default();
+        let session = SessionConfig {
+            max_tokens: Some(42),
+            ..Default::default()
+        };
+        let _merged = session.merge(&config);
+        // Original must be unchanged.
+        assert_eq!(config.max_tokens, 100_000);
     }
 
     // ── TOML deserialization of Config ────────────────────────────
@@ -600,12 +775,19 @@ mod tests {
     fn deserialize_config_minimal() {
         let toml_str = r#"model = "openai/gpt-4o""#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.model, "openai/gpt-4o");
+        assert_eq!(config.model.to_string(), "openai/gpt-4o");
         assert_eq!(config.provider(), Provider::OpenAI);
         assert_eq!(config.model_name(), "gpt-4o");
         // Defaults for omitted fields.
         assert_eq!(config.max_tokens, 100_000);
         assert_eq!(config.enabled_tool_groups.len(), 4);
+    }
+
+    #[test]
+    fn deserialize_config_invalid_model() {
+        let toml_str = r#"model = "foobar/x""#;
+        let result = toml::from_str::<Config>(toml_str);
+        assert!(result.is_err());
     }
 
     // ── MCP config deserialization ─────────────────────────────────
@@ -668,5 +850,22 @@ command = "my-indexer"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.enabled_mcp_servers, vec!["telegram", "code_indexer"]);
         assert_eq!(config.mcp_servers.len(), 2);
+    }
+
+    // ── Provider helpers ──────────────────────────────────────────
+
+    #[test]
+    fn provider_as_str_roundtrips() {
+        for (s, p) in [
+            ("deepseek", Provider::DeepSeek),
+            ("openai", Provider::OpenAI),
+            ("openrouter", Provider::OpenRouter),
+            ("groq", Provider::Groq),
+            ("ollama", Provider::Ollama),
+            ("anthropic", Provider::Anthropic),
+        ] {
+            assert_eq!(Provider::from_model_prefix(s), Some(p));
+            assert_eq!(p.as_str(), s);
+        }
     }
 }

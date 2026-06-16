@@ -209,17 +209,22 @@ pub fn build_agent(
     let any_agent = match provider {
         Provider::DeepSeek => arm!(
             DeepSeek,
-            deepseek::Client::new(&config::api_key_for(provider)?)?
+            deepseek::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
         ),
         Provider::OpenAI => arm!(
             OpenAI,
-            openai::CompletionsClient::new(&config::api_key_for(provider)?)?
+            openai::CompletionsClient::new(
+                &config::api_key_for(provider).map_err(anyhow::Error::new)?
+            )?
         ),
         Provider::OpenRouter => arm!(
             OpenRouter,
-            openrouter::Client::new(&config::api_key_for(provider)?)?
+            openrouter::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
         ),
-        Provider::Groq => arm!(Groq, groq::Client::new(&config::api_key_for(provider)?)?),
+        Provider::Groq => arm!(
+            Groq,
+            groq::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
         Provider::Ollama => {
             let ollama_api_key = std::env::var("OLLAMA_API_KEY").ok();
             arm!(
@@ -234,7 +239,7 @@ pub fn build_agent(
         }
         Provider::Anthropic => arm!(
             Anthropic,
-            anthropic::Client::new(&config::api_key_for(provider)?)?
+            anthropic::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
         ),
     };
 

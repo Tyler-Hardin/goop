@@ -17,6 +17,31 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+// ── error type ───────────────────────────────────────────────────────
+
+/// Errors that can occur during transport operations (local or remote).
+#[derive(thiserror::Error, Debug)]
+pub enum TransportError {
+    /// Filesystem or network I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Path contains non-UTF8 bytes — SFTP requires UTF-8 paths.
+    #[error("invalid path (non-UTF8): {0}")]
+    NonUtf8Path(PathBuf),
+
+    /// An SFTP operation failed.
+    #[error("SFTP error: {0}")]
+    Sftp(String),
+
+    /// An SSH channel operation (shell exec, etc.) failed.
+    #[error("SSH channel error: {0}")]
+    Channel(String),
+}
+
+/// Alias for results with [`TransportError`].
+pub type TransportResult<T> = std::result::Result<T, TransportError>;
+
 // ── SSH handler ───────────────────────────────────────────────────
 
 /// russh client handler that checks host keys against `~/.ssh/known_hosts`.
@@ -38,7 +63,7 @@ impl Handler for SshHandler {
     async fn check_server_key(
         &mut self,
         server_public_key: &russh::keys::PublicKey,
-    ) -> Result<bool, Self::Error> {
+    ) -> std::result::Result<bool, Self::Error> {
         match russh::keys::known_hosts::check_known_hosts(&self.host, self.port, server_public_key)
         {
             Ok(true) => {
@@ -94,7 +119,7 @@ impl Handler for SshHandler {
         _channel: russh::ChannelId,
         _data: &[u8],
         _session: &mut russh::client::Session,
-    ) -> Result<(), Self::Error> {
+    ) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -180,17 +205,17 @@ pub enum PersistedTransport {
 // ── helpers ────────────────────────────────────────────────────────
 
 /// Convert a path to a String for SFTP operations.
-fn path_to_string(path: &Path) -> Result<String, anyhow::Error> {
+fn path_to_string(path: &Path) -> TransportResult<String> {
     path.to_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("invalid path (non-UTF8): {}", path.display()))
+        .ok_or_else(|| TransportError::NonUtf8Path(path.to_path_buf()))
 }
 
 // ── transport operations ───────────────────────────────────────────
 
 impl Transport {
     /// Read the contents of a file (local or remote).
-    pub async fn read_file(&self, path: &Path) -> Result<String, anyhow::Error> {
+    pub async fn read_file(&self, path: &Path) -> TransportResult<String> {
         match self {
             Transport::Local => Ok(tokio::fs::read_to_string(path).await?),
             Transport::Ssh(state) => {
@@ -198,7 +223,8 @@ impl Transport {
                 let path_str = path_to_string(path)?;
                 let mut file = sftp
                     .open_with_flags(path_str, russh_sftp::protocol::OpenFlags::READ)
-                    .await?;
+                    .await
+                    .map_err(|e| TransportError::Sftp(e.to_string()))?;
                 let mut content = String::new();
                 file.read_to_string(&mut content).await?;
                 Ok(content)
@@ -207,7 +233,7 @@ impl Transport {
     }
 
     /// Write content to a file, creating or truncating it.
-    pub async fn write_file(&self, path: &Path, content: &str) -> Result<(), anyhow::Error> {
+    pub async fn write_file(&self, path: &Path, content: &str) -> TransportResult<()> {
         match self {
             Transport::Local => {
                 tokio::fs::write(path, content).await?;
@@ -223,9 +249,12 @@ impl Transport {
                             | russh_sftp::protocol::OpenFlags::TRUNCATE
                             | russh_sftp::protocol::OpenFlags::WRITE,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| TransportError::Sftp(e.to_string()))?;
                 file.write_all(content.as_bytes()).await?;
-                file.shutdown().await?;
+                file.shutdown()
+                    .await
+                    .map_err(|e| TransportError::Sftp(e.to_string()))?;
                 Ok(())
             }
         }
@@ -235,7 +264,7 @@ impl Transport {
     ///
     /// `cwd` is the working directory in which the command executes
     /// (local path for local transport, remote path for SSH).
-    pub async fn run_shell(&self, command: &str, cwd: &Path) -> Result<String, anyhow::Error> {
+    pub async fn run_shell(&self, command: &str, cwd: &Path) -> TransportResult<String> {
         match self {
             Transport::Local => {
                 let output = tokio::process::Command::new("sh")
@@ -260,11 +289,20 @@ impl Transport {
                 let full_cmd = format!("cd {escaped} && {{ {command}; }} 2>&1");
 
                 let handle = state.handle.lock().await;
-                let mut channel = handle.channel_open_session().await?;
-                channel.exec(true, full_cmd.as_bytes().to_vec()).await?;
+                let mut channel = handle
+                    .channel_open_session()
+                    .await
+                    .map_err(|e| TransportError::Channel(e.to_string()))?;
+                channel
+                    .exec(true, full_cmd.as_bytes().to_vec())
+                    .await
+                    .map_err(|e| TransportError::Channel(e.to_string()))?;
 
                 // Close stdin.
-                channel.eof().await?;
+                channel
+                    .eof()
+                    .await
+                    .map_err(|e| TransportError::Channel(e.to_string()))?;
 
                 // Read stdout (which now includes stderr).
                 let output = {
@@ -281,20 +319,23 @@ impl Transport {
     }
 
     /// Canonicalize a path (resolve `..`, `.`, symlinks).
-    pub async fn canonicalize(&self, path: &Path) -> Result<PathBuf, anyhow::Error> {
+    pub async fn canonicalize(&self, path: &Path) -> TransportResult<PathBuf> {
         match self {
             Transport::Local => Ok(std::fs::canonicalize(path)?),
             Transport::Ssh(state) => {
                 let sftp = state.sftp.lock().await;
                 let path_str = path_to_string(path)?;
-                let result: String = sftp.canonicalize(&path_str).await?;
+                let result: String = sftp
+                    .canonicalize(&path_str)
+                    .await
+                    .map_err(|e| TransportError::Sftp(e.to_string()))?;
                 Ok(PathBuf::from(result))
             }
         }
     }
 
     /// Check whether a path exists and is a directory.
-    pub async fn is_dir(&self, path: &Path) -> Result<bool, anyhow::Error> {
+    pub async fn is_dir(&self, path: &Path) -> TransportResult<bool> {
         match self {
             Transport::Local => Ok(path.is_dir()),
             Transport::Ssh(state) => {
@@ -311,7 +352,7 @@ impl Transport {
 
 // ── helper: read AsyncRead to String ───────────────────────────────
 
-async fn read_to_string<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String, anyhow::Error> {
+async fn read_to_string<R: AsyncReadExt + Unpin>(reader: &mut R) -> TransportResult<String> {
     let mut buf = String::new();
     reader.read_to_string(&mut buf).await?;
     Ok(buf)

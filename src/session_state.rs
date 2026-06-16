@@ -36,7 +36,58 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::SessionConfig;
-use crate::transport::{PersistedTransport, Transport};
+use crate::transport::{PersistedTransport, Transport, TransportError};
+
+// ── error type ───────────────────────────────────────────────────────
+
+/// Errors that can occur during session-level operations (file I/O,
+/// directory changes, shell execution, SSH).
+#[derive(thiserror::Error, Debug)]
+pub enum SessionStateError {
+    /// An error from the transport layer (I/O, SFTP, SSH channel).
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+
+    /// Filesystem I/O error (e.g. writing the state file).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Serialization error when persisting session state.
+    #[error("serialization error: {0}")]
+    Toml(#[from] toml::ser::Error),
+
+    /// SSH connection or authentication failure.
+    #[error("SSH error: {0}")]
+    Ssh(String),
+
+    /// A path-related error from `cd`: canonicalization failure,
+    /// path is not a directory, etc.
+    #[error("cd error: {0}")]
+    Cd(String),
+
+    /// Line-range arguments are out of bounds for the file.
+    #[error("invalid line range: start={start}, end={end}, file has {total} lines")]
+    LineRange { start: u64, end: u64, total: u64 },
+
+    /// `old_str` was either not found, or found more than once.
+    #[error("replace error: {0}")]
+    Replace(String),
+
+    /// A spawned blocking task panicked or was cancelled.
+    #[error("blocking task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    /// HTML-to-text conversion failed.
+    #[error("html2text conversion failed: {0}")]
+    Html2Text(String),
+
+    /// A web fetch failed (HTTP error, curl missing on remote, DNS, etc.).
+    #[error("web fetch failed: {0}")]
+    WebFetch(String),
+}
+
+/// Alias for results with [`SessionStateError`].
+pub type SessionResult<T> = std::result::Result<T, SessionStateError>;
 
 // ── inner state (single lock) ──────────────────────────────────────
 
@@ -100,8 +151,8 @@ impl SessionState {
         path: PathBuf,
         start_line: Option<u64>,
         end_line: Option<u64>,
-    ) -> Result<String, anyhow::Error> {
-        let (transport, resolved) = self.resolve_io_context(&path).await;
+    ) -> SessionResult<String> {
+        let (transport, resolved) = self.resolve_io_context(&path).await?;
         let content = transport.read_file(&resolved).await?;
 
         let all_lines: Vec<&str> = content.lines().collect();
@@ -111,10 +162,10 @@ impl SessionState {
         let end = end_line.unwrap_or(total).min(total);
 
         if start > total {
-            anyhow::bail!("start_line {start} exceeds file length ({total} lines)");
+            return Err(SessionStateError::LineRange { start, end, total });
         }
         if start > end {
-            anyhow::bail!("start_line {start} > end_line {end}");
+            return Err(SessionStateError::LineRange { start, end, total });
         }
 
         Ok(all_lines[(start - 1) as usize..end as usize]
@@ -128,12 +179,8 @@ impl SessionState {
     /// Write content to a file (create or truncate).
     ///
     /// `path` is resolved relative to the session CWD.
-    pub async fn write_file(
-        &self,
-        path: PathBuf,
-        content: String,
-    ) -> Result<String, anyhow::Error> {
-        let (transport, resolved) = self.resolve_io_context(&path).await;
+    pub async fn write_file(&self, path: PathBuf, content: String) -> SessionResult<String> {
+        let (transport, resolved) = self.resolve_io_context(&path).await?;
         let len = content.len();
         transport.write_file(&resolved, &content).await?;
         Ok(format!("Wrote {len} bytes to {}", resolved.display()))
@@ -148,15 +195,17 @@ impl SessionState {
         path: PathBuf,
         old_str: String,
         new_str: String,
-    ) -> Result<String, anyhow::Error> {
-        let (transport, resolved) = self.resolve_io_context(&path).await;
+    ) -> SessionResult<String> {
+        let (transport, resolved) = self.resolve_io_context(&path).await?;
         let content = transport.read_file(&resolved).await?;
         let count = content.matches(&old_str).count();
         if count == 0 {
-            anyhow::bail!("old_str not found");
+            return Err(SessionStateError::Replace("old_str not found".into()));
         }
         if count > 1 {
-            anyhow::bail!("old_str found {count} times, must be unique");
+            return Err(SessionStateError::Replace(format!(
+                "old_str found {count} times, must be unique"
+            )));
         }
         let new_content = content.replacen(&old_str, &new_str, 1);
         transport.write_file(&resolved, &new_content).await?;
@@ -166,12 +215,12 @@ impl SessionState {
     /// Read an HTML file and extract plain text (headings, links, body).
     ///
     /// `path` is resolved relative to the session CWD.
-    pub async fn read_html(&self, path: PathBuf) -> Result<String, anyhow::Error> {
-        let (transport, resolved) = self.resolve_io_context(&path).await;
+    pub async fn read_html(&self, path: PathBuf) -> SessionResult<String> {
+        let (transport, resolved) = self.resolve_io_context(&path).await?;
         let html = transport.read_file(&resolved).await?;
         tokio::task::spawn_blocking(move || html2text::from_read(html.as_bytes(), 80))
             .await?
-            .map_err(|e| anyhow::anyhow!(e))
+            .map_err(|e| SessionStateError::Html2Text(e.to_string()))
     }
 
     /// Change the session's working directory.
@@ -179,7 +228,7 @@ impl SessionState {
     /// `path` may be absolute, relative (to current CWD), `~` for home,
     /// or `..` for parent.  The result is canonicalised and verified to
     /// be a directory before the CWD is updated.
-    pub async fn change_dir(&self, path: String) -> Result<String, anyhow::Error> {
+    pub async fn change_dir(&self, path: String) -> SessionResult<String> {
         // Snapshot everything we need, then drop the lock for I/O.
         let (transport, current_cwd, home) = {
             let inner = self.inner.lock().await;
@@ -211,14 +260,17 @@ impl SessionState {
         let canonical = transport
             .canonicalize(&new_path)
             .await
-            .map_err(|e| anyhow::anyhow!("cd: {}: {e}", new_path.display()))?;
+            .map_err(|e| SessionStateError::Cd(format!("{}: {e}", new_path.display())))?;
 
         if !transport
             .is_dir(&canonical)
             .await
-            .map_err(|e| anyhow::anyhow!("cd: {}: {e}", canonical.display()))?
+            .map_err(|e| SessionStateError::Cd(format!("{}: {e}", canonical.display())))?
         {
-            anyhow::bail!("cd: not a directory: {}", canonical.display());
+            return Err(SessionStateError::Cd(format!(
+                "not a directory: {}",
+                canonical.display()
+            )));
         }
 
         self.set_cwd(canonical.clone()).await;
@@ -231,14 +283,17 @@ impl SessionState {
     }
 
     /// Run a shell command in the session's CWD (local or remote).
-    pub async fn run_shell(&self, command: String) -> Result<String, anyhow::Error> {
+    pub async fn run_shell(&self, command: String) -> SessionResult<String> {
         let (transport, cwd) = {
             let inner = self.inner.lock().await;
             let t = inner.transport.clone();
             let c = self.cwd_of(&inner).await;
             (t, c)
         };
-        transport.run_shell(&command, &cwd).await
+        transport
+            .run_shell(&command, &cwd)
+            .await
+            .map_err(SessionStateError::Transport)
     }
 
     /// Connect to a remote host via SSH.
@@ -252,7 +307,7 @@ impl SessionState {
         &self,
         destination: String,
         password: Option<String>,
-    ) -> Result<String, anyhow::Error> {
+    ) -> SessionResult<String> {
         // If already SSH'd, go back to local first.
         {
             let mut inner = self.inner.lock().await;
@@ -261,7 +316,9 @@ impl SessionState {
             }
         }
 
-        let transport = crate::ssh::ssh_connect(&destination, password.as_deref()).await?;
+        let transport = crate::ssh::ssh_connect(&destination, password.as_deref())
+            .await
+            .map_err(|e| SessionStateError::Ssh(e.to_string()))?;
 
         // Use the current (local) CWD as the initial remote CWD.
         // canonicalize resolves it on the remote side.
@@ -293,7 +350,7 @@ impl SessionState {
     ///
     /// Restores the local CWD that was active before `ssh_connect`.
     /// No-ops (with a message) if already local.
-    pub async fn ssh_disconnect(&self) -> Result<String, anyhow::Error> {
+    pub async fn ssh_disconnect(&self) -> SessionResult<String> {
         let local_cwd = {
             let mut inner = self.inner.lock().await;
             if !inner.transport.is_ssh() {
@@ -310,6 +367,30 @@ impl SessionState {
             "Disconnected — now operating locally in {}",
             local_cwd.display()
         ))
+    }
+
+    /// Fetch a URL and extract plain text from the HTML.
+    ///
+    /// On the local transport this uses `reqwest` directly.  On SSH it
+    /// runs `curl -sSf` on the remote host — so the URL is fetched from
+    /// the *remote's* network perspective (internal services, VPNs, etc.
+    /// are reachable).  The raw HTML and extracted text are cached to
+    /// `/tmp/goop/` so the LLM can re-examine them with `read` or
+    /// `read_html`.
+    pub async fn web_fetch(&self, url: String) -> SessionResult<String> {
+        let (transport, is_local) = {
+            let inner = self.inner.lock().await;
+            (
+                inner.transport.clone(),
+                matches!(inner.transport, Transport::Local),
+            )
+        };
+
+        if is_local {
+            self.web_fetch_local(&url).await
+        } else {
+            self.web_fetch_remote(&transport, &url).await
+        }
     }
 
     // ── pub(crate) — used by Session::new for SSH reconnect ──────
@@ -339,7 +420,7 @@ impl SessionState {
     /// Resolve `path` against the session CWD and return the transport
     /// handle + resolved path.  The transport handle is cloned out of
     /// the lock so I/O happens without holding it.
-    async fn resolve_io_context(&self, path: &Path) -> (Transport, PathBuf) {
+    async fn resolve_io_context(&self, path: &Path) -> SessionResult<(Transport, PathBuf)> {
         let inner = self.inner.lock().await;
         let transport = inner.transport.clone();
         let cwd = self.cwd_of(&inner).await;
@@ -348,7 +429,7 @@ impl SessionState {
         } else {
             cwd.join(path)
         };
-        (transport, resolved)
+        Ok((transport, resolved))
     }
 
     /// CWD derived from the current transport.  `inner` must already
@@ -376,6 +457,105 @@ impl SessionState {
                 *ssh.remote_cwd.lock().await = path;
             }
         }
+    }
+
+    // ── web_fetch helpers ─────────────────────────────────────────
+
+    /// Fetch via `reqwest` on the local machine.
+    async fn web_fetch_local(&self, url: &str) -> SessionResult<String> {
+        let resp = reqwest::get(url)
+            .await
+            .map_err(|e| SessionStateError::WebFetch(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(SessionStateError::WebFetch(format!("HTTP {status}")));
+        }
+        let html = resp
+            .text()
+            .await
+            .map_err(|e| SessionStateError::WebFetch(e.to_string()))?;
+
+        let text = tokio::task::spawn_blocking({
+            let html = html.clone();
+            move || {
+                html2text::from_read(html.as_bytes(), 80)
+                    .map_err(|e| SessionStateError::Html2Text(e.to_string()))
+            }
+        })
+        .await??;
+
+        let dir = std::env::temp_dir().join("goop");
+        tokio::fs::create_dir_all(&dir).await?;
+        let stem = slugify(url);
+        let txt_path = dir.join(format!("{stem}.txt"));
+        let html_path = dir.join(format!("{stem}.html"));
+        tokio::fs::write(&txt_path, &text).await?;
+        tokio::fs::write(&html_path, &html).await?;
+
+        Ok(format!(
+            "{text}\n\n---\nCached: {} (plain text) and {} (raw HTML) — \
+             use `read` or `read_html` or `shell` (e.g. grep) to re-examine if needed.",
+            txt_path.display(),
+            html_path.display(),
+        ))
+    }
+
+    /// Fetch via `curl` on the remote host, then process locally.
+    async fn web_fetch_remote(&self, transport: &Transport, url: &str) -> SessionResult<String> {
+        // curl -sSf: silent, show errors, fail on HTTP 4xx/5xx.
+        // The marker lets us distinguish success (HTML output) from
+        // failure (curl error message on merged stderr).
+        let marker = "GOOP_CURL_OK_7a3f1b9c";
+        let cmd = format!("curl -sSf {url:?} && echo {marker:?}");
+        let output = transport
+            .run_shell(&cmd, &PathBuf::from("/tmp"))
+            .await
+            .map_err(SessionStateError::Transport)?;
+
+        // Strip the marker to get raw HTML; if absent, curl failed.
+        let html = match output.strip_suffix(&format!("{marker}\n")) {
+            Some(html) => html.to_string(),
+            None => {
+                let err = output.trim();
+                let detail = if err.is_empty() {
+                    "curl produced no output — is curl installed on the remote host?"
+                } else {
+                    err
+                };
+                return Err(SessionStateError::WebFetch(detail.to_string()));
+            }
+        };
+
+        // HTML → text conversion on the local machine.
+        let text = tokio::task::spawn_blocking({
+            let html = html.clone();
+            move || {
+                html2text::from_read(html.as_bytes(), 80)
+                    .map_err(|e| SessionStateError::Html2Text(e.to_string()))
+            }
+        })
+        .await??;
+
+        // Write cached files to the remote host via transport.
+        let remote_dir = PathBuf::from("/tmp/goop");
+        // Ensure the directory exists on the remote.
+        transport
+            .run_shell("mkdir -p /tmp/goop", &PathBuf::from("/tmp"))
+            .await
+            .map_err(SessionStateError::Transport)?;
+
+        let stem = slugify(url);
+        let txt_path = remote_dir.join(format!("{stem}.txt"));
+        let html_path = remote_dir.join(format!("{stem}.html"));
+        transport.write_file(&txt_path, &text).await?;
+        transport.write_file(&html_path, &html).await?;
+
+        Ok(format!(
+            "{text}\n\n---\nCached on remote: {} (plain text) and {} \
+             (raw HTML) — use `read` or `read_html` to re-examine if needed.",
+            txt_path.display(),
+            html_path.display(),
+        ))
     }
 }
 
@@ -425,7 +605,7 @@ impl PersistedSessionState {
     }
 
     /// Write to a `<name>.state.toml` path (creates parent dirs).
-    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+    pub fn save_to(&self, path: &Path) -> std::result::Result<(), anyhow::Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -442,4 +622,19 @@ pub fn state_path(name: &str) -> PathBuf {
     crate::config::config_dir()
         .join("sessions")
         .join(format!("{name}.state.toml"))
+}
+
+// ── misc ──────────────────────────────────────────────────────────────
+
+/// Turn a URL into a safe filename fragment.
+fn slugify(url: &str) -> String {
+    url.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '_',
+        })
+        .collect::<String>()
+        .chars()
+        .take(120)
+        .collect()
 }

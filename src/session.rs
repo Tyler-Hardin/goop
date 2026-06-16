@@ -119,9 +119,8 @@ impl Session {
         // ── load persisted state (config overrides + CWD + transport) ──
         let persisted = PersistedSessionState::load(&name).unwrap_or_default();
 
-        // Merge session config overrides into a clone of the global config.
-        let mut merged_config = config.clone();
-        persisted.config.merge_into(&mut merged_config);
+        // Merge session config overrides into the global config.
+        let merged_config = persisted.config.merge(config);
 
         let initial_local_cwd = persisted.local_cwd.clone();
 
