@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Local;
@@ -14,7 +14,7 @@ use crate::memory::FileConversationMemory;
 use crate::memory::prompt_history_path;
 use crate::model;
 use crate::preamble::build_preamble;
-use crate::session_state::SessionState;
+use crate::session_state::{PersistedSessionState, SessionState, TransportState};
 use crate::transport::Transport;
 
 // ── subscriber with history replay ──────────────────────────────
@@ -47,6 +47,10 @@ pub struct Session {
     /// Session name (user-supplied or auto-generated like `20260128_001`).
     name: String,
     /// Shared mutable state (CWD, transport, home_dir) accessible by tools.
+    ///
+    /// Held here to keep the `Arc` alive; tools receive their own clone
+    /// at construction time via [`model::build_agent`].
+    #[allow(dead_code)]
     pub(crate) state: Arc<SessionState>,
     agent: Arc<crate::model::AnyAgent>,
     tx: broadcast::Sender<SessionEvent>,
@@ -71,8 +75,9 @@ impl Session {
     /// can buffer between the slowest and fastest subscriber.
     ///
     /// Session data is persisted to
-    /// `~/.config/goop/sessions/<name>.jsonl` (events) and
-    /// `~/.config/goop/sessions/<name>.messages.jsonl` (agent memory).
+    /// `~/.config/goop/sessions/<name>.jsonl` (events),
+    /// `~/.config/goop/sessions/<name>.messages.jsonl` (agent memory),
+    /// and `~/.config/goop/sessions/<name>.state.toml` (config + CWD + transport).
     /// Existing files are loaded so named sessions can be resumed.
     ///
     /// A background task is spawned to drain the prompt queue — the
@@ -88,24 +93,77 @@ impl Session {
         std::fs::create_dir_all(&dir)?;
         let events_path = dir.join(format!("{name}.jsonl"));
         let messages_path = dir.join(format!("{name}.messages.jsonl"));
-        let cwd_path = dir.join(format!("{name}.cwd"));
+        let state_path = crate::session_state::state_path(&name);
         let mem = FileConversationMemory::new(messages_path)?;
         // Load pre-existing events for history replay.
         let existing_events = load_events_from_file(&events_path).unwrap_or_default();
 
-        // ── CWD ──────────────────────────────────────────────
-        let cwd = load_cwd(&cwd_path);
+        // ── load persisted state (config overrides + CWD + transport) ──
+        let persisted = PersistedSessionState::load(&name).unwrap_or_default();
+
+        // Merge session config overrides into a clone of the global config.
+        let mut merged_config = config.clone();
+        persisted.config.merge_into(&mut merged_config);
+
+        let initial_cwd = persisted.local_cwd.clone();
 
         // ── SessionState (created before agent so tools can use it) ──
         let state = Arc::new(SessionState::new(
             name.clone(),
             config.home_dir.clone(),
-            cwd.clone(),
+            initial_cwd.clone(),
+            state_path,
         ));
 
-        let preamble = build_preamble(&cwd.display().to_string(), &config.home_dir);
+        // Restore transport if the session was SSH'd.
+        match &persisted.transport {
+            TransportState::Local => {
+                // Nothing to restore.
+            }
+            TransportState::Ssh {
+                destination,
+                remote_cwd,
+            } => {
+                // We can't auto-reconnect here because we need async.
+                // Spawn a background task to reconnect.
+                let state_clone = Arc::clone(&state);
+                let dest = destination.clone();
+                let rwd = remote_cwd.clone();
+                let name_for_log = name.clone();
+                tokio::spawn(async move {
+                    match crate::ssh::ssh_connect(&dest, None).await {
+                        Ok(transport) => {
+                            if let Transport::Ssh(ref ssh_state) = transport {
+                                match transport.canonicalize(&rwd).await {
+                                    Ok(canon) => {
+                                        *ssh_state.remote_cwd.lock().await = canon.clone();
+                                        state_clone.set_cwd(canon);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "auto-reconnect SSH {name_for_log}: could not \
+                                             canonicalize persisted CWD {rwd:?}: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            state_clone.set_transport(transport);
+                            state_clone.save();
+                            tracing::info!("auto-reconnect SSH {name_for_log} → {dest} succeeded");
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "auto-reconnect SSH {name_for_log} → {dest} failed: {e}"
+                            );
+                        }
+                    }
+                });
+            }
+        }
 
-        let agent = model::build_agent(config, &preamble, mem, state.clone())?;
+        let preamble = build_preamble(&initial_cwd.display().to_string(), &config.home_dir);
+
+        let agent = model::build_agent(&merged_config, &preamble, mem, state.clone())?;
 
         let (tx, _) = broadcast::channel(capacity);
         let (submit_tx, submit_rx) = mpsc::unbounded_channel();
@@ -352,11 +410,10 @@ impl SessionManager {
     /// Get an existing session or create one.
     ///
     /// If the session already exists in the map, returns it directly.
-    /// Otherwise creates a new [`Session`] — which loads events and
-    /// messages from disk if files exist for this name.
-    ///
-    /// If the session was previously connected via SSH (a `.ssh` file
-    /// exists), a background task is spawned to auto-reconnect.
+    /// Otherwise creates a new [`Session`] — which loads events,
+    /// messages, and state (config overrides + CWD + transport) from
+    /// disk if files exist for this name.  Session config overrides
+    /// are merged into the global config before building the agent.
     pub async fn get_or_create(&self, name: String) -> anyhow::Result<Arc<Session>> {
         // Fast path: read lock.
         {
@@ -377,57 +434,6 @@ impl SessionManager {
 
         // If this session was previously closed, un-close it now.
         remove_closed_session(&name);
-
-        // If this session was previously SSH'd, auto-reconnect in the
-        // background so the transport is warm when the first prompt
-        // arrives.
-        let ssh_file = sessions_dir().join(format!("{name}.ssh"));
-        if ssh_file.exists()
-            && let Ok(contents) = std::fs::read_to_string(&ssh_file)
-        {
-            let mut lines = contents.lines();
-            let destination = lines.next().unwrap_or("").trim().to_string();
-            let remote_cwd = lines
-                .next()
-                .map(|s| PathBuf::from(s.trim()))
-                .unwrap_or_default();
-            if !destination.is_empty() {
-                tracing::info!("auto-reconnecting SSH session {name} → {destination}");
-                let state = Arc::clone(&session.state);
-                let name_for_log = name.clone();
-                tokio::spawn(async move {
-                    match crate::ssh::ssh_connect(&destination, None).await {
-                        Ok(transport) => {
-                            // Update the remote CWD to match what was
-                            // persisted (canonicalize on the remote side).
-                            if !remote_cwd.as_os_str().is_empty()
-                                && let Transport::Ssh(ref ssh_state) = transport
-                            {
-                                match transport.canonicalize(&remote_cwd).await {
-                                    Ok(canon) => {
-                                        *ssh_state.remote_cwd.lock().await = canon.clone();
-                                        state.set_cwd(canon);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "auto-reconnect SSH {name_for_log}: could not \
-                                                 canonicalize persisted CWD {remote_cwd:?}: {e}"
-                                        );
-                                    }
-                                }
-                            }
-                            state.set_transport(transport);
-                            tracing::info!("auto-reconnect SSH {name_for_log} succeeded");
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "auto-reconnect SSH {name_for_log} → {destination} failed: {e}"
-                            );
-                        }
-                    }
-                });
-            }
-        }
 
         Ok(session)
     }
@@ -480,10 +486,15 @@ impl SessionManager {
             let fname = fname.to_string_lossy();
             // Session event files look like "<name>.jsonl".
             // Memory files look like "<name>.messages.jsonl".
+            // State files look like "<name>.state.json".
             // Strip suffixes to get the raw session name.
             if let Some(stripped) = fname.strip_suffix(".jsonl")
                 && !stripped.ends_with(".messages")
             {
+                names.insert(stripped.to_string());
+            }
+            // Also discover from .state.toml files (in case there's no .jsonl yet).
+            if let Some(stripped) = fname.strip_suffix(".state.toml") {
                 names.insert(stripped.to_string());
             }
         }
@@ -505,6 +516,11 @@ impl SessionManager {
 /// Directory for session files: `~/.config/goop/sessions/`
 pub(crate) fn sessions_dir() -> PathBuf {
     config::config_dir().join("sessions")
+}
+
+/// Path to a session's state file (public for `config.rs`).
+pub fn session_state_path(name: &str) -> PathBuf {
+    crate::session_state::state_path(name)
 }
 
 /// Path to the closed-sessions list: `~/.config/goop/closed_sessions.json`
@@ -553,28 +569,6 @@ fn save_closed_sessions(closed: &std::collections::HashSet<String>) {
     if let Ok(json) = serde_json::to_string_pretty(&names) {
         let _ = std::fs::write(&path, json);
     }
-}
-
-/// Load the session's saved CWD, or fall back to the process CWD.
-fn load_cwd(path: &PathBuf) -> PathBuf {
-    if let Ok(contents) = std::fs::read_to_string(path) {
-        let trimmed = contents.trim();
-        if !trimmed.is_empty() {
-            let p = PathBuf::from(trimmed);
-            if p.is_dir() {
-                return p;
-            }
-        }
-    }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-/// Persist a session's CWD to its `<name>.cwd` file.
-pub(crate) fn save_cwd(path: &PathBuf, cwd: &Path) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, format!("{}\n", cwd.display()));
 }
 
 /// Auto-generate a session name like `20260128_001`.

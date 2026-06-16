@@ -40,9 +40,12 @@ The web UI shows a session sidebar for switching between sessions.
   one at a time.
 - **`Config`** (`src/config.rs`) — provider selection, model name, tuning
   knobs, and tool-group toggles.  Owns `home_dir` (computed once at startup)
-  so no other module reads `HOME` from the environment.  Reads from
-  `~/.config/goop/config.toml` with env-var overrides (`GOOP_PROVIDER`,
-  `GOOP_MODEL`). Falls back to DeepSeek defaults.
+  so no other module reads `HOME` from the environment.  Loaded via
+  [`figment`](https://crates.io/crates/figment) with layered precedence:
+  CLI flags > env vars > session config > global config > defaults.  Global
+  config lives at `~/.config/goop/config.toml`; per-session overrides live
+  in `<name>.state.toml` via [`SessionConfig`].  If no global config file
+  exists, a well-commented default is written automatically.
 - **`model`** (`src/model.rs`) — provider abstraction layer. Wraps rig's
   type-level providers (DeepSeek, OpenAI, OpenRouter, Groq, Ollama,
   Anthropic) behind enums so one binary works with any provider. The
@@ -75,11 +78,15 @@ The web UI shows a session sidebar for switching between sessions.
   open_url).  The active set is built in `build_tools()` based on
   `Config::enabled_tool_groups` and passed to the agent via the builder's
   `.tools()` method, which takes `Vec<Box<dyn ToolDyn>>`.
-- **`SessionState`** (`src/session_state.rs`) — per-session shared mutable
-  state: `name`, `home_dir` (from Config), `cwd` (Mutex<PathBuf>), and
-  `transport` (Mutex<Transport>).  Replaces the former `SESSION_CWDS`,
-  `SESSION_TRANSPORTS` globals and `SESSION_ID` task-local.  Tools access
-  it through `Arc<SessionState>` — no global lookups needed.
+- **`SessionState`** (`src/session_state.rs`) — runtime per-session shared
+  mutable state: `name`, `home_dir` (from Config), `cwd` (Mutex<PathBuf>),
+  `transport` (Mutex<Transport>), and a `state_path` for persistence.  Tools
+  access it through `Arc<SessionState>` — no global lookups needed.  CWD
+  and transport changes are persisted to `<name>.state.toml` via `save()`.
+  **`PersistedSessionState`** (same module) is the on-disk JSON snapshot:
+  `config` (session overrides), `local_cwd`, and `transport` (local vs. SSH
+  destination + remote CWD).  Replaces the former `.cwd`, `.cwd.local`, and
+  `.ssh` scattered files.
 - **SSH** (`src/ssh.rs`) — connection logic: parses `~/.ssh/config`,
   resolves `HostName`/`User`/`Port`/`IdentityFile`/`ProxyJump`, loads
   private keys, and connects with key-first-then-password authentication.
@@ -114,7 +121,19 @@ running, then connects as a WS client — it never owns the session directly.
 ## Multi-session design
 
 The server owns a `SessionManager`, not a single session.  The provider and
-model are chosen once at startup via config; all sessions share that choice.
+model are chosen at startup via the global config, but each session can
+override them through its `SessionConfig` in `<name>.state.toml`.
+
+### Config layering
+
+Configuration is merged from five layers via [`figment`](https://crates.io/crates/figment)
+(highest precedence wins):
+
+1. **CLI flags** — `--model`, `--provider` (via `CliOverrides`)
+2. **Environment** — `GOOP_PROVIDER`, `GOOP_MODEL`
+3. **Session config** — `<name>.state.toml` → `config` section
+4. **Global config** — `~/.config/goop/config.toml`
+5. **Hard defaults** — DeepSeek, `deepseek-v4-pro`, all tool groups except `computer_use`
 
 ### Provider configuration
 
@@ -177,12 +196,18 @@ duplication across the six match arms in `build_agent()`.
 
 ### Session lifecycle
 - **Creation:** `SessionManager::create(name)` → `Session::new(256, Some(name))`.
-  The session loads events and messages from disk if files exist.
+  The session loads events, messages, and state (config overrides + CWD +
+  transport) from disk if files exist.  Session config overrides are merged
+  into the global config before building the agent.
 - **Discovery:** On server start, `SessionManager::discover()` scans
-  `~/.config/goop/sessions/` for `*.jsonl` files, extracts session names,
-  and calls `get_or_create` for each **except** those listed in
-  `~/.config/goop/closed_sessions.json`.  Existing sessions become
-  immediately available.
+  `~/.config/goop/sessions/` for `*.jsonl` and `*.state.toml` files,
+  extracts session names, and calls `get_or_create` for each **except**
+  those listed in `~/.config/goop/closed_sessions.json`.  Existing sessions
+  become immediately available.
+- **Persistence:** Each session stores three files:
+  - `<name>.jsonl` — event stream (JSONL)
+  - `<name>.messages.jsonl` — LLM conversation memory (JSONL)
+  - `<name>.state.toml` — config overrides + CWD + transport state (TOML)
 - **Closing (sidebar ×):** `DELETE /api/sessions/{name}` removes the session
   from the in-memory map and adds its name to `closed_sessions.json`.  Disk
   files are preserved — the session won't reappear on restart.  To reopen,
@@ -200,28 +225,27 @@ duplication across the six match arms in `build_agent()`.
 
 ### Session working directory (CWD)
 
-Each session has its own working directory, persisted to
-`~/.config/goop/sessions/<name>.cwd` (a plain text file containing the path).
+Each session has its own working directory, persisted as part of
+`~/.config/goop/sessions/<name>.state.toml` (in the `local_cwd` field).
 On creation the CWD defaults to the server process's CWD.
 
 - **`cd` tool** — the LLM can change the session's CWD. The tool resolves
   paths relative to the current session CWD, supports `~` for home and `..`
-  for parent, canonicalises the result, persists it to disk, and updates a
-  global `SESSION_CWDS` registry.
-- **`shell` tool** — runs commands with `.current_dir(session_cwd)` so file
-  operations are relative to the session's directory.
+  for parent, canonicalises the result, persists it via `SessionState::save()`.
+- **`shell` tool** — runs commands with the session's current directory
+  (local or remote) so file operations are relative to the session's directory.
 - **Initial CWD** is included in the agent preamble so the LLM knows where
   it starts; subsequent changes are communicated via the `cd` tool result.
-- The global `SESSION_CWDS` (a `LazyLock<RwLock<HashMap<String, PathBuf>>>`)
-  and a `tokio::task_local! SESSION_ID` allow tools to find their session's
-  CWD without explicit plumbing.
+- Tools access CWD through `Arc<SessionState>` — no global registries needed.
 
 ### SSH transport
 
 A session can operate on a remote host via the `ssh` tool.  The transport
 layer (`src/transport.rs`) abstracts local vs. remote file operations so
 that `read`, `write`, `replace`, `read_html`, `shell`, and `cd` work
-transparently on whichever host is active.
+transparently on whichever host is active.  Transport state is persisted in
+`<name>.state.toml` via the `TransportState` enum (`local` | `ssh { destination,
+remote_cwd }`) and auto-reconnected when a session is resumed.
 
 Connection logic lives in `src/ssh.rs`, which:
 
@@ -238,9 +262,10 @@ Connection logic lives in `src/ssh.rs`, which:
   `russh::client::connect_stream`.  Supports multiple chained jumps
   (comma-separated in config).
 - **`ssh` tool** — calls `ssh::ssh_connect()`.  If already connected
-  to a different host, disconnects first.
-- **`disconnect` tool** — closes the SSH connection and resets the
-  transport to `Local`.  The CWD is reset to the server process's CWD.
+  to a different host, disconnects first.  Persists transport state
+  via `SessionState::save()`.
+- **`disconnect` tool** — closes the SSH connection, resets transport
+  to `Local`, and restores `local_cwd` from the persisted session state.
 - **`Transport` enum** (`src/transport.rs`) — `Local` or `Ssh(Arc<SshState>)`.
   `SshState` holds the russh `Handle` (for opening exec channels) and an
   `SftpSession` (for file read/write/directory ops), each behind a

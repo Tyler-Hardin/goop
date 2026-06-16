@@ -10,6 +10,7 @@ axum = { version = "0.8", features = ["ws"] }
 axum-extra = "0.12"
 chrono = "0.4.45"
 clap = { version = "4.6.1", features = ["derive"] }
+figment = { version = "0.10.19", features = ["toml", "env"] }
 futures = "0.3"
 gtk = { version = "0.18.2", features = ["v3_24"] }
 html2text = "0.17.1"

@@ -3,12 +3,19 @@
 //!
 //! Reads from `~/.config/goop/config.toml` with env-var overrides.
 //! Falls back to DeepSeek defaults for backward compatibility.
+//!
+//! Configuration layering (highest wins):
+//! 1. CLI flags (`--model`, `--provider`)
+//! 2. Environment variables (`GOOP_PROVIDER`, `GOOP_MODEL`)
+//! 3. Session config (`<name>.state.json` → `config`)
+//! 4. Global config (`~/.config/goop/config.toml`)
+//! 5. Hard-coded defaults
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-// ── config file ──────────────────────────────────────────────────
+// ── paths ───────────────────────────────────────────────────────────
 
 /// Return the user's home directory, computing it once at startup.
 pub fn home_dir() -> PathBuf {
@@ -21,14 +28,17 @@ pub fn config_dir() -> PathBuf {
     home_dir().join(".config").join("goop")
 }
 
-fn config_path() -> PathBuf {
+pub fn global_config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+// ── provider ────────────────────────────────────────────────────────
+
 /// Supported LLM providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
+    #[default]
     DeepSeek,
     OpenAI,
     OpenRouter,
@@ -75,10 +85,10 @@ impl Provider {
     }
 }
 
-// ── tool groups ──────────────────────────────────────────────────
+// ── tool groups ─────────────────────────────────────────────────────
 
 /// Groups of tools that can be enabled/disabled in config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolGroup {
     /// `read`, `write`, `replace`, `read_html`, `cd`
@@ -102,17 +112,18 @@ fn default_tool_groups() -> Vec<ToolGroup> {
     ]
 }
 
-// ── config struct ────────────────────────────────────────────────
+// ── config ──────────────────────────────────────────────────────────
 
-/// Parsed configuration.
-#[derive(Debug, Clone, Deserialize)]
+/// Effective configuration, built by merging all layers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Computed once at startup; not serialized.
-    #[serde(skip)]
+    #[serde(skip, default = "home_dir")]
     pub home_dir: PathBuf,
 
-    #[serde(default = "default_provider")]
+    #[serde(default)]
     pub provider: Provider,
+    /// Model name.  `None` means "use the provider default".
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default = "default_max_tokens")]
@@ -123,10 +134,6 @@ pub struct Config {
     pub enabled_tool_groups: Vec<ToolGroup>,
 }
 
-fn default_provider() -> Provider {
-    Provider::DeepSeek
-}
-
 fn default_max_tokens() -> u64 {
     100_000
 }
@@ -135,61 +142,147 @@ fn default_max_turns() -> usize {
     100
 }
 
-impl Config {
-    pub fn has_tool_group(&self, group: ToolGroup) -> bool {
-        self.enabled_tool_groups.contains(&group)
-    }
-}
-
-// ── loading ──────────────────────────────────────────────────────
-
-/// Load configuration from disk + environment, returning the effective config.
-///
-/// Precedence (highest wins):
-/// 1. `GOOP_MODEL` env var
-/// 2. `GOOP_PROVIDER` env var
-/// 3. `~/.config/goop/config.toml`
-/// 4. hard-coded defaults (DeepSeek, deepseek-v4-pro)
-///
-/// If no config file exists, a default one is written to disk so the user
-/// has something to inspect and edit.
-pub fn load_config() -> anyhow::Result<Config> {
-    let config_path = config_path();
-
-    let mut config = if config_path.exists() {
-        let contents = std::fs::read_to_string(&config_path)?;
-        toml::from_str(&contents)?
-    } else {
-        let defaults = Config {
+impl Default for Config {
+    fn default() -> Self {
+        Self {
             home_dir: home_dir(),
-            provider: default_provider(),
-            model: None, // will be resolved below
+            provider: Provider::default(),
+            model: None,
             max_tokens: default_max_tokens(),
             default_max_turns: default_max_turns(),
             enabled_tool_groups: default_tool_groups(),
-        };
-        write_default_config(&config_path, &defaults)?;
-        defaults
-    };
+        }
+    }
+}
 
-    // Ensure home_dir is always set (won't be from TOML).
+impl Config {
+    /// Whether the given tool group is enabled.
+    pub fn has_tool_group(&self, group: ToolGroup) -> bool {
+        self.enabled_tool_groups.contains(&group)
+    }
+
+    /// Resolve the effective model name (provider default if none set).
+    pub fn effective_model(&self) -> String {
+        self.model
+            .clone()
+            .unwrap_or_else(|| self.provider.default_model().to_string())
+    }
+}
+
+// ── session config ──────────────────────────────────────────────────
+
+/// Per-session overrides for [`Config`].  All fields are optional —
+/// `None` means "defer to the global config".
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_turns: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_tool_groups: Option<Vec<ToolGroup>>,
+}
+
+impl SessionConfig {
+    /// Merge these overrides into a [`Config`].  Any `Some` value here
+    /// replaces the corresponding field in `config`.
+    pub fn merge_into(&self, config: &mut Config) {
+        if let Some(p) = self.provider {
+            config.provider = p;
+        }
+        if let Some(ref m) = self.model {
+            config.model = Some(m.clone());
+        }
+        if let Some(t) = self.max_tokens {
+            config.max_tokens = t;
+        }
+        if let Some(t) = self.default_max_turns {
+            config.default_max_turns = t;
+        }
+        if let Some(ref g) = self.enabled_tool_groups {
+            config.enabled_tool_groups = g.clone();
+        }
+    }
+}
+
+// ── CLI overrides ───────────────────────────────────────────────────
+
+/// Overrides coming from CLI flags (highest precedence).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CliOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+// ── loading ─────────────────────────────────────────────────────────
+
+/// Load configuration by merging all layers.
+///
+/// Precedence (highest wins):
+/// 1. `cli` — CLI flags (`--model`, `--provider`)
+/// 2. `GOOP_PROVIDER`, `GOOP_MODEL` env vars
+/// 3. Session state file (`<name>.state.json` → `config` section)
+/// 4. Global config file (`~/.config/goop/config.toml`)
+/// 5. Hard-coded defaults
+///
+/// If no global config file exists, a default is written before
+/// proceeding (see [`write_default_config`]).
+pub fn load_config(
+    cli: Option<&CliOverrides>,
+    session_name: Option<&str>,
+) -> anyhow::Result<Config> {
+    let global_path = global_config_path();
+
+    // Write a default global config if none exists.
+    if !global_path.exists() {
+        let defaults = Config::default();
+        write_default_config(&global_path, &defaults)?;
+    }
+
+    use figment::Figment;
+    use figment::providers::Format;
+    use figment::providers::{Env, Serialized, Toml};
+
+    let mut fig = Figment::new()
+        // Layer 5: hard-coded defaults
+        .merge(Serialized::defaults(Config::default()))
+        // Layer 4: global config file
+        .merge(Toml::file(&global_path));
+
+    // Layer 3: session config (from <name>.state.json)
+    if let Some(name) = session_name {
+        let state_path = crate::session::session_state_path(name);
+        if state_path.exists() {
+            let session_fig = Figment::new()
+                .merge(Toml::file(&state_path))
+                .select("config");
+            fig = fig.merge(session_fig);
+        }
+    }
+
+    // Layer 2: environment variables
+    fig = fig.merge(Env::prefixed("GOOP_"));
+
+    // Layer 1: CLI overrides
+    if let Some(cli) = cli {
+        fig = fig.merge(Serialized::from(cli, figment::Profile::Default));
+    }
+
+    let mut config: Config = fig.extract()?;
+
+    // home_dir is never in any provider — set it explicitly.
     config.home_dir = home_dir();
-
-    // Env-var overrides.
-    if let Ok(provider_str) = std::env::var("GOOP_PROVIDER") {
-        config.provider = parse_provider(&provider_str)?;
-    }
-    if let Ok(model) = std::env::var("GOOP_MODEL") {
-        config.model = Some(model);
-    }
-
-    // Resolve the effective model name.
-    if config.model.is_none() {
-        config.model = Some(config.provider.default_model().to_string());
-    }
 
     Ok(config)
 }
+
+// ── default config file ─────────────────────────────────────────────
 
 /// Write a well-commented default config file so users have something to
 /// inspect and edit.  Creates the parent directory if needed.
@@ -201,10 +294,7 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
         std::fs::create_dir_all(parent)?;
     }
 
-    let model = config
-        .model
-        .as_deref()
-        .unwrap_or_else(|| config.provider.default_model());
+    let model = config.effective_model();
 
     let groups: Vec<&str> = config
         .enabled_tool_groups
@@ -220,7 +310,7 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
 
     let mut context = tera::Context::new();
     context.insert("provider", serde_lowercase(&config.provider));
-    context.insert("model", model);
+    context.insert("model", &model);
     context.insert("max_tokens", &config.max_tokens);
     context.insert("default_max_turns", &config.default_max_turns);
     context.insert("groups", &groups);
@@ -246,21 +336,7 @@ fn serde_lowercase(p: &Provider) -> &'static str {
     }
 }
 
-fn parse_provider(s: &str) -> anyhow::Result<Provider> {
-    match s.to_lowercase().as_str() {
-        "deepseek" => Ok(Provider::DeepSeek),
-        "openai" => Ok(Provider::OpenAI),
-        "openrouter" => Ok(Provider::OpenRouter),
-        "groq" => Ok(Provider::Groq),
-        "ollama" => Ok(Provider::Ollama),
-        "anthropic" => Ok(Provider::Anthropic),
-        other => anyhow::bail!(
-            "unknown provider '{other}'. Supported: deepseek, openai, openrouter, groq, ollama, anthropic"
-        ),
-    }
-}
-
-// ── helpers ──────────────────────────────────────────────────────
+// ── helpers ─────────────────────────────────────────────────────────
 
 /// Read the API key for the configured provider from its environment variable.
 /// Returns an error if the env var is missing (except for Ollama which needs no key).
@@ -284,14 +360,7 @@ mod tests {
     #[test]
     fn default_config_round_trips() {
         // Simulate what happens on first run: create defaults, write, re-parse.
-        let defaults = Config {
-            home_dir: PathBuf::from("/home/test"),
-            provider: default_provider(),
-            model: None,
-            max_tokens: default_max_tokens(),
-            default_max_turns: default_max_turns(),
-            enabled_tool_groups: default_tool_groups(),
-        };
+        let defaults = Config::default();
 
         let tmp = std::env::temp_dir().join("goop-test-config.toml");
         write_default_config(&tmp, &defaults).unwrap();
@@ -313,5 +382,33 @@ mod tests {
         assert!(contents.contains("goop configuration"));
         assert!(contents.contains("GOOP_PROVIDER"));
         assert!(contents.contains("deepseek"));
+    }
+
+    #[test]
+    fn session_config_merge() {
+        let mut config = Config::default();
+        assert_eq!(config.provider, Provider::DeepSeek);
+
+        let session = SessionConfig {
+            provider: Some(Provider::OpenAI),
+            model: Some("gpt-4o-mini".into()),
+            ..Default::default()
+        };
+        session.merge_into(&mut config);
+
+        assert_eq!(config.provider, Provider::OpenAI);
+        assert_eq!(config.model.as_deref(), Some("gpt-4o-mini"));
+        // Unset fields retain defaults.
+        assert_eq!(config.max_tokens, 100_000);
+    }
+
+    #[test]
+    fn load_config_layering() {
+        // With no env vars set and no session, we get defaults.
+        let config = load_config(None, None).unwrap();
+        assert_eq!(config.provider, Provider::DeepSeek);
+        // The default config file writes the resolved model, so it's
+        // Some on load (not None waiting for lazy resolution).
+        assert_eq!(config.effective_model(), "deepseek-v4-pro");
     }
 }

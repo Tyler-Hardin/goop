@@ -185,8 +185,7 @@ define_tool!(pub(crate) struct Cd, args = CdArgs,
             *ssh_state.remote_cwd.lock().await = canonical.clone();
         }
 
-        let cwd_path = crate::session::sessions_dir().join(format!("{}.cwd", this.state.name));
-        crate::session::save_cwd(&cwd_path, &canonical);
+        this.state.save();
 
         Ok(format!("Changed working directory to {}", canonical.display()))
     }
