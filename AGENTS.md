@@ -99,6 +99,17 @@ The web UI shows a session sidebar for switching between sessions.
 - **FileConversationMemory** (`src/memory.rs`) — implements rig's
   `ConversationMemory` trait backed by a JSONL file on disk. One
   per session at `~/.config/goop/sessions/<name>.messages.jsonl`.
+- **Compaction** (`src/memory.rs`) — `SessionMemory` type alias wraps
+  `FileConversationMemory` in `rig_memory::CompactingMemory` with a
+  `TokenWindowMemory` policy and `TemplateCompactor`.  When the token
+  budget is exceeded, older messages are evicted from the active window
+  and replaced with a rolling text summary (no extra LLM call — the
+  `TemplateCompactor` produces a textual rollup).  The summary cap is
+  4 KiB.  Budget is configured via `compaction` in config.toml (an
+  integer for absolute tokens, or a string like `"80%"` for a percentage
+  of the model's context window, resolved from a built-in lookup table).
+  When not set, the budget is `usize::MAX` (nothing evicted).
+  Env var: `GOOP_COMPACTION`.
 
 ## Startup modes
 
@@ -165,6 +176,11 @@ default_max_turns = 100
 # Available: file_ops, shell, ssh, web_fetch, computer_use
 enabled_tool_groups = ["file_ops", "shell", "ssh", "web_fetch"]
 
+# Token budget for context compaction — when the conversation exceeds this
+# many tokens, older messages are evicted and replaced with a rolling text
+# summary.  Remove or comment out to disable (unlimited context).
+# compaction_token_budget = 64000
+
 # Base URL for the Ollama API.  Only used when provider is ollama.
 # Uncomment and set if Ollama runs on a nonstandard port or remote host.
 # ollama_base_url = "http://localhost:11434"
@@ -173,6 +189,7 @@ enabled_tool_groups = ["file_ops", "shell", "ssh", "web_fetch"]
 Environment variables override the config file:
 - `GOOP_MODEL` — model in `provider/model` format (e.g. `openai/gpt-4o`, `openrouter/openai/gpt-4o`)
 - `GOOP_OLLAMA_BASE_URL` — Ollama API base URL (overrides the `ollama_base_url` config field)
+- `GOOP_COMPACTION_TOKEN_BUDGET` — token budget for context compaction
 - Provider-specific API keys: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`,
   `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`
   (Ollama reads `OLLAMA_API_KEY` for authentication when behind a proxy;

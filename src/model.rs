@@ -16,7 +16,7 @@ use rig::providers::{anthropic, deepseek, groq, ollama, openai, openrouter};
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 
 use crate::config::{self, Config, Provider};
-use crate::memory::FileConversationMemory;
+use crate::memory::SessionMemory;
 use crate::session_state::SessionState;
 
 // ── opaque streaming-response enum ───────────────────────────────
@@ -181,7 +181,7 @@ fn map_assistant<R>(
 pub fn build_agent(
     config: &Config,
     preamble: &str,
-    memory: FileConversationMemory,
+    memory: SessionMemory,
     state: Arc<SessionState>,
     mcp_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
 ) -> anyhow::Result<Arc<AnyAgent>> {
@@ -192,15 +192,21 @@ pub fn build_agent(
     let mut all_tools = tools;
     all_tools.extend(mcp_tools);
 
-    /// One arm body — constructs a provider-specific client and wraps it.
-    /// `all_tools` is moved into the first (and only) executing match arm.
+    // Wrap memory in Option so each match arm can take ownership
+    // without requiring Clone on the (non-Clone) SessionMemory.
+    let mut memory = Some(memory);
+
+    /// One arm body — constructs a provider-specific client, then
+    /// calls finish_agent with the tools and memory taken from `memory`.
     macro_rules! arm {
         ($variant:ident, $new_client:expr) => {{
             let client = $new_client;
             AnyAgent::$variant(finish_agent(
                 client.agent(model_name).preamble(preamble),
                 config,
-                memory.clone(),
+                memory
+                    .take()
+                    .expect("bug: memory already consumed in match"),
                 all_tools,
             ))
         }};
@@ -252,7 +258,7 @@ pub fn build_agent(
 fn finish_agent<M: rig::completion::CompletionModel>(
     builder: rig::agent::AgentBuilder<M>,
     config: &Config,
-    memory: FileConversationMemory,
+    memory: SessionMemory,
     tools: Vec<Box<dyn rig::tool::ToolDyn>>,
 ) -> Agent<M> {
     builder

@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::config::{self, Config, McpServerDef};
 use crate::events::{PromptSource, SessionEvent};
-use crate::memory::FileConversationMemory;
+use crate::memory::build_session_memory;
 use crate::memory::prompt_history_path;
 use crate::model;
 use crate::preamble::build_preamble;
@@ -112,7 +112,6 @@ impl Session {
         let events_path = dir.join(format!("{name}.jsonl"));
         let messages_path = dir.join(format!("{name}.messages.jsonl"));
         let state_path = crate::session_state::state_path(&name);
-        let mem = FileConversationMemory::new(messages_path)?;
         // Load pre-existing events for history replay.
         let existing_events = load_events_from_file(&events_path).unwrap_or_default();
 
@@ -121,6 +120,9 @@ impl Session {
 
         // Merge session config overrides into the global config.
         let merged_config = persisted.config.merge(config);
+
+        // ── memory (file-backed, with optional compaction) ────────
+        let mem = build_session_memory(messages_path, &merged_config)?;
 
         let initial_local_cwd = persisted.local_cwd.clone();
 

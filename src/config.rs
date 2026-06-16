@@ -314,6 +314,64 @@ fn default_enabled_mcp_servers() -> Vec<String> {
 
 // ── config ──────────────────────────────────────────────────────────
 
+/// Compaction budget for the conversation memory.
+///
+/// When set, messages exceeding the budget are evicted from the active
+/// window and replaced with a rolling text summary (no extra LLM call).
+/// `None` disables compaction (unlimited context).
+///
+/// In config files this accepts either a bare integer (absolute tokens)
+/// or a string like `"80%"` (percentage of the model's context window).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum CompactionMode {
+    /// Absolute token budget.
+    Tokens(usize),
+    /// Percentage of the model's context window (0–100).
+    Percent(u8),
+}
+
+impl<'de> Deserialize<'de> for CompactionMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = CompactionMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an integer (absolute tokens) or a string like \"80%\"")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(CompactionMode::Tokens(v as usize))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(CompactionMode::Tokens(v as usize))
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                // "80%" → Percent(80)
+                if let Some(pct_str) = s.strip_suffix('%') {
+                    let pct: u8 = pct_str
+                        .trim()
+                        .parse()
+                        .map_err(|_| E::custom(format_args!("invalid percentage: {s:?}")))?;
+                    if pct > 100 {
+                        return Err(E::custom(format_args!(
+                            "percentage out of range 0–100: {pct}"
+                        )));
+                    }
+                    return Ok(CompactionMode::Percent(pct));
+                }
+                // Bare integer string → Tokens (for env vars like GOOP_COMPACTION=64000)
+                if let Ok(n) = s.trim().parse::<usize>() {
+                    return Ok(CompactionMode::Tokens(n));
+                }
+                Err(E::custom(format_args!(
+                    "expected integer or percentage string like \"80%\", got {s:?}"
+                )))
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
 /// Effective configuration, built by merging all layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -329,6 +387,16 @@ pub struct Config {
     pub max_tokens: u64,
     #[serde(default = "default_max_turns")]
     pub default_max_turns: usize,
+    /// Compaction budget for the conversation memory.
+    ///
+    /// When set, messages exceeding the budget are evicted from the active
+    /// window and replaced with a rolling text summary (no extra LLM call).
+    /// `None` disables compaction (unlimited context).
+    ///
+    /// In config files, either a bare integer (absolute token limit) or a
+    /// string like `"80%"` (percentage of the model's context window).
+    #[serde(default)]
+    pub compaction: Option<CompactionMode>,
     #[serde(default = "default_tool_groups")]
     pub enabled_tool_groups: Vec<ToolGroup>,
 
@@ -369,6 +437,7 @@ impl Default for Config {
             model: default_model(),
             max_tokens: default_max_tokens(),
             default_max_turns: default_max_turns(),
+            compaction: None,
             enabled_tool_groups: default_tool_groups(),
             ollama_base_url: default_ollama_base_url(),
             mcp_servers: default_mcp_servers(),
@@ -407,6 +476,9 @@ pub struct SessionConfig {
     pub max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_max_turns: Option<usize>,
+    /// Override the compaction budget.  `None` means "defer to global".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled_tool_groups: Option<Vec<ToolGroup>>,
     /// Override the Ollama base URL.  `None` means "defer to global".
@@ -437,6 +509,9 @@ impl SessionConfig {
         }
         if let Some(t) = self.default_max_turns {
             merged.default_max_turns = t;
+        }
+        if let Some(ref c) = self.compaction {
+            merged.compaction = Some(c.clone());
         }
         if let Some(ref g) = self.enabled_tool_groups {
             merged.enabled_tool_groups = g.clone();
@@ -853,6 +928,49 @@ command = "my-indexer"
     }
 
     // ── Provider helpers ──────────────────────────────────────────
+
+    // ── CompactionMode deserialization ────────────────────────────
+
+    #[test]
+    fn compaction_mode_tokens_integer() {
+        let toml_str = r#"compaction = 64000"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        match config.compaction {
+            Some(CompactionMode::Tokens(n)) => assert_eq!(n, 64000),
+            other => panic!("expected Tokens(64000), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_mode_percent_string() {
+        let toml_str = r#"compaction = "80%""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        match config.compaction {
+            Some(CompactionMode::Percent(p)) => assert_eq!(p, 80),
+            other => panic!("expected Percent(80), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_mode_none() {
+        let toml_str = r#"model = "openai/gpt-4o""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.compaction.is_none());
+    }
+
+    #[test]
+    fn compaction_mode_invalid_string() {
+        let toml_str = r#"compaction = "bogus""#;
+        let result = toml::from_str::<Config>(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compaction_mode_percent_out_of_range() {
+        let toml_str = r#"compaction = "150%""#;
+        let result = toml::from_str::<Config>(toml_str);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn provider_as_str_roundtrips() {

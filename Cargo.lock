@@ -4149,6 +4149,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rig",
  "rig-derive",
+ "rig-memory",
  "rmcp",
  "russh",
  "russh-sftp",
@@ -8283,6 +8284,16 @@ dependencies = [
  "rig-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rig-memory"
+version = "0.38.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c14d63788f0578145694b75409cdf0df0f5b8641d65743ed6d3d118441ab1149"
+dependencies = [
+ "rig-core",
+ "tracing",
 ]
 
 [[package]]

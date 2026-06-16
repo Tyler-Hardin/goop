@@ -39,3 +39,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 wry = "0.55.1"
 thiserror = "2.0.18"
+rig-memory = "0.38.2"

@@ -1,8 +1,9 @@
 # goop configuration — ~/.config/goop/config.toml
 #
 # Environment variable overrides this file:
-#   GOOP_MODEL             — model in provider/model format (e.g. "deepseek/deepseek-v4-pro")
-#   GOOP_OLLAMA_BASE_URL   — Ollama API base URL (default: http://localhost:11434)
+#   GOOP_MODEL                     — model in provider/model format (e.g. "deepseek/deepseek-v4-pro")
+#   GOOP_OLLAMA_BASE_URL           — Ollama API base URL (default: http://localhost:11434)
+#   GOOP_COMPACTION              — compaction budget (integer or "80%")
 
 # LLM model in litellm-style provider/model format.
 # Provider is the first segment before "/", model is everything after.
@@ -14,6 +15,17 @@ max_tokens = {{ max_tokens }}
 
 # Maximum tool-calling turns per prompt (safety limit).
 default_max_turns = {{ default_max_turns }}
+
+# ── Compaction ──────────────────────────────────────────────────────
+# When the conversation exceeds a token budget, older messages are
+# evicted and replaced with a rolling text summary (no extra LLM call).
+#
+# Accepts either:
+#   compaction = 64000     # absolute token limit
+#   compaction = "75%"      # percentage of model's context window
+#
+# Uncomment to enable.  Leave commented for unlimited context.
+# compaction = "75%"
 
 # Tool groups enabled for the agent.
 # Available: file_ops, shell, ssh, web_fetch, computer_use
