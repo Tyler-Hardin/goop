@@ -12,6 +12,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::events::SessionEvent;
 use crate::memory::prompt_history_path;
+use streamdown_parser::Parser;
+use streamdown_render::Renderer;
 
 // ── ANSI constants ──────────────────────────────────────────────
 
@@ -336,6 +338,81 @@ impl TerminalClient {
 // `()` on `done_tx` so the main loop knows the output is fully
 // visible and it's safe to show the next readline prompt.
 
+/// Owns all mutable rendering state so the event loop can call
+/// methods instead of macros.
+struct RenderState<P: rustyline::ExternalPrinter> {
+    printer: Arc<StdMutex<P>>,
+    term_width: usize,
+    parser: Parser,
+    renderer: Option<Renderer<PrinterWriter<P>>>,
+    line_buf: String,
+    in_turn: bool,
+}
+
+impl<P: rustyline::ExternalPrinter> RenderState<P> {
+    fn new(printer: Arc<StdMutex<P>>, term_width: usize) -> Self {
+        let renderer = Some(Renderer::new(
+            PrinterWriter {
+                printer: printer.clone(),
+                buf: String::new(),
+            },
+            term_width,
+        ));
+        Self {
+            printer,
+            term_width,
+            parser: Parser::new(),
+            renderer,
+            line_buf: String::new(),
+            in_turn: false,
+        }
+    }
+
+    /// Lock the printer mutex for direct (non-markdown) output.
+    fn lock_printer(&self) -> std::sync::MutexGuard<'_, P> {
+        self.printer.lock().expect("printer mutex poisoned")
+    }
+
+    /// Get a mutable reference to the renderer.
+    /// Always `Some` — the renderer is only dropped transiently
+    /// during `reset_renderer`.
+    fn renderer_mut(&mut self) -> &mut Renderer<PrinterWriter<P>> {
+        self.renderer.as_mut().expect("renderer unexpectedly None")
+    }
+
+    /// Drop the renderer (which also drops its inner writer),
+    /// then create a fresh writer + renderer pair.
+    fn reset_renderer(&mut self) {
+        drop(self.renderer.take());
+        self.renderer = Some(Renderer::new(
+            PrinterWriter {
+                printer: self.printer.clone(),
+                buf: String::new(),
+            },
+            self.term_width,
+        ));
+    }
+
+    /// Flush markdown: parse any buffered partial line, then
+    /// finalize the parser and render events.
+    fn flush_markdown(&mut self) {
+        if !self.line_buf.is_empty() {
+            let events = self.parser.parse_line(&self.line_buf);
+            let r = self.renderer_mut();
+            for evt in &events {
+                r.render_event(evt).expect("markdown render_event failed");
+            }
+            self.line_buf.clear();
+        }
+        let events = self.parser.finalize();
+        let r = self.renderer_mut();
+        for evt in &events {
+            r.render_event(evt)
+                .expect("markdown finalize render_event failed");
+        }
+    }
+}
+
 pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
     printer: Arc<StdMutex<P>>,
     mut events: mpsc::UnboundedReceiver<SessionEvent>,
@@ -343,82 +420,14 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
     term_width: usize,
 ) {
     use crate::events::PromptSource;
-    use streamdown_parser::Parser;
-    use streamdown_render::Renderer;
 
-    let mut parser = Parser::new();
-
-    // The renderer owns its writer.  We recreate the pair at turn
-    // boundaries.  Non-markdown output (tool headers, prompts,
-    // etc.) goes directly to `printer`.
-    let mut renderer: Option<Renderer<PrinterWriter<P>>> = Some(Renderer::new(
-        PrinterWriter {
-            printer: printer.clone(),
-            buf: String::new(),
-        },
-        term_width,
-    ));
-
-    let mut line_buf = String::new();
-    let mut in_turn = false;
-
-    /// Drop the renderer (which also drops its inner writer),
-    /// then create a fresh writer + renderer pair.
-    macro_rules! reset_renderer {
-        ($renderer:expr, $printer:expr) => {
-            drop($renderer.take());
-            $renderer = Some(Renderer::new(
-                PrinterWriter {
-                    printer: ($printer).clone(),
-                    buf: String::new(),
-                },
-                term_width,
-            ));
-        };
-    }
-
-    /// Flush markdown: parse any buffered partial line, then
-    /// finalize the parser and render events.
-    macro_rules! flush_markdown {
-        ($parser:expr, $renderer:expr, $line_buf:expr) => {
-            if !$line_buf.is_empty() {
-                let events = $parser.parse_line(&$line_buf);
-                for evt in &events {
-                    $renderer
-                        .render_event(evt)
-                        .expect("markdown render_event failed");
-                }
-                $line_buf.clear();
-            }
-            let events = $parser.finalize();
-            for evt in &events {
-                $renderer
-                    .render_event(evt)
-                    .expect("markdown finalize render_event failed");
-            }
-        };
-    }
-
-    /// Helper to get a mutable reference to the renderer.
-    /// Always `Some` at the call sites — the renderer is only
-    /// dropped transiently during `reset_renderer!`.
-    macro_rules! renderer_mut {
-        ($renderer:expr) => {
-            $renderer.as_mut().expect("renderer unexpectedly None")
-        };
-    }
-
-    /// Lock the printer mutex for direct (non-markdown) output.
-    macro_rules! lock_printer {
-        ($printer:expr) => {
-            $printer.lock().expect("printer mutex poisoned")
-        };
-    }
+    let mut state = RenderState::new(printer, term_width);
 
     while let Some(event) = events.recv().await {
         match event {
             SessionEvent::SessionInfo { ref name } => {
-                lock_printer!(printer)
+                state
+                    .lock_printer()
                     .print(format!("{DIM}  ● session {name}{RST}\n"))
                     .ok();
             }
@@ -434,34 +443,35 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 // Don't echo back what the user just typed in
                 // the terminal — they already saw it.
                 if *source == PromptSource::Terminal {
-                    in_turn = true;
+                    state.in_turn = true;
                     continue;
                 }
 
                 // Finish previous turn.
-                if in_turn {
-                    flush_markdown!(parser, renderer_mut!(renderer), line_buf);
-                    reset_renderer!(renderer, printer);
+                if state.in_turn {
+                    state.flush_markdown();
+                    state.reset_renderer();
                 }
 
                 // Start new turn.
-                parser = Parser::new();
-                line_buf.clear();
-                in_turn = true;
+                state.parser = Parser::new();
+                state.line_buf.clear();
+                state.in_turn = true;
 
                 let prompt = ellipsize(content, 80);
-                lock_printer!(printer)
+                state
+                    .lock_printer()
                     .print(format!("{BOLD}{CYAN}»{RST} {prompt}\n"))
                     .ok();
             }
 
             SessionEvent::AssistantText(text) => {
-                line_buf.push_str(&text);
-                while let Some(pos) = line_buf.find('\n') {
-                    let complete = line_buf[..pos].to_string();
-                    line_buf = line_buf[pos + 1..].to_string();
-                    let events = parser.parse_line(&complete);
-                    let r = renderer_mut!(renderer);
+                state.line_buf.push_str(&text);
+                while let Some(pos) = state.line_buf.find('\n') {
+                    let complete = state.line_buf[..pos].to_string();
+                    state.line_buf = state.line_buf[pos + 1..].to_string();
+                    let events = state.parser.parse_line(&complete);
+                    let r = state.renderer_mut();
                     for evt in &events {
                         r.render_event(evt).expect("markdown render_event failed");
                     }
@@ -472,12 +482,13 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 ref name,
                 ref arguments,
             } => {
-                flush_markdown!(parser, renderer_mut!(renderer), line_buf);
-                reset_renderer!(renderer, printer);
-                parser = Parser::new();
-                line_buf.clear();
+                state.flush_markdown();
+                state.reset_renderer();
+                state.parser = Parser::new();
+                state.line_buf.clear();
 
-                lock_printer!(printer)
+                state
+                    .lock_printer()
                     .print(format!(
                         "{DIM}  ────────────────────────────────────────{RST}\n\
                          {BOLD}  ▸ {name}{RST}\n"
@@ -491,7 +502,8 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                                 serde_json::Value::String(s) => s.clone(),
                                 other => other.to_string(),
                             };
-                            lock_printer!(printer)
+                            state
+                                .lock_printer()
                                 .print(format!(
                                     "    {BOLD}{key}:{RST} {GREEN}{}{RST}\n",
                                     ellipsize(&display_val, MAX_ARG_LEN)
@@ -500,7 +512,8 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                         }
                     }
                     other => {
-                        lock_printer!(printer)
+                        state
+                            .lock_printer()
                             .print(format!(
                                 "    {BOLD}args:{RST} {GREEN}{}{RST}\n",
                                 ellipsize(&other.to_string(), MAX_ARG_LEN)
@@ -513,7 +526,8 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             SessionEvent::ToolResult { ref content } => {
                 if !content.is_empty() {
                     let displayed = ellipsize(content, MAX_RESULT_LEN);
-                    lock_printer!(printer)
+                    state
+                        .lock_printer()
                         .print(format!("{DIM}{displayed}{RST}\n"))
                         .ok();
                 }
@@ -522,33 +536,35 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             SessionEvent::Thinking => { /* implicit */ }
 
             SessionEvent::FinalResponse => {
-                flush_markdown!(parser, renderer_mut!(renderer), line_buf);
-                reset_renderer!(renderer, printer);
-                parser = Parser::new();
-                line_buf.clear();
-                in_turn = false;
+                state.flush_markdown();
+                state.reset_renderer();
+                state.parser = Parser::new();
+                state.line_buf.clear();
+                state.in_turn = false;
                 done_tx.send(()).ok();
             }
 
             SessionEvent::Cancelled => {
                 // Flush any partial markdown, then signal done.
-                flush_markdown!(parser, renderer_mut!(renderer), line_buf);
-                reset_renderer!(renderer, printer);
-                parser = Parser::new();
-                line_buf.clear();
-                lock_printer!(printer)
+                state.flush_markdown();
+                state.reset_renderer();
+                state.parser = Parser::new();
+                state.line_buf.clear();
+                state
+                    .lock_printer()
                     .print(format!("{DIM}cancelled.{RST}\n"))
                     .ok();
-                in_turn = false;
+                state.in_turn = false;
                 done_tx.send(()).ok();
             }
 
             SessionEvent::Error(e) => {
-                line_buf.clear();
-                lock_printer!(printer)
+                state.line_buf.clear();
+                state
+                    .lock_printer()
                     .print(format!("\x1b[1;31merror:\x1b[0m {e}\n"))
                     .ok();
-                in_turn = false;
+                state.in_turn = false;
                 done_tx.send(()).ok();
             }
         }
