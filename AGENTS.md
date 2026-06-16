@@ -387,8 +387,11 @@ with origin validation).
 - All async I/O uses tokio (full features).
 - Tools implement `rig::tool::Tool` (manually, not via `#[rig_tool]`). Each
   tool struct holds `Arc<SessionState>` for CWD/transport/home_dir access.
-- `Config::home_dir` is the single source of truth for `$HOME` — no other
-  module reads `std::env::var("HOME")`.
+- `Config::home_dir` is the single source of truth for `$HOME` — computed
+  via the `dirs` crate (`dirs::home_dir()`).  No module reads
+  `std::env::var("HOME")`.
+- Config directory is determined via `dirs::config_dir()` + `"goop"`,
+  not hardcoded `~/.config/goop`.
 - Tool groups are gated via `Config::enabled_tool_groups` (a `Vec<ToolGroup>`
   in `config.toml`).  `build_tools()` produces a `Vec<Box<dyn ToolDyn>>` at
   agent construction time — disabled groups simply aren't included.

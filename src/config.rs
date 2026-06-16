@@ -17,15 +17,17 @@ use serde::{Deserialize, Serialize};
 
 // ── paths ───────────────────────────────────────────────────────────
 
-/// Return the user's home directory, computing it once at startup.
+/// Return the user's home directory (via the `dirs` crate).
 pub fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Return the goop config directory: `$XDG_CONFIG_HOME/goop` (or
+/// platform-appropriate equivalent via the `dirs` crate).
 pub fn config_dir() -> PathBuf {
-    home_dir().join(".config").join("goop")
+    dirs::config_dir()
+        .map(|p| p.join("goop"))
+        .unwrap_or_else(|| PathBuf::from(".config/goop"))
 }
 
 pub fn global_config_path() -> PathBuf {
