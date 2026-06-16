@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 use rig::agent::Agent;
-use rig::client::{CompletionClient, ProviderClient};
+use rig::client::CompletionClient;
 use rig::providers::{anthropic, deepseek, groq, ollama, openai, openrouter};
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 
@@ -186,7 +186,6 @@ pub fn build_agent(
 ) -> anyhow::Result<Arc<AnyAgent>> {
     let provider = config.provider();
     let model_name = config.model_name();
-    let api_key = config::api_key_for(provider)?;
 
     let tools = crate::tools::build_tools(config, &state);
 
@@ -204,12 +203,35 @@ pub fn build_agent(
     }
 
     let any_agent = match provider {
-        Provider::DeepSeek => arm!(DeepSeek, deepseek::Client::new(&api_key)?),
-        Provider::OpenAI => arm!(OpenAI, openai::CompletionsClient::new(&api_key)?),
-        Provider::OpenRouter => arm!(OpenRouter, openrouter::Client::new(&api_key)?),
-        Provider::Groq => arm!(Groq, groq::Client::new(&api_key)?),
-        Provider::Ollama => arm!(Ollama, ollama::Client::from_env()?),
-        Provider::Anthropic => arm!(Anthropic, anthropic::Client::new(&api_key)?),
+        Provider::DeepSeek => arm!(
+            DeepSeek,
+            deepseek::Client::new(&config::api_key_for(provider)?)?
+        ),
+        Provider::OpenAI => arm!(
+            OpenAI,
+            openai::CompletionsClient::new(&config::api_key_for(provider)?)?
+        ),
+        Provider::OpenRouter => arm!(
+            OpenRouter,
+            openrouter::Client::new(&config::api_key_for(provider)?)?
+        ),
+        Provider::Groq => arm!(Groq, groq::Client::new(&config::api_key_for(provider)?)?),
+        Provider::Ollama => {
+            let ollama_api_key = std::env::var("OLLAMA_API_KEY").ok();
+            arm!(
+                Ollama,
+                ollama::Client::builder()
+                    .api_key(ollama::OllamaApiKey::from(
+                        ollama_api_key.unwrap_or_default().as_str(),
+                    ))
+                    .base_url(&config.ollama_base_url)
+                    .build()?
+            )
+        }
+        Provider::Anthropic => arm!(
+            Anthropic,
+            anthropic::Client::new(&config::api_key_for(provider)?)?
+        ),
     };
 
     tracing::info!("● provider · {}  model · {}", provider.label(), model_name);

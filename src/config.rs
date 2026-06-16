@@ -168,6 +168,11 @@ pub struct Config {
     pub default_max_turns: usize,
     #[serde(default = "default_tool_groups")]
     pub enabled_tool_groups: Vec<ToolGroup>,
+
+    /// Base URL for the Ollama API.  Only used when provider is `ollama`.
+    /// Override via `GOOP_OLLAMA_BASE_URL` env var or `ollama_base_url` in config.toml.
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
 }
 
 fn default_model() -> String {
@@ -182,6 +187,10 @@ fn default_max_turns() -> usize {
     100
 }
 
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -190,6 +199,7 @@ impl Default for Config {
             max_tokens: default_max_tokens(),
             default_max_turns: default_max_turns(),
             enabled_tool_groups: default_tool_groups(),
+            ollama_base_url: default_ollama_base_url(),
         }
     }
 }
@@ -236,6 +246,9 @@ pub struct SessionConfig {
     pub default_max_turns: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled_tool_groups: Option<Vec<ToolGroup>>,
+    /// Override the Ollama base URL.  `None` means "defer to global".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ollama_base_url: Option<String>,
 }
 
 impl SessionConfig {
@@ -253,6 +266,9 @@ impl SessionConfig {
         }
         if let Some(ref g) = self.enabled_tool_groups {
             config.enabled_tool_groups = g.clone();
+        }
+        if let Some(ref u) = self.ollama_base_url {
+            config.ollama_base_url = u.clone();
         }
     }
 }
@@ -360,6 +376,7 @@ fn write_default_config(path: &std::path::Path, config: &Config) -> anyhow::Resu
     context.insert("max_tokens", &config.max_tokens);
     context.insert("default_max_turns", &config.default_max_turns);
     context.insert("groups", &groups);
+    context.insert("ollama_base_url", &config.ollama_base_url);
 
     let template = include_str!("../assets/default_config.toml");
     let contents = tera::Tera::one_off(template, &context, false)

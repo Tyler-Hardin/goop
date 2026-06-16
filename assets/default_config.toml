@@ -1,7 +1,8 @@
 # goop configuration — ~/.config/goop/config.toml
 #
 # Environment variable overrides this file:
-#   GOOP_MODEL  — model in provider/model format (e.g. "deepseek/deepseek-v4-pro")
+#   GOOP_MODEL             — model in provider/model format (e.g. "deepseek/deepseek-v4-pro")
+#   GOOP_OLLAMA_BASE_URL   — Ollama API base URL (default: http://localhost:11434)
 
 # LLM model in litellm-style provider/model format.
 # Provider is the first segment before "/", model is everything after.
@@ -17,3 +18,7 @@ default_max_turns = {{ default_max_turns }}
 # Tool groups enabled for the agent.
 # Available: file_ops, shell, ssh, web_fetch, computer_use
 enabled_tool_groups = [{% for g in groups %}"{{ g }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+
+# Base URL for the Ollama API.  Only used when provider is ollama.
+# Set this if Ollama runs on a nonstandard port or remote host.
+# ollama_base_url = "{{ ollama_base_url }}"
