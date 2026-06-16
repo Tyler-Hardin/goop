@@ -853,8 +853,10 @@
           ws = null;
         }
 
-        // Clear UI.
+        // Clear UI and reset running state (the old session's
+        // FinalResponse/Cancelled events went to the closed socket).
         clearMessages();
+        setRunning(false);
         currentSession = name;
         titleEl.textContent = name;
         updateHash();
@@ -891,6 +893,7 @@
             ws = null;
           }
           clearMessages();
+          setRunning(false);
           currentSession = null;
           titleEl.textContent = "goop";
           updateHash();
@@ -957,6 +960,10 @@
       // ── event handling ───────────────────────────────
       function handle(evt) {
         switch (evt.type) {
+          case "SessionState":
+            setRunning(evt.data.running);
+            return;
+
           case "UserPrompt":
             append("user", evt.data.content);
             scrollDown(true);

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Local;
 use futures::StreamExt;
@@ -63,6 +64,10 @@ pub struct Session {
     /// Set by `cancel()` and consumed by the currently-running turn.
     /// When the sender is dropped or fired, the turn is cancelled.
     cancel_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+
+    /// Whether the session is currently processing a prompt.
+    /// Used to tell late-joining clients whether to show a Cancel button.
+    is_running: AtomicBool,
 
     /// If set, every event is appended to this file as JSONL.
     events_file: Option<PathBuf>,
@@ -190,6 +195,7 @@ impl Session {
             history: Mutex::new(existing_events),
             submit_tx,
             cancel_tx: std::sync::Mutex::new(None),
+            is_running: AtomicBool::new(false),
             events_file: Some(events_path),
         });
 
@@ -227,6 +233,11 @@ impl Session {
         &self.name
     }
 
+    /// Whether the session is currently processing a prompt.
+    pub fn is_running(&self) -> bool {
+        self.is_running.load(Ordering::SeqCst)
+    }
+
     // ── subscribe ────────────────────────────────────────────────
 
     /// Subscribe to **live events only**.
@@ -243,8 +254,12 @@ impl Session {
     /// Late-joining views (web, phone, …) receive every event since
     /// session creation before transitioning to live events.
     pub async fn subscribe_all(&self) -> SessionSubscriber {
-        let history = self.history.lock().await.clone();
+        let mut history = self.history.lock().await.clone();
         let rx = self.tx.subscribe();
+        // Let late-joining clients know whether the session is mid-conversation.
+        if self.is_running() {
+            history.push(SessionEvent::SessionState { running: true });
+        }
         SessionSubscriber { history, rx }
     }
 
@@ -278,6 +293,7 @@ impl Session {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         *self.cancel_tx.lock().unwrap() = Some(cancel_tx);
 
+        self.is_running.store(true, Ordering::SeqCst);
         self.emit(SessionEvent::Thinking).await;
 
         // No more SESSION_ID task-local — tools receive SessionState directly.
@@ -291,6 +307,7 @@ impl Session {
                     biased;
 
                     _ = &mut cancel_rx => {
+                        self.is_running.store(false, Ordering::SeqCst);
                         self.emit(SessionEvent::Cancelled).await;
                         return;
                     }
@@ -374,6 +391,7 @@ impl Session {
     /// Remove the cancel sender for the current turn (turn ending normally).
     fn clear_cancel(&self) {
         self.cancel_tx.lock().unwrap().take();
+        self.is_running.store(false, Ordering::SeqCst);
     }
 
     /// Send an event to live subscribers, append to history, and

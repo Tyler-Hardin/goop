@@ -18,6 +18,11 @@ pub enum SessionEvent {
     /// session name for copy/paste at exit.
     SessionInfo { name: String },
 
+    /// The session is currently processing a prompt (true) or idle (false).
+    /// Sent to late-joining clients after history replay so they know
+    /// whether to show a Cancel button. Not persisted to disk.
+    SessionState { running: bool },
+
     /// A user submitted a prompt.  Arrives *before* Thinking.
     UserPrompt {
         content: String,

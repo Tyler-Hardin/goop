@@ -392,6 +392,10 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                     .ok();
             }
 
+            // Web/GUI clients use this to show/hide a Cancel button;
+            // the terminal tracks its own in-turn state.
+            SessionEvent::SessionState { .. } => {}
+
             SessionEvent::UserPrompt {
                 ref content,
                 ref source,
