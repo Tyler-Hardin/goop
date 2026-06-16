@@ -243,6 +243,11 @@
 
       /* ── message list ─────────────────────────────── */
 
+      /* Do NOT set scroll-behavior: smooth here.  Auto-scroll during
+         LLM streaming sets scrollTop on every animation frame; smooth
+         scrolling can never catch up because the target keeps moving.
+         scrollDown() uses scrollTo({ behavior: "auto" }) explicitly. */
+
       main {
         flex: 1;
         overflow-y: auto;
@@ -250,7 +255,6 @@
         display: flex;
         flex-direction: column;
         gap: 14px;
-        scroll-behavior: smooth;
         -webkit-overflow-scrolling: touch;
         background:
           radial-gradient(
@@ -804,6 +808,7 @@
       let buf = "";
       let running = false;
       let lastToolEl = null;
+      let userAtBottom = true; // tracks whether user has scrolled away
 
       // ── sidebar toggle (mobile) ─────────────────────
       menuBtn.addEventListener("click", () => {
@@ -1064,6 +1069,7 @@
         assistantEl = null;
         buf = "";
         lastToolEl = null;
+        userAtBottom = true;
         // Re-add empty state.
         log.appendChild(emptyState);
       }
@@ -1104,15 +1110,21 @@
       }
 
       function scrollDown(force) {
-        requestAnimationFrame(() => {
-          const threshold = 50;
-          const atBottom =
-            log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
-          if (force || atBottom) {
-            log.scrollTop = log.scrollHeight;
-          }
-        });
+        if (force || userAtBottom) {
+          requestAnimationFrame(() => {
+            log.scrollTo({ top: log.scrollHeight, behavior: "auto" });
+          });
+        }
       }
+
+      // Track whether the user is scrolled to the bottom.  The scroll
+      // event fires on both user-initiated and programmatic scrolls, so
+      // this stays correct regardless of who moved the viewport.
+      log.addEventListener("scroll", () => {
+        const threshold = 50;
+        userAtBottom =
+          log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
+      });
 
       // ── input ────────────────────────────────────
       input.addEventListener("input", () => {
