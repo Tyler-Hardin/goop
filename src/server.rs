@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get};
 use futures::{SinkExt, StreamExt};
@@ -14,6 +14,9 @@ use crate::events::PromptSource;
 use crate::session::{Session, SessionManager};
 
 const PAGE: &str = include_str!("../assets/index.html");
+const MANIFEST: &str = include_str!("../assets/manifest.json");
+const SERVICE_WORKER: &str = include_str!("../assets/sw.js");
+const ICON: &[u8] = include_bytes!("../assets/goop_icon_full.png");
 
 /// Build the axum router (exposed so GUI mode can bind the listener
 /// synchronously before opening the webview).
@@ -24,6 +27,10 @@ pub fn build_router(manager: Arc<SessionManager>) -> Router {
         .route("/ws", get(ws_handler))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}", delete(delete_session))
+        .route("/manifest.json", get(manifest))
+        .route("/sw.js", get(service_worker))
+        .route("/icon-192.png", get(icon_192))
+        .route("/icon-512.png", get(icon_512))
         .with_state(state)
 }
 
@@ -47,6 +54,40 @@ struct ServerState {
 
 async fn index() -> Html<&'static str> {
     Html(PAGE)
+}
+
+// ── PWA static assets ────────────────────────────────────────────
+
+async fn manifest() -> (
+    StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/manifest+json")],
+        MANIFEST,
+    )
+}
+
+async fn service_worker() -> (
+    StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/javascript")],
+        SERVICE_WORKER,
+    )
+}
+
+async fn icon_192() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], ICON)
+}
+
+async fn icon_512() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], ICON)
 }
 
 // ── REST API ────────────────────────────────────────────────────

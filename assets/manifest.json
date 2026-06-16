@@ -1,0 +1,23 @@
+{
+  "name": "goop — AI Agent REPL",
+  "short_name": "goop",
+  "description": "AI agent REPL with terminal and desktop GUI",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#0c0e12",
+  "background_color": "#0c0e12",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
