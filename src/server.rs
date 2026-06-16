@@ -158,7 +158,8 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    let json = serde_json::to_string(&event).unwrap();
+                    let json = serde_json::to_string(&event)
+                        .expect("SessionEvent serialization should never fail");
                     if tx
                         .send(axum::extract::ws::Message::Text(json.into()))
                         .await

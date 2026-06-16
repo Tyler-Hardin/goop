@@ -19,7 +19,9 @@ pub fn build_preamble(cwd: &str, home_dir: &Path) -> String {
     let user_md_path = home_dir.join(".config").join("goop").join("USER.md");
     let user_md = {
         if !user_md_path.exists() {
-            let parent = user_md_path.parent().unwrap(); // always has a parent
+            let parent = user_md_path
+                .parent()
+                .expect("user_md_path always has a parent");
             let _ = std::fs::create_dir_all(parent);
             let _ = std::fs::write(&user_md_path, "");
         }

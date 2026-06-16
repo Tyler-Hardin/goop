@@ -190,15 +190,13 @@ pub fn build_agent(
 
     let tools = crate::tools::build_tools(config, &state);
 
-    let mut memory = Some(memory);
-
     let any_agent = match provider {
         Provider::DeepSeek => {
             let client = deepseek::Client::new(&api_key)?;
             AnyAgent::DeepSeek(finish_agent(
                 client.agent(model_name).preamble(preamble),
                 config,
-                memory.take().unwrap(),
+                memory,
                 tools,
             ))
         }
@@ -207,7 +205,7 @@ pub fn build_agent(
             AnyAgent::OpenAI(finish_agent(
                 client.agent(model_name).preamble(preamble),
                 config,
-                memory.take().unwrap(),
+                memory,
                 tools,
             ))
         }
@@ -216,7 +214,7 @@ pub fn build_agent(
             AnyAgent::OpenRouter(finish_agent(
                 client.agent(model_name).preamble(preamble),
                 config,
-                memory.take().unwrap(),
+                memory,
                 tools,
             ))
         }
@@ -225,7 +223,7 @@ pub fn build_agent(
             AnyAgent::Groq(finish_agent(
                 client.agent(model_name).preamble(preamble),
                 config,
-                memory.take().unwrap(),
+                memory,
                 tools,
             ))
         }
@@ -234,7 +232,7 @@ pub fn build_agent(
             AnyAgent::Ollama(finish_agent(
                 client.agent(model_name).preamble(preamble),
                 config,
-                memory.take().unwrap(),
+                memory,
                 tools,
             ))
         }
@@ -243,7 +241,7 @@ pub fn build_agent(
             AnyAgent::Anthropic(finish_agent(
                 client.agent(model_name).preamble(preamble),
                 config,
-                memory.take().unwrap(),
+                memory,
                 tools,
             ))
         }

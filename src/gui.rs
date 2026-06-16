@@ -71,7 +71,9 @@ fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> any
     rt.spawn(async move {
         let _ = ready_tx.send(());
         tracing::info!("web server on http://127.0.0.1:8187");
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app)
+            .await
+            .expect("server exited unexpectedly");
     });
 
     let _ = ready_rx.recv();

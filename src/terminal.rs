@@ -53,7 +53,11 @@ impl<P: rustyline::ExternalPrinter> PrinterWriter<P> {
     fn flush_buf(&mut self) {
         if !self.buf.is_empty() {
             let line = std::mem::take(&mut self.buf);
-            self.printer.lock().unwrap().print(line).ok();
+            self.printer
+                .lock()
+                .expect("printer mutex poisoned")
+                .print(line)
+                .ok();
         }
     }
 }
@@ -68,7 +72,7 @@ impl<P: rustyline::ExternalPrinter> std::io::Write for PrinterWriter<P> {
             self.buf = self.buf[pos + 1..].to_string();
             self.printer
                 .lock()
-                .unwrap()
+                .expect("printer mutex poisoned")
                 .print(line)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
         }
@@ -170,7 +174,9 @@ impl TerminalClient {
                                     rl.add_history_entry(&trimmed).ok();
                                     input_tx.send(Some(trimmed)).ok();
                                 }
-                                if let Some(rx) = thread_ready.lock().unwrap().as_mut() {
+                                if let Some(rx) =
+                                    thread_ready.lock().expect("ready mutex poisoned").as_mut()
+                                {
                                     if rx.blocking_recv().is_none() {
                                         break 'outer;
                                     }
@@ -220,7 +226,8 @@ impl TerminalClient {
                         };
                         // Capture session name when we see SessionInfo.
                         if let SessionEvent::SessionInfo { ref name } = event {
-                            *ws_session_name.lock().unwrap() = Some(name.clone());
+                            *ws_session_name.lock().expect("session name mutex poisoned") =
+                                Some(name.clone());
                         }
                         // Suppress UserPrompt echoes — the terminal
                         // user already saw their input on the readline.
@@ -258,7 +265,10 @@ impl TerminalClient {
                     {
                         let mut tx = ws_tx.lock().await;
                         if tx.send(Message::Text(payload.into())).await.is_err() {
-                            let name = session_name.lock().unwrap().clone();
+                            let name = session_name
+                                .lock()
+                                .expect("session name mutex poisoned")
+                                .clone();
                             print_exit_banner(&name).await;
                             break;
                         }
@@ -275,9 +285,9 @@ impl TerminalClient {
                             _ = tokio::signal::ctrl_c() => {
                                 if cancelled {
                                     // Second Ctrl+C → exit.
-                                    let name = session_name.lock().unwrap().clone();
+                                    let name = session_name.lock().expect("session name mutex poisoned").clone();
                                     print_exit_banner(&name).await;
-                                    *ready_rx.lock().unwrap() = None;
+                                    *ready_rx.lock().expect("ready mutex poisoned") = None;
                                     drop(ev_tx);
                                     render_handle.abort();
                                     fwd_handle.abort();
@@ -296,9 +306,12 @@ impl TerminalClient {
                     ready_tx.send(()).ok();
                 }
                 _ => {
-                    let name = session_name.lock().unwrap().clone();
+                    let name = session_name
+                        .lock()
+                        .expect("session name mutex poisoned")
+                        .clone();
                     print_exit_banner(&name).await;
-                    *ready_rx.lock().unwrap() = None;
+                    *ready_rx.lock().expect("ready mutex poisoned") = None;
                     break;
                 }
             }
@@ -371,23 +384,41 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             if !$line_buf.is_empty() {
                 let events = $parser.parse_line(&$line_buf);
                 for evt in &events {
-                    $renderer.render_event(evt).unwrap();
+                    $renderer
+                        .render_event(evt)
+                        .expect("markdown render_event failed");
                 }
                 $line_buf.clear();
             }
             let events = $parser.finalize();
             for evt in &events {
-                $renderer.render_event(evt).unwrap();
+                $renderer
+                    .render_event(evt)
+                    .expect("markdown finalize render_event failed");
             }
+        };
+    }
+
+    /// Helper to get a mutable reference to the renderer.
+    /// Always `Some` at the call sites — the renderer is only
+    /// dropped transiently during `reset_renderer!`.
+    macro_rules! renderer_mut {
+        ($renderer:expr) => {
+            $renderer.as_mut().expect("renderer unexpectedly None")
+        };
+    }
+
+    /// Lock the printer mutex for direct (non-markdown) output.
+    macro_rules! lock_printer {
+        ($printer:expr) => {
+            $printer.lock().expect("printer mutex poisoned")
         };
     }
 
     while let Some(event) = events.recv().await {
         match event {
             SessionEvent::SessionInfo { ref name } => {
-                printer
-                    .lock()
-                    .unwrap()
+                lock_printer!(printer)
                     .print(format!("{DIM}  ● session {name}{RST}\n"))
                     .ok();
             }
@@ -409,7 +440,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
 
                 // Finish previous turn.
                 if in_turn {
-                    flush_markdown!(parser, renderer.as_mut().unwrap(), line_buf);
+                    flush_markdown!(parser, renderer_mut!(renderer), line_buf);
                     reset_renderer!(renderer, printer);
                 }
 
@@ -419,9 +450,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 in_turn = true;
 
                 let prompt = ellipsize(content, 80);
-                printer
-                    .lock()
-                    .unwrap()
+                lock_printer!(printer)
                     .print(format!("{BOLD}{CYAN}»{RST} {prompt}\n"))
                     .ok();
             }
@@ -432,9 +461,9 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                     let complete = line_buf[..pos].to_string();
                     line_buf = line_buf[pos + 1..].to_string();
                     let events = parser.parse_line(&complete);
-                    let r = renderer.as_mut().unwrap();
+                    let r = renderer_mut!(renderer);
                     for evt in &events {
-                        r.render_event(evt).unwrap();
+                        r.render_event(evt).expect("markdown render_event failed");
                     }
                 }
             }
@@ -443,14 +472,12 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 ref name,
                 ref arguments,
             } => {
-                flush_markdown!(parser, renderer.as_mut().unwrap(), line_buf);
+                flush_markdown!(parser, renderer_mut!(renderer), line_buf);
                 reset_renderer!(renderer, printer);
                 parser = Parser::new();
                 line_buf.clear();
 
-                printer
-                    .lock()
-                    .unwrap()
+                lock_printer!(printer)
                     .print(format!(
                         "{DIM}  ────────────────────────────────────────{RST}\n\
                          {BOLD}  ▸ {name}{RST}\n"
@@ -464,9 +491,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                                 serde_json::Value::String(s) => s.clone(),
                                 other => other.to_string(),
                             };
-                            printer
-                                .lock()
-                                .unwrap()
+                            lock_printer!(printer)
                                 .print(format!(
                                     "    {BOLD}{key}:{RST} {GREEN}{}{RST}\n",
                                     ellipsize(&display_val, MAX_ARG_LEN)
@@ -475,9 +500,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                         }
                     }
                     other => {
-                        printer
-                            .lock()
-                            .unwrap()
+                        lock_printer!(printer)
                             .print(format!(
                                 "    {BOLD}args:{RST} {GREEN}{}{RST}\n",
                                 ellipsize(&other.to_string(), MAX_ARG_LEN)
@@ -490,9 +513,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             SessionEvent::ToolResult { ref content } => {
                 if !content.is_empty() {
                     let displayed = ellipsize(content, MAX_RESULT_LEN);
-                    printer
-                        .lock()
-                        .unwrap()
+                    lock_printer!(printer)
                         .print(format!("{DIM}{displayed}{RST}\n"))
                         .ok();
                 }
@@ -501,7 +522,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             SessionEvent::Thinking => { /* implicit */ }
 
             SessionEvent::FinalResponse => {
-                flush_markdown!(parser, renderer.as_mut().unwrap(), line_buf);
+                flush_markdown!(parser, renderer_mut!(renderer), line_buf);
                 reset_renderer!(renderer, printer);
                 parser = Parser::new();
                 line_buf.clear();
@@ -511,13 +532,11 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
 
             SessionEvent::Cancelled => {
                 // Flush any partial markdown, then signal done.
-                flush_markdown!(parser, renderer.as_mut().unwrap(), line_buf);
+                flush_markdown!(parser, renderer_mut!(renderer), line_buf);
                 reset_renderer!(renderer, printer);
                 parser = Parser::new();
                 line_buf.clear();
-                printer
-                    .lock()
-                    .unwrap()
+                lock_printer!(printer)
                     .print(format!("{DIM}cancelled.{RST}\n"))
                     .ok();
                 in_turn = false;
@@ -526,9 +545,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
 
             SessionEvent::Error(e) => {
                 line_buf.clear();
-                printer
-                    .lock()
-                    .unwrap()
+                lock_printer!(printer)
                     .print(format!("\x1b[1;31merror:\x1b[0m {e}\n"))
                     .ok();
                 in_turn = false;

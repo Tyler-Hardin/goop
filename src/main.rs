@@ -87,9 +87,11 @@ async fn start_server_in_background() -> anyhow::Result<()> {
         let app = server::build_router(manager);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:8187")
             .await
-            .unwrap();
+            .expect("failed to bind to 127.0.0.1:8187");
         let _ = ready_tx.send(());
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app)
+            .await
+            .expect("server exited unexpectedly");
     });
     ready_rx.await?;
     Ok(())
