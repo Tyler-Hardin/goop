@@ -66,6 +66,8 @@
         font-size: 15px;
         line-height: 1.55;
         -webkit-font-smoothing: antialiased;
+        /* overscroll-behavior-x: none prevents Chrome's swipe-to-back. */
+        overscroll-behavior-x: none;
       }
 
       /* ── layout ────────────────────────────────────── */
@@ -98,6 +100,7 @@
         align-items: center;
         gap: 9px;
         flex-shrink: 0;
+        min-height: 49px;
       }
       nav .sidebar-header .logo-icon {
         width: 18px;
@@ -214,6 +217,7 @@
         gap: 10px;
         flex-shrink: 0;
         background: var(--surface);
+        min-height: 49px;
       }
       header .dot {
         width: 9px;
@@ -252,6 +256,20 @@
         line-height: 1;
         padding: 4px 6px;
       }
+      header .reload-btn {
+        background: none;
+        border: none;
+        color: var(--dim2);
+        cursor: pointer;
+        font-size: 17px;
+        line-height: 1;
+        padding: 2px 6px;
+        border-radius: 4px;
+        transition: color 0.2s;
+      }
+      header .reload-btn:hover {
+        color: var(--blue);
+      }
 
       /* ── message list ─────────────────────────────── */
 
@@ -267,7 +285,9 @@
         display: flex;
         flex-direction: column;
         gap: 14px;
-        -webkit-overflow-scrolling: touch;
+        /* overscroll-behavior-y: none stops Chrome's native pull-to-refresh
+           and iOS rubber-banding, so our JS handler owns the gesture. */
+        overscroll-behavior-y: none;
         background:
           radial-gradient(
             ellipse at 50% 0%,
@@ -654,6 +674,10 @@
 
       /* ── sidebar overlay (mobile) ─────────────────── */
 
+      #edgeZone {
+        display: none;
+      }
+
       .sidebar-overlay {
         display: none;
       }
@@ -663,6 +687,16 @@
       @media (max-width: 750px) {
         body {
           grid-template-columns: 1fr;
+          /* Lock the viewport: 100dvh is buggy on mobile Safari — it can
+             be larger than the visible area when the address bar is
+             showing, causing the entire body to scroll.  Fixed positioning
+             anchors the layout to the actual visible viewport. */
+          position: fixed;
+          inset: 0;
+          height: auto;
+          /* overflow:hidden on the global html,body rule propagates to the
+             viewport and clips position:fixed children in some browsers. */
+          overflow: clip;
         }
         nav {
           position: fixed;
@@ -672,11 +706,12 @@
           width: var(--sidebar-w);
           z-index: 100;
           transform: translateX(-100%);
-          transition: transform 0.25s ease;
           box-shadow: 2px 0 20px rgba(0, 0, 0, 0.5);
+          will-change: transform;
         }
         nav.open {
           transform: translateX(0);
+          touch-action: none;
         }
         .sidebar-overlay {
           display: none;
@@ -684,9 +719,24 @@
           inset: 0;
           background: rgba(0, 0, 0, 0.4);
           z-index: 99;
+          /* Prevent the browser from claiming touches on the overlay
+             (e.g. scrolling) so our swipe-to-close gesture works. */
+          touch-action: none;
         }
         .sidebar-overlay.open {
           display: block;
+        }
+        #edgeZone {
+          display: block;
+          position: fixed;
+          top: 0;
+          left: 0;
+          bottom: 0;
+          width: 40px;
+          z-index: 1;
+          /* Prevent the browser from claiming left-edge touches so
+             our swipe-to-open gesture owns them. */
+          touch-action: none;
         }
         header .menu-btn {
           display: block;
@@ -743,11 +793,38 @@
           padding: 8px 10px;
         }
       }
+
+      /* ── pull-to-refresh indicator ──────────────── */
+
+      #refreshIndicator {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+        transform: translateY(-100%);
+        z-index: 150;
+        pointer-events: none;
+      }
+      #refreshIndicator .refresh-label {
+        font-size: 13px;
+        color: var(--dim);
+        transition: color 0.15s;
+      }
+      #refreshIndicator.ready .refresh-label {
+        color: var(--blue);
+      }
     </style>
   </head>
   <body>
     <!-- ── sidebar ──────────────────────────────── -->
     <div class="sidebar-overlay" id="overlay"></div>
+    <div id="edgeZone"></div>
     <nav id="sidebar">
       <div class="sidebar-header">
         <img
@@ -767,11 +844,21 @@
 
     <!-- ── main area ────────────────────────────── -->
     <div class="main">
+      <div id="refreshIndicator">
+        <span class="refresh-label">Pull to refresh</span>
+      </div>
       <header>
         <button class="menu-btn" id="menuBtn" title="Sessions">☰</button>
         <div class="dot" id="dot"></div>
         <span class="title" id="title">goop</span>
         <span class="status" id="status">connecting…</span>
+        <button
+          class="reload-btn"
+          id="reloadBtn"
+          title="Force reload (clear cache)"
+        >
+          ↻
+        </button>
       </header>
 
       <main id="log">
@@ -801,6 +888,8 @@
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+    <!-- swipe sidebar uses raw touch events on targeted zones (not Hammer)
+         so text selection on messages remains native -->
     <script>
       // ── DOM refs ────────────────────────────────────
       const sidebar = document.getElementById("sidebar");
@@ -815,6 +904,7 @@
       const dot = document.getElementById("dot");
       const statusEl = document.getElementById("status");
       const titleEl = document.getElementById("title");
+      const reloadBtn = document.getElementById("reloadBtn");
 
       // ── state ────────────────────────────────────────
       let ws = null;
@@ -827,16 +917,316 @@
       let lastToolEl = null;
       let userAtBottom = true; // tracks whether user has scrolled away
       let programmaticScroll = false; // guard: ignore scroll events from our own scrollTo
+      let swipeActive = false; // guard: pause autoscroll during sidebar swipe
 
       // ── sidebar toggle (mobile) ─────────────────────
-      menuBtn.addEventListener("click", () => {
-        sidebar.classList.toggle("open");
-        overlay.classList.toggle("open");
-      });
-      overlay.addEventListener("click", () => {
+      function closeSidebar() {
         sidebar.classList.remove("open");
         overlay.classList.remove("open");
+        // Clear any leftover inline styles from the swipe gesture so
+        // the CSS class rules take over immediately.
+        sidebar.style.transform = "";
+        sidebar.style.transition = "";
+        sidebar.style.willChange = "";
+        overlay.style.display = "";
+        overlay.style.opacity = "";
+        overlay.style.transition = "";
+      }
+
+      menuBtn.addEventListener("click", () => {
+        // Add a temporary transition for the snap animation,
+        // then remove it so it can't interfere with swipes.
+        sidebar.style.transition =
+          "transform 0.2s cubic-bezier(0.0, 0.0, 0.2, 1)";
+        if (sidebar.classList.contains("open")) {
+          closeSidebar();
+        } else {
+          sidebar.classList.add("open");
+          overlay.classList.add("open");
+        }
+        sidebar.addEventListener(
+          "transitionend",
+          function () {
+            sidebar.style.transition = "";
+          },
+          { once: true },
+        );
       });
+      overlay.addEventListener("click", closeSidebar);
+
+      // ── force reload (clear SW + cache, then hard reload) ──
+      reloadBtn.addEventListener("click", async () => {
+        reloadBtn.textContent = "⏳";
+        reloadBtn.style.pointerEvents = "none";
+        try {
+          // Unregister all service workers so stale code can't survive
+          const registrations =
+            await navigator.serviceWorker.getRegistrations();
+          await Promise.all(registrations.map((r) => r.unregister()));
+          // Nuke all cache storage
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        } catch (_) {
+          // best-effort; proceed to reload
+        }
+        location.reload();
+      });
+
+      // ── swipe sidebar (raw touch events on targeted zones) ─────────────
+      // Touchstart is only on #edgeZone (open), #overlay (close), and
+      // #sidebar (close).  The rest of the page never sees our touch
+      // handlers, so native text selection works unhindered.
+      //
+      // Key design: touchstart never calls preventDefault.  Instead we defer
+      // it to touchmove and only commit after the finger moves past a 5 px
+      // dead zone.  This means a tap (no movement) generates a normal click
+      // event — session names work, overlay close works, and the session
+      // list scrolls natively.  Only actual horizontal swipes are captured.
+      (function () {
+        const sidebarEl = document.getElementById("sidebar");
+        const overlayEl = document.getElementById("overlay");
+        const edgeZone = document.getElementById("edgeZone");
+        const EDGE_WIDTH = 40;
+        const SWIPE_THRESHOLD = 60;
+        const DEAD_ZONE = 5; // px before we decide "swipe" vs "tap/scroll"
+
+        let mode = null; // "open" | "close"
+        let startX = 0;
+        let committed = false; // preventDefault called, gesture is ours
+
+        function startSwipe(x, m) {
+          swipeActive = true;
+          mode = m;
+          startX = x;
+          committed = false;
+          sidebarEl.style.transition = "none";
+          sidebarEl.style.willChange = "transform";
+          if (m === "open") {
+            overlayEl.style.display = "block";
+            overlayEl.style.opacity = "0";
+          }
+        }
+
+        function endSwipe(shouldOpen) {
+          swipeActive = false;
+          const sidebarWidth = sidebarEl.offsetWidth || 250;
+          const target = shouldOpen
+            ? "translateX(0)"
+            : `translateX(-${sidebarWidth}px)`;
+
+          sidebarEl.style.transition =
+            "transform 0.2s cubic-bezier(0.0, 0.0, 0.2, 1)";
+          sidebarEl.style.transform = target;
+
+          overlayEl.style.transition =
+            "opacity 0.2s cubic-bezier(0.0, 0.0, 0.2, 1)";
+          overlayEl.style.opacity = shouldOpen ? "1" : "0";
+
+          if (shouldOpen) {
+            sidebarEl.classList.add("open");
+            overlayEl.classList.add("open");
+          } else {
+            sidebarEl.classList.remove("open");
+            overlayEl.classList.remove("open");
+          }
+
+          sidebarEl.addEventListener(
+            "transitionend",
+            function cleanup() {
+              sidebarEl.style.transition = "";
+              sidebarEl.style.transform = "";
+              sidebarEl.style.willChange = "";
+              overlayEl.style.transition = "";
+              overlayEl.style.display = "";
+              overlayEl.style.opacity = "";
+              sidebarEl.removeEventListener("transitionend", cleanup);
+            },
+            { once: true },
+          );
+
+          mode = null;
+          committed = false;
+        }
+
+        // ── opening swipe: only on the left-edge zone ──────────────────
+        edgeZone.addEventListener(
+          "touchstart",
+          function (e) {
+            if (swipeActive || e.touches.length !== 1) return;
+            if (sidebarEl.classList.contains("open")) return;
+            if (e.touches[0].clientX > EDGE_WIDTH) return;
+            startSwipe(e.touches[0].clientX, "open");
+            // Edge zone has no interactive content; prevent default eagerly.
+            e.preventDefault();
+            committed = true;
+          },
+          { passive: false },
+        );
+
+        // ── closing swipe: overlay + sidebar ──────────────────────────
+        function onCloseTouchStart(e) {
+          if (swipeActive || e.touches.length !== 1) return;
+          if (!sidebarEl.classList.contains("open")) return;
+          // Do NOT preventDefault here — defer to touchmove so taps
+          // still generate click events (session names, overlay close).
+          startSwipe(e.touches[0].clientX, "close");
+        }
+        overlayEl.addEventListener("touchstart", onCloseTouchStart, {
+          passive: false,
+        });
+        sidebarEl.addEventListener("touchstart", onCloseTouchStart, {
+          passive: false,
+        });
+
+        // ── shared move / end / cancel on document ────────────────────
+        document.addEventListener(
+          "touchmove",
+          function (e) {
+            if (!swipeActive) return;
+
+            const deltaX = e.touches[0].clientX - startX;
+
+            // Don't commit until the finger moves past the dead zone.
+            // This lets vertical scrolling (session list) and taps work.
+            if (!committed) {
+              if (Math.abs(deltaX) < DEAD_ZONE) return;
+              committed = true;
+            }
+            e.preventDefault();
+
+            const sidebarWidth = sidebarEl.offsetWidth || 250;
+            let px;
+
+            if (mode === "open") {
+              // Clamp to [-sidebarWidth, 0] — sidebar can't slide left past
+              // fully closed or right past fully open.
+              px = Math.max(-sidebarWidth, Math.min(0, -sidebarWidth + deltaX));
+            } else {
+              px = Math.max(-sidebarWidth, Math.min(0, deltaX));
+            }
+
+            sidebarEl.style.transform = `translateX(${px}px)`;
+
+            const progress = (sidebarWidth + px) / sidebarWidth;
+            overlayEl.style.display = progress > 0 ? "block" : "none";
+            overlayEl.style.opacity = Math.max(0, Math.min(1, progress * 0.45));
+          },
+          { passive: false },
+        );
+
+        document.addEventListener("touchend", function (e) {
+          if (!swipeActive) return;
+
+          if (!committed) {
+            // Finger never moved past dead zone — it was a tap.
+            // Let the click event fire; just clean up without snapping.
+            swipeActive = false;
+            mode = null;
+            committed = false;
+            sidebarEl.style.transition = "";
+            sidebarEl.style.transform = "";
+            sidebarEl.style.willChange = "";
+            // Overlay was already visible (class "open"); don't touch it.
+            return;
+          }
+
+          const deltaX = e.changedTouches[0].clientX - startX;
+          let shouldOpen;
+          if (mode === "open") {
+            shouldOpen = deltaX > SWIPE_THRESHOLD;
+          } else {
+            shouldOpen = deltaX > -SWIPE_THRESHOLD;
+          }
+          endSwipe(shouldOpen);
+        });
+
+        document.addEventListener("touchcancel", function () {
+          if (!swipeActive) return;
+          const wasOpen = sidebarEl.classList.contains("open");
+          swipeActive = false;
+          committed = false;
+          sidebarEl.style.transform = "";
+          sidebarEl.style.transition = "";
+          sidebarEl.style.willChange = "";
+          overlayEl.style.display = "";
+          overlayEl.style.opacity = "";
+          overlayEl.style.transition = "";
+          if (wasOpen) {
+            sidebarEl.classList.add("open");
+            overlayEl.classList.add("open");
+          } else {
+            sidebarEl.classList.remove("open");
+            overlayEl.classList.remove("open");
+          }
+          mode = null;
+        });
+      })();
+
+      // ── pull-to-refresh (touch events + CSS transition) ──
+      (function () {
+        var REFRESH_THRESHOLD = 64;
+        var indicator = document.getElementById("refreshIndicator");
+        var tracking = false;
+        var startY = 0;
+
+        log.addEventListener(
+          "touchstart",
+          function (e) {
+            if (tracking) return;
+            if (log.scrollTop > 0) return;
+            if (e.touches.length !== 1) return;
+            if (e.touches[0].clientX <= 40) return; // sidebar swipe territory
+            tracking = true;
+            startY = e.touches[0].clientY;
+            e.preventDefault();
+          },
+          { passive: false },
+        );
+
+        log.addEventListener(
+          "touchmove",
+          function (e) {
+            if (!tracking) return;
+            var dy = Math.max(0, e.touches[0].clientY - startY);
+            var progress = Math.min(1, dy / REFRESH_THRESHOLD);
+            var offset = -48 + progress * 48;
+            indicator.style.transform = "translateY(" + offset + "px)";
+            indicator.classList.toggle("ready", dy >= REFRESH_THRESHOLD);
+          },
+          { passive: false },
+        );
+
+        log.addEventListener("touchend", function (e) {
+          if (!tracking) return;
+          tracking = false;
+
+          var dy = e.changedTouches[0].clientY - startY;
+          if (dy >= REFRESH_THRESHOLD) {
+            location.reload();
+          } else {
+            // Spring back.
+            indicator.style.transition =
+              "transform 0.2s cubic-bezier(0.0, 0.0, 0.2, 1)";
+            indicator.style.transform = "translateY(-100%)";
+            indicator.classList.remove("ready");
+            indicator.addEventListener(
+              "transitionend",
+              function () {
+                indicator.style.transition = "";
+                indicator.style.transform = "";
+              },
+              { once: true },
+            );
+          }
+        });
+
+        log.addEventListener("touchcancel", function () {
+          if (!tracking) return;
+          tracking = false;
+          indicator.style.transform = "translateY(-100%)";
+          indicator.classList.remove("ready");
+        });
+      })();
 
       // ── session list ─────────────────────────────────
       async function fetchSessions() {
@@ -866,8 +1256,7 @@
 
       async function switchSession(name) {
         if (name === currentSession) return;
-        sidebar.classList.remove("open");
-        overlay.classList.remove("open");
+        closeSidebar();
 
         // Disconnect old socket.
         if (ws) {
@@ -1128,6 +1517,7 @@
       }
 
       function scrollDown(force) {
+        if (swipeActive) return;
         if (force || userAtBottom) {
           programmaticScroll = true;
           log.scrollTo({ top: log.scrollHeight, behavior: "auto" });
@@ -1153,10 +1543,11 @@
       });
 
       // ── input ────────────────────────────────────
-      input.addEventListener("input", () => {
+      function resizeInput() {
         input.style.height = "auto";
         input.style.height = Math.min(input.scrollHeight, 200) + "px";
-      });
+      }
+      input.addEventListener("input", resizeInput);
 
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
@@ -1217,6 +1608,7 @@
           statusEl.textContent = "no session";
           sendBtn.disabled = true;
         }
+        resizeInput();
       }
 
       init();

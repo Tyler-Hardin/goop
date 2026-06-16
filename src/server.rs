@@ -17,7 +17,7 @@ use crate::session::{Session, SessionManager};
 
 const PAGE: &str = include_str!("../assets/index.html");
 const MANIFEST: &str = include_str!("../assets/manifest.json");
-const SERVICE_WORKER: &str = include_str!("../assets/sw.js");
+const SERVICE_WORKER: &str = include_str!(concat!(env!("OUT_DIR"), "/sw.js"));
 const ICON: &[u8] = include_bytes!("../assets/goop_icon_full.png");
 
 // ── restart machinery ──────────────────────────────────────────────
@@ -149,32 +149,38 @@ struct ServerState {
 
 // ── routes ──────────────────────────────────────────────────────
 
-async fn index() -> Html<&'static str> {
-    Html(PAGE)
+async fn index() -> impl IntoResponse {
+    ([(header::CACHE_CONTROL, "no-store")], Html(PAGE))
 }
 
 // ── PWA static assets ────────────────────────────────────────────
 
 async fn manifest() -> (
     StatusCode,
-    [(axum::http::header::HeaderName, &'static str); 1],
+    [(axum::http::header::HeaderName, &'static str); 2],
     &'static str,
 ) {
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/manifest+json")],
+        [
+            (header::CONTENT_TYPE, "application/manifest+json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         MANIFEST,
     )
 }
 
 async fn service_worker() -> (
     StatusCode,
-    [(axum::http::header::HeaderName, &'static str); 1],
+    [(axum::http::header::HeaderName, &'static str); 2],
     &'static str,
 ) {
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/javascript")],
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         SERVICE_WORKER,
     )
 }
