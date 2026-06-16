@@ -185,7 +185,7 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
                                 session.submit(content, PromptSource::Web);
                             }
                             ClientMessage::Cancel => {
-                                session.cancel();
+                                session.cancel().await;
                             }
                         }
                     }

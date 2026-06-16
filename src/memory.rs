@@ -1,10 +1,7 @@
-use std::{
-    io::{BufRead, Write},
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{io::BufRead, path::PathBuf, sync::Arc};
 
 use rig::{completion::Message, memory::ConversationMemory, memory::MemoryError};
+use tokio::sync::Mutex;
 
 use crate::config;
 
@@ -45,8 +42,8 @@ impl FileConversationMemory {
 
     /// Return a snapshot of all messages currently in the store.
     #[allow(dead_code)]
-    pub fn snapshot(&self) -> Vec<Message> {
-        self.messages.lock().unwrap().clone()
+    pub async fn snapshot(&self) -> Vec<Message> {
+        self.messages.lock().await.clone()
     }
 }
 
@@ -67,12 +64,21 @@ fn load_messages_from_file(path: &std::path::Path) -> Result<Vec<Message>, Memor
     Ok(messages)
 }
 
-fn write_messages_to_file(path: &std::path::Path, messages: &[Message]) -> Result<(), MemoryError> {
-    let mut file = std::fs::File::create(path).map_err(|e| MemoryError::Backend(Box::new(e)))?;
+/// Write messages to file as JSONL.  Does **not** hold the mutex —
+/// callers clone the message vec first and drop their lock.
+async fn write_messages_to_file(
+    path: &std::path::Path,
+    messages: &[Message],
+) -> Result<(), MemoryError> {
+    let mut content = String::new();
     for msg in messages {
         let json = serde_json::to_string(msg).map_err(|e| MemoryError::Backend(Box::new(e)))?;
-        writeln!(file, "{json}").map_err(|e| MemoryError::Backend(Box::new(e)))?;
+        content.push_str(&json);
+        content.push('\n');
     }
+    tokio::fs::write(path, content)
+        .await
+        .map_err(|e| MemoryError::Backend(Box::new(e)))?;
     Ok(())
 }
 
@@ -86,10 +92,7 @@ impl ConversationMemory for FileConversationMemory {
         Box<dyn std::future::Future<Output = Result<Vec<Message>, MemoryError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let guard = self
-                .messages
-                .lock()
-                .map_err(|e| MemoryError::Internal(e.to_string()))?;
+            let guard = self.messages.lock().await;
             Ok(guard.clone())
         })
     }
@@ -101,15 +104,12 @@ impl ConversationMemory for FileConversationMemory {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MemoryError>> + Send + 'a>>
     {
         Box::pin(async move {
-            {
-                let mut guard = self
-                    .messages
-                    .lock()
-                    .map_err(|e| MemoryError::Internal(e.to_string()))?;
+            let snapshot = {
+                let mut guard = self.messages.lock().await;
                 guard.extend(messages);
-                write_messages_to_file(&self.path, &guard)?;
-            }
-            Ok(())
+                guard.clone()
+            }; // lock dropped here — I/O happens outside the critical section.
+            write_messages_to_file(&self.path, &snapshot).await
         })
     }
 
@@ -120,14 +120,10 @@ impl ConversationMemory for FileConversationMemory {
     {
         Box::pin(async move {
             {
-                let mut guard = self
-                    .messages
-                    .lock()
-                    .map_err(|e| MemoryError::Internal(e.to_string()))?;
+                let mut guard = self.messages.lock().await;
                 guard.clear();
-                write_messages_to_file(&self.path, &guard)?;
             }
-            Ok(())
+            write_messages_to_file(&self.path, &[]).await
         })
     }
 }

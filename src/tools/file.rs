@@ -1,11 +1,14 @@
 //! File-operation tools: `read`, `write`, `replace`, `read_html`, `cd`.
+//!
+//! Each tool is a thin wrapper — it deserializes arguments and delegates
+//! to the corresponding [`SessionState`] method.  No tool touches CWD,
+//! transport, or path resolution directly.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::session_state::SessionState;
 use crate::tools::{define_tool, tool_err};
-use crate::transport::Transport;
 
 // ═══════════════════════════════════════════════════════════════════
 // Read
@@ -24,33 +27,7 @@ define_tool!(pub(crate) struct Read, args = ReadArgs,
         "required": ["path"]
     }),
     args { path: PathBuf, start_line: Option<u64>, end_line: Option<u64> },
-    |this, args| {
-        let transport = this.state.transport();
-        let path = this.state.resolve_path(args.path);
-        let content = transport.read_file(&path).await.map_err(tool_err)?;
-
-        let all_lines: Vec<&str> = content.lines().collect();
-        let total = all_lines.len() as u64;
-
-        let start = args.start_line.unwrap_or(1).max(1);
-        let end = args.end_line.unwrap_or(total).min(total);
-
-        if start > total {
-            return Err(tool_err(format!("start_line {start} exceeds file length ({total} lines)")));
-        }
-        if start > end {
-            return Err(tool_err(format!("start_line {start} > end_line {end}")));
-        }
-
-        let output: String = all_lines[(start - 1) as usize..end as usize]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{:>6}\t{}", start as usize + i, line))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Ok(output)
-    }
+    |this, args| this.state.read_file(args.path, args.start_line, args.end_line).await.map_err(tool_err)
 );
 
 // ═══════════════════════════════════════════════════════════════════
@@ -69,13 +46,7 @@ define_tool!(pub(crate) struct Write, args = WriteArgs,
         "required": ["path", "content"]
     }),
     args { path: PathBuf, content: String },
-    |this, args| {
-        let transport = this.state.transport();
-        let path = this.state.resolve_path(args.path);
-        let len = args.content.len();
-        transport.write_file(&path, &args.content).await.map_err(tool_err)?;
-        Ok(format!("Wrote {len} bytes to {}", path.display()))
-    }
+    |this, args| this.state.write_file(args.path, args.content).await.map_err(tool_err)
 );
 
 // ═══════════════════════════════════════════════════════════════════
@@ -95,21 +66,7 @@ define_tool!(pub(crate) struct Replace, args = ReplaceArgs,
         "required": ["path", "old_str", "new_str"]
     }),
     args { path: PathBuf, old_str: String, new_str: String },
-    |this, args| {
-        let transport = this.state.transport();
-        let path = this.state.resolve_path(args.path);
-        let content = transport.read_file(&path).await.map_err(tool_err)?;
-        let count = content.matches(&args.old_str).count();
-        if count == 0 {
-            Err(tool_err("old_str not found"))
-        } else if count > 1 {
-            Err(tool_err(format!("old_str found {count} times, must be unique")))
-        } else {
-            let new_content = content.replacen(&args.old_str, &args.new_str, 1);
-            transport.write_file(&path, &new_content).await.map_err(tool_err)?;
-            Ok(format!("Replaced 1 occurrence in {}", path.display()))
-        }
-    }
+    |this, args| this.state.replace_in_file(args.path, args.old_str, args.new_str).await.map_err(tool_err)
 );
 
 // ═══════════════════════════════════════════════════════════════════
@@ -127,16 +84,7 @@ define_tool!(pub(crate) struct ReadHtml, args = ReadHtmlArgs,
         "required": ["path"]
     }),
     args { path: PathBuf },
-    |this, args| {
-        let transport = this.state.transport();
-        let path = this.state.resolve_path(args.path);
-        let html = transport.read_file(&path).await.map_err(tool_err)?;
-        tokio::task::spawn_blocking(move || {
-            html2text::from_read(html.as_bytes(), 80).map_err(|e| tool_err(e.to_string()))
-        })
-        .await
-        .map_err(|e| tool_err(e.to_string()))?
-    }
+    |this, args| this.state.read_html(args.path).await.map_err(tool_err)
 );
 
 // ═══════════════════════════════════════════════════════════════════
@@ -154,39 +102,5 @@ define_tool!(pub(crate) struct Cd, args = CdArgs,
         "required": ["path"]
     }),
     args { path: String },
-    |this, args| {
-        let transport = this.state.transport();
-        let current = this.state.cwd();
-
-        let new_path = if args.path.starts_with('~') {
-            this.state.expand_tilde(&args.path)
-        } else if args.path.starts_with('/') {
-            PathBuf::from(&args.path)
-        } else {
-            current.join(&args.path)
-        };
-
-        let canonical = transport
-            .canonicalize(&new_path)
-            .await
-            .map_err(|e| tool_err(format!("cd: {}: {}", new_path.display(), e)))?;
-
-        if !transport
-            .is_dir(&canonical)
-            .await
-            .map_err(|e| tool_err(format!("cd: {}: {}", canonical.display(), e)))?
-        {
-            return Err(tool_err(format!("cd: not a directory: {}", canonical.display())));
-        }
-
-        this.state.set_cwd(canonical.clone());
-
-        if let Transport::Ssh(ref ssh_state) = transport {
-            *ssh_state.remote_cwd.lock().await = canonical.clone();
-        }
-
-        this.state.save();
-
-        Ok(format!("Changed working directory to {}", canonical.display()))
-    }
+    |this, args| this.state.change_dir(args.path).await.map_err(tool_err)
 );

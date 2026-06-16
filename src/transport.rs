@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use russh::client::Handler;
 use russh_sftp::client::SftpSession;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -137,6 +138,43 @@ impl Transport {
             Transport::Ssh(state) => state.label.clone(),
         }
     }
+
+    /// Snapshot the transport into its serializable form.
+    ///
+    /// Runtime handles (SSH connection, SFTP session) are dropped —
+    /// only the data needed to reconnect later is preserved.
+    pub async fn to_persisted(&self) -> PersistedTransport {
+        match self {
+            Transport::Local => PersistedTransport::Local,
+            Transport::Ssh(ssh) => PersistedTransport::Ssh {
+                destination: ssh.label.clone(),
+                remote_cwd: ssh.remote_cwd.lock().await.clone(),
+            },
+        }
+    }
+}
+
+// ── persisted transport (serializable snapshot) ──────────────────
+
+/// Serializable snapshot of a [`Transport`] for persistence.
+///
+/// The runtime handles are stripped — on deserialization, the SSH
+/// connection is re-established from the [`PersistedTransport::Ssh`]
+/// fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[derive(Default)]
+pub enum PersistedTransport {
+    #[serde(rename = "local")]
+    #[default]
+    Local,
+    #[serde(rename = "ssh")]
+    Ssh {
+        /// e.g. "user@host:22"
+        destination: String,
+        /// Current working directory on the remote host.
+        remote_cwd: PathBuf,
+    },
 }
 
 // ── helpers ────────────────────────────────────────────────────────

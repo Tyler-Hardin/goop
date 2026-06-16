@@ -15,8 +15,8 @@ use crate::memory::FileConversationMemory;
 use crate::memory::prompt_history_path;
 use crate::model;
 use crate::preamble::build_preamble;
-use crate::session_state::{PersistedSessionState, SessionState, TransportState};
-use crate::transport::Transport;
+use crate::session_state::{PersistedSessionState, SessionState};
+use crate::transport::{PersistedTransport, Transport};
 
 // ── subscriber with history replay ──────────────────────────────
 
@@ -63,7 +63,10 @@ pub struct Session {
 
     /// Set by `cancel()` and consumed by the currently-running turn.
     /// When the sender is dropped or fired, the turn is cancelled.
-    cancel_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    ///
+    /// Uses a tokio [`Mutex`] so cancel (called from async WS handler) and
+    /// clear_cancel (called from async run_one) never hold a blocking lock.
+    cancel_tx: Mutex<Option<oneshot::Sender<()>>>,
 
     /// Whether the session is currently processing a prompt.
     /// Used to tell late-joining clients whether to show a Cancel button.
@@ -85,9 +88,13 @@ impl Session {
     /// and `~/.config/goop/sessions/<name>.state.toml` (config + CWD + transport).
     /// Existing files are loaded so named sessions can be resumed.
     ///
+    /// If the session was previously SSH'd, the SSH connection is
+    /// re-established synchronously (awaited) before the session is
+    /// returned — no race between reconnect and first prompt.
+    ///
     /// A background task is spawned to drain the prompt queue — the
     /// tokio runtime must already be running.
-    pub fn new(
+    pub async fn new(
         config: &Config,
         capacity: usize,
         session_name: Option<String>,
@@ -110,63 +117,65 @@ impl Session {
         let mut merged_config = config.clone();
         persisted.config.merge_into(&mut merged_config);
 
-        let initial_cwd = persisted.local_cwd.clone();
+        let initial_local_cwd = persisted.local_cwd.clone();
 
         // ── SessionState (created before agent so tools can use it) ──
         let state = Arc::new(SessionState::new(
-            name.clone(),
             config.home_dir.clone(),
-            initial_cwd.clone(),
+            initial_local_cwd.clone(),
+            persisted.config.clone(),
             state_path,
         ));
 
-        // Restore transport if the session was SSH'd.
-        match &persisted.transport {
-            TransportState::Local => {
-                // Nothing to restore.
+        // ── restore SSH transport synchronously ────────────────
+        let initial_cwd_for_preamble = match &persisted.transport {
+            PersistedTransport::Local => {
+                // Nothing to restore — already local.
+                initial_local_cwd
             }
-            TransportState::Ssh {
+            PersistedTransport::Ssh {
                 destination,
                 remote_cwd,
             } => {
-                // We can't auto-reconnect here because we need async.
-                // Spawn a background task to reconnect.
-                let state_clone = Arc::clone(&state);
-                let dest = destination.clone();
-                let rwd = remote_cwd.clone();
-                let name_for_log = name.clone();
-                tokio::spawn(async move {
-                    match crate::ssh::ssh_connect(&dest, None).await {
-                        Ok(transport) => {
-                            if let Transport::Ssh(ref ssh_state) = transport {
-                                match transport.canonicalize(&rwd).await {
-                                    Ok(canon) => {
-                                        *ssh_state.remote_cwd.lock().await = canon.clone();
-                                        state_clone.set_cwd(canon);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "auto-reconnect SSH {name_for_log}: could not \
-                                             canonicalize persisted CWD {rwd:?}: {e}"
-                                        );
-                                    }
+                match crate::ssh::ssh_connect(destination, None).await {
+                    Ok(transport) => {
+                        // Resolve remote CWD.
+                        let resolved_cwd = if let Transport::Ssh(ref ssh_state) = transport {
+                            match transport.canonicalize(remote_cwd).await {
+                                Ok(canon) => {
+                                    *ssh_state.remote_cwd.lock().await = canon.clone();
+                                    canon
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "SSH {name}: could not canonicalize persisted CWD \
+                                         {remote_cwd:?}: {e}"
+                                    );
+                                    remote_cwd.clone()
                                 }
                             }
-                            state_clone.set_transport(transport);
-                            state_clone.save();
-                            tracing::info!("auto-reconnect SSH {name_for_log} → {dest} succeeded");
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "auto-reconnect SSH {name_for_log} → {dest} failed: {e}"
-                            );
-                        }
-                    }
-                });
-            }
-        }
+                        } else {
+                            remote_cwd.clone()
+                        };
 
-        let preamble = build_preamble(&initial_cwd.display().to_string(), &config.home_dir);
+                        state.set_transport(transport).await;
+                        state.save().await;
+                        tracing::info!("SSH {name} → {destination} reconnected");
+                        resolved_cwd
+                    }
+                    Err(e) => {
+                        tracing::warn!("SSH {name} → {destination} reconnect failed: {e}");
+                        // Fall back to local — the session is usable locally.
+                        initial_local_cwd
+                    }
+                }
+            }
+        };
+
+        let preamble = build_preamble(
+            &initial_cwd_for_preamble.display().to_string(),
+            &config.home_dir,
+        );
 
         let agent = model::build_agent(&merged_config, &preamble, mem, state.clone())?;
 
@@ -194,7 +203,7 @@ impl Session {
             tx,
             history: Mutex::new(existing_events),
             submit_tx,
-            cancel_tx: std::sync::Mutex::new(None),
+            cancel_tx: Mutex::new(None),
             is_running: AtomicBool::new(false),
             events_file: Some(events_path),
         });
@@ -221,9 +230,9 @@ impl Session {
     }
 
     /// Cancel the currently-running LLM turn (if any).
-    /// Safe to call from any thread / async context; idempotent.
-    pub fn cancel(&self) {
-        if let Some(tx) = self.cancel_tx.lock().unwrap().take() {
+    /// Safe to call from any async context; idempotent.
+    pub async fn cancel(&self) {
+        if let Some(tx) = self.cancel_tx.lock().await.take() {
             let _ = tx.send(());
         }
     }
@@ -291,12 +300,11 @@ impl Session {
     async fn run_one(&self, prompt: &str) {
         // Set up cancellation for this turn.
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
-        *self.cancel_tx.lock().unwrap() = Some(cancel_tx);
+        *self.cancel_tx.lock().await = Some(cancel_tx);
 
         self.is_running.store(true, Ordering::SeqCst);
         self.emit(SessionEvent::Thinking).await;
 
-        // No more SESSION_ID task-local — tools receive SessionState directly.
         {
             let mut stream = self.agent.stream_prompt(prompt).await;
 
@@ -362,7 +370,7 @@ impl Session {
                             }
 
                             Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
-                                self.clear_cancel();
+                                self.clear_cancel().await;
                                 self.emit(SessionEvent::FinalResponse).await;
                                 return;
                             }
@@ -370,14 +378,14 @@ impl Session {
                             Some(Ok(_)) => {}
 
                             Some(Err(e)) => {
-                                self.clear_cancel();
+                                self.clear_cancel().await;
                                 self.emit(SessionEvent::Error(e.to_string())).await;
                                 return;
                             }
 
                             None => {
                                 // Stream ended without FinalResponse.
-                                self.clear_cancel();
+                                self.clear_cancel().await;
                                 self.emit(SessionEvent::FinalResponse).await;
                                 return;
                             }
@@ -389,8 +397,8 @@ impl Session {
     }
 
     /// Remove the cancel sender for the current turn (turn ending normally).
-    fn clear_cancel(&self) {
-        self.cancel_tx.lock().unwrap().take();
+    async fn clear_cancel(&self) {
+        self.cancel_tx.lock().await.take();
         self.is_running.store(false, Ordering::SeqCst);
     }
 
@@ -432,6 +440,9 @@ impl SessionManager {
     /// messages, and state (config overrides + CWD + transport) from
     /// disk if files exist for this name.  Session config overrides
     /// are merged into the global config before building the agent.
+    ///
+    /// If the session was previously SSH'd, the SSH connection is
+    /// re-established before this returns (no race with first prompt).
     pub async fn get_or_create(&self, name: String) -> anyhow::Result<Arc<Session>> {
         // Fast path: read lock.
         {
@@ -440,8 +451,9 @@ impl SessionManager {
                 return Ok(Arc::clone(s));
             }
         }
-        // Slow path: create the session, then insert under write lock.
-        let session = Session::new(&self.config, 256, Some(name.clone()))?;
+        // Slow path: create the session (may await SSH reconnect),
+        // then insert under write lock.
+        let session = Session::new(&self.config, 256, Some(name.clone())).await?;
         let mut sessions = self.sessions.write().await;
         // Double-check: another caller may have created it while we
         // were building the session.

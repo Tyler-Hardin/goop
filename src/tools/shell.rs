@@ -1,4 +1,6 @@
 //! Shell tool: `shell`.
+//!
+//! Thin wrapper around [`SessionState::run_shell`].
 
 use std::sync::Arc;
 
@@ -16,12 +18,5 @@ define_tool!(pub(crate) struct Shell, args = ShellArgs,
         "required": ["command"]
     }),
     args { command: String },
-    |this, args| {
-        let transport = this.state.transport();
-        let cwd = this.state.cwd();
-        transport
-            .run_shell(&args.command, &cwd)
-            .await
-            .map_err(tool_err)
-    }
+    |this, args| this.state.run_shell(args.command).await.map_err(tool_err)
 );
