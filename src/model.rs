@@ -190,61 +190,26 @@ pub fn build_agent(
 
     let tools = crate::tools::build_tools(config, &state);
 
+    /// One arm body — constructs a provider-specific client and wraps it.
+    macro_rules! arm {
+        ($variant:ident, $new_client:expr) => {{
+            let client = $new_client;
+            AnyAgent::$variant(finish_agent(
+                client.agent(model_name).preamble(preamble),
+                config,
+                memory,
+                tools,
+            ))
+        }};
+    }
+
     let any_agent = match provider {
-        Provider::DeepSeek => {
-            let client = deepseek::Client::new(&api_key)?;
-            AnyAgent::DeepSeek(finish_agent(
-                client.agent(model_name).preamble(preamble),
-                config,
-                memory,
-                tools,
-            ))
-        }
-        Provider::OpenAI => {
-            let client = openai::CompletionsClient::new(&api_key)?;
-            AnyAgent::OpenAI(finish_agent(
-                client.agent(model_name).preamble(preamble),
-                config,
-                memory,
-                tools,
-            ))
-        }
-        Provider::OpenRouter => {
-            let client = openrouter::Client::new(&api_key)?;
-            AnyAgent::OpenRouter(finish_agent(
-                client.agent(model_name).preamble(preamble),
-                config,
-                memory,
-                tools,
-            ))
-        }
-        Provider::Groq => {
-            let client = groq::Client::new(&api_key)?;
-            AnyAgent::Groq(finish_agent(
-                client.agent(model_name).preamble(preamble),
-                config,
-                memory,
-                tools,
-            ))
-        }
-        Provider::Ollama => {
-            let client = ollama::Client::from_env()?;
-            AnyAgent::Ollama(finish_agent(
-                client.agent(model_name).preamble(preamble),
-                config,
-                memory,
-                tools,
-            ))
-        }
-        Provider::Anthropic => {
-            let client = anthropic::Client::new(&api_key)?;
-            AnyAgent::Anthropic(finish_agent(
-                client.agent(model_name).preamble(preamble),
-                config,
-                memory,
-                tools,
-            ))
-        }
+        Provider::DeepSeek => arm!(DeepSeek, deepseek::Client::new(&api_key)?),
+        Provider::OpenAI => arm!(OpenAI, openai::CompletionsClient::new(&api_key)?),
+        Provider::OpenRouter => arm!(OpenRouter, openrouter::Client::new(&api_key)?),
+        Provider::Groq => arm!(Groq, groq::Client::new(&api_key)?),
+        Provider::Ollama => arm!(Ollama, ollama::Client::from_env()?),
+        Provider::Anthropic => arm!(Anthropic, anthropic::Client::new(&api_key)?),
     };
 
     tracing::info!("● provider · {}  model · {}", provider.label(), model_name);
