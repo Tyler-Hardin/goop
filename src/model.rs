@@ -12,6 +12,8 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use rig::agent::Agent;
 use rig::client::CompletionClient;
+use rig::completion::Message;
+use rig::memory::ConversationMemory;
 use rig::providers::{anthropic, deepseek, groq, ollama, openai, openrouter};
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 
@@ -59,6 +61,35 @@ impl AnyAgent {
             AnyAgent::Groq(a) => AnyStream::Groq(a.stream_prompt(prompt).await),
             AnyAgent::Ollama(a) => AnyStream::Ollama(a.stream_prompt(prompt).await),
             AnyAgent::Anthropic(a) => AnyStream::Anthropic(a.stream_prompt(prompt).await),
+        }
+    }
+
+    /// Append messages to the agent's conversation memory.
+    ///
+    /// Used when a prompt is cancelled mid-stream — the rig stream only
+    /// saves to memory on [`FinalResponse`], so a cancelled prompt loses
+    /// the user message and any completed tool turns.  This method lets
+    /// us explicitly preserve what we can.
+    pub(crate) async fn append_to_memory(&self, messages: Vec<Message>) {
+        // Each variant has the same field layout; extract via macro.
+        macro_rules! do_append {
+            ($agent:expr) => {
+                if let Some(ref memory) = $agent.memory
+                    && let Some(ref conv_id) = $agent.default_conversation_id
+                {
+                    if let Err(e) = memory.append(conv_id, messages).await {
+                        tracing::warn!("failed to save cancelled state to memory: {e}");
+                    }
+                }
+            };
+        }
+        match self {
+            AnyAgent::DeepSeek(a) => do_append!(a),
+            AnyAgent::OpenAI(a) => do_append!(a),
+            AnyAgent::OpenRouter(a) => do_append!(a),
+            AnyAgent::Groq(a) => do_append!(a),
+            AnyAgent::Ollama(a) => do_append!(a),
+            AnyAgent::Anthropic(a) => do_append!(a),
         }
     }
 }

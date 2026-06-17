@@ -418,8 +418,9 @@ Two independent history systems:
   - `<name>.messages.jsonl` — LLM `Message` objects (JSONL). Managed by
     `FileConversationMemory` which implements rig's `ConversationMemory`
     trait. The agent's internal memory loads from this file before each
-    prompt and appends after each successful turn — no replay or
-    re-execution needed.
+    prompt and appends after each successful turn.  Cancelled prompts
+    also persist the user message and any completed tool turns
+    (see Cancellation recovery above).
 - When a session file exists, the agent picks up the conversation where
   it left off.
 
@@ -434,6 +435,22 @@ Two independent history systems:
 - **Cancel via biased select.** The LLM stream loop uses
   `tokio::select! { biased; cancel_rx => …, stream.next() => … }` so a
   queued cancel always wins.
+- **Cancellation recovery.** rig only saves to `ConversationMemory` on
+  `FinalResponse`, so dropping the stream mid-turn would lose the user
+  prompt and all completed tool turns.  `run_one()` tracks tool calls and
+  results as they stream by; when cancelled it builds `Message` pairs
+  (assistant `ToolCall` + user `ToolResult`) for every completed turn
+  and appends them via `AnyAgent::append_to_memory()`.
+  **If at least one tool turn completed** (any ToolCall+ToolResult pair),
+  the user prompt and all completed pairs are saved to memory — the next
+  prompt starts fresh with the LLM seeing all completed work.  Any
+  in-flight tool call (emitted but no result yet) is intentionally
+  dropped.  **If zero tool turns completed** (cancelled during thinking,
+  text, or before any tool result arrived), nothing is saved — two
+  consecutive `User` text messages would violate some provider APIs.
+  Instead the `Cancelled` event carries the prompt text and the terminal
+  repopulates the input line via `readline_with_initial` so the user can
+  edit and resubmit immediately.
 - **Prompt queue.** `Session::submit()` sends into an unbounded mpsc;
   a background `drain_queue()` task processes them serially.
 - **History replay.** `subscribe_all()` returns a `SessionSubscriber`

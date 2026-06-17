@@ -51,5 +51,10 @@ pub enum SessionEvent {
     Error(String),
 
     /// The current prompt was cancelled by the user.
-    Cancelled,
+    ///
+    /// When `prompt` is set, no agent output was produced before the
+    /// cancel — the terminal should repopulate its input so the user
+    /// can edit and resubmit.  When `None`, completed tool turns were
+    /// already saved to memory and the next prompt starts fresh.
+    Cancelled { prompt: Option<String> },
 }

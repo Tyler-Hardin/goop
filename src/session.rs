@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Local;
 use futures::StreamExt;
+use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
+use rig::completion;
+use rig::message;
 use rig::streaming::StreamedAssistantContent;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
@@ -346,6 +349,17 @@ impl Session {
         self.is_running.store(true, Ordering::SeqCst);
         self.emit(SessionEvent::Thinking).await;
 
+        // Track tool calls and results so we can preserve completed
+        // work when the user cancels mid-stream.  rig only saves to
+        // memory on FinalResponse, so a cancelled prompt loses the
+        // user message and every completed tool turn.
+        //
+        // Each tool turn produces two messages:
+        //   Assistant { content: [ToolCall] }
+        //   User      { content: [ToolResult] }
+        let mut pending_tool_calls: Vec<message::ToolCall> = Vec::new();
+        let mut committed_messages: Vec<completion::Message> = Vec::new();
+
         {
             let mut stream = self.agent.stream_prompt(prompt).await;
 
@@ -356,8 +370,32 @@ impl Session {
                     biased;
 
                     _ = &mut cancel_rx => {
+                        // ── cancellation recovery ──────────────────────────
+                        // If tool calls completed, save the user prompt +
+                        // every completed turn to memory so the LLM still
+                        // knows what was asked and what tools already ran.
+                        //
+                        // If nothing completed, don't save — two consecutive
+                        // User text messages would violate some provider APIs.
+                        // Instead, hand the prompt back so the terminal can
+                        // repopulate the input for editing.
+                        if committed_messages.is_empty() {
+                            // Nothing to save — return prompt for editing.
+                            self.is_running.store(false, Ordering::SeqCst);
+                            self.emit(SessionEvent::Cancelled {
+                                prompt: Some(prompt.to_string()),
+                            })
+                            .await;
+                            self.notify_push("Cancelled").await;
+                            return;
+                        }
+
+                        let mut saved = vec![completion::Message::user(prompt)];
+                        saved.append(&mut committed_messages);
+                        self.agent.append_to_memory(saved).await;
+
                         self.is_running.store(false, Ordering::SeqCst);
-                        self.emit(SessionEvent::Cancelled).await;
+                        self.emit(SessionEvent::Cancelled { prompt: None }).await;
                         self.notify_push("Cancelled").await;
                         return;
                     }
@@ -383,8 +421,11 @@ impl Session {
                                         )
                                     }
                                 };
+                                let name = tool_call.function.name.clone();
+                                // Track for cancellation recovery.
+                                pending_tool_calls.push(tool_call);
                                 self.emit(SessionEvent::ToolCall {
-                                    name: tool_call.function.name,
+                                    name,
                                     arguments: args,
                                 })
                                 .await;
@@ -392,20 +433,47 @@ impl Session {
 
                             Some(Ok(MultiTurnStreamItem::StreamUserItem(
                                 rig::streaming::StreamedUserContent::ToolResult {
-                                    tool_result, ..
+                                    tool_result,
+                                    ..
                                 },
                             ))) => {
                                 let text: String = tool_result
                                     .content
                                     .iter()
                                     .filter_map(|c| match c {
-                                        rig::message::ToolResultContent::Text(t) => {
+                                        message::ToolResultContent::Text(t) => {
                                             Some(t.text.as_str())
                                         }
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>()
                                     .join("");
+
+                                // Match tool result with its pending tool call
+                                // and commit the pair as a completed turn.
+                                if let Some(pos) = pending_tool_calls
+                                    .iter()
+                                    .position(|tc| tc.id == tool_result.id)
+                                {
+                                    let tc = pending_tool_calls.remove(pos);
+
+                                    // Assistant message with the tool call.
+                                    let assistant_msg = completion::Message::Assistant {
+                                        id: None,
+                                        content: OneOrMany::one(
+                                            completion::AssistantContent::ToolCall(tc),
+                                        ),
+                                    };
+                                    committed_messages.push(assistant_msg);
+
+                                    // User message with the tool result.
+                                    let user_msg = completion::Message::User {
+                                        content: OneOrMany::one(
+                                            message::UserContent::ToolResult(tool_result),
+                                        ),
+                                    };
+                                    committed_messages.push(user_msg);
+                                }
 
                                 self.emit(SessionEvent::ToolResult { content: text }).await;
                                 self.emit(SessionEvent::Thinking).await;

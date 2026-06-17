@@ -118,7 +118,7 @@ impl TerminalClient {
 
         // ── channel plumbing ──────────────────────────────────
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Option<String>>();
-        let (ready_tx, ready_rx) = mpsc::unbounded_channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::unbounded_channel::<Option<String>>();
         let ready_rx = Arc::new(StdMutex::new(Some(ready_rx)));
 
         // Events from WS → render task.
@@ -128,7 +128,7 @@ impl TerminalClient {
         let session_name: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
 
         // Render task signals main loop when output is fully rendered.
-        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Option<String>>();
 
         // ── banner ────────────────────────────────────────────
         {
@@ -147,6 +147,7 @@ impl TerminalClient {
         // ── permanent readline thread ──────────────────────────
         let thread_ready = ready_rx.clone();
         std::thread::spawn(move || {
+            let mut prefill: Option<String> = None;
             'outer: loop {
                 let mut buffer = String::new();
                 let mut first = true;
@@ -158,7 +159,13 @@ impl TerminalClient {
                         "  \x1b[2m…\x1b[0m "
                     };
 
-                    match rl.readline(prompt) {
+                    let line = if let Some(ref text) = prefill.take() {
+                        rl.readline_with_initial(prompt, (text, ""))
+                    } else {
+                        rl.readline(prompt)
+                    };
+
+                    match line {
                         Ok(line) => {
                             if first && line.trim().is_empty() {
                                 continue 'outer;
@@ -179,8 +186,11 @@ impl TerminalClient {
                                 if let Some(rx) =
                                     thread_ready.lock().expect("ready mutex poisoned").as_mut()
                                 {
-                                    if rx.blocking_recv().is_none() {
-                                        break 'outer;
+                                    match rx.blocking_recv() {
+                                        Some(next_prefill) => {
+                                            prefill = next_prefill;
+                                        }
+                                        None => break 'outer,
                                     }
                                 } else {
                                     break 'outer;
@@ -305,7 +315,7 @@ impl TerminalClient {
                         }
                     }
 
-                    ready_tx.send(()).ok();
+                    ready_tx.send(None).ok();
                 }
                 _ => {
                     let name = session_name
@@ -416,7 +426,7 @@ impl<P: rustyline::ExternalPrinter> RenderState<P> {
 pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
     printer: Arc<StdMutex<P>>,
     mut events: mpsc::UnboundedReceiver<SessionEvent>,
-    done_tx: mpsc::UnboundedSender<()>,
+    done_tx: mpsc::UnboundedSender<Option<String>>,
     term_width: usize,
 ) {
     use crate::events::PromptSource;
@@ -541,21 +551,28 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 state.parser = Parser::new();
                 state.line_buf.clear();
                 state.in_turn = false;
-                done_tx.send(()).ok();
+                done_tx.send(None).ok();
             }
 
-            SessionEvent::Cancelled => {
+            SessionEvent::Cancelled { prompt } => {
                 // Flush any partial markdown, then signal done.
                 state.flush_markdown();
                 state.reset_renderer();
                 state.parser = Parser::new();
                 state.line_buf.clear();
-                state
-                    .lock_printer()
-                    .print(format!("{DIM}cancelled.{RST}\n"))
-                    .ok();
+                if prompt.is_some() {
+                    state
+                        .lock_printer()
+                        .print(format!("{DIM}cancelled — ↑ to edit{RST}\n"))
+                        .ok();
+                } else {
+                    state
+                        .lock_printer()
+                        .print(format!("{DIM}cancelled.{RST}\n"))
+                        .ok();
+                }
                 state.in_turn = false;
-                done_tx.send(()).ok();
+                done_tx.send(prompt).ok();
             }
 
             SessionEvent::Error(e) => {
@@ -565,7 +582,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                     .print(format!("\x1b[1;31merror:\x1b[0m {e}\n"))
                     .ok();
                 state.in_turn = false;
-                done_tx.send(()).ok();
+                done_tx.send(None).ok();
             }
         }
     }
