@@ -7,7 +7,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::{Notify, broadcast};
@@ -113,13 +113,21 @@ pub fn spawn_new_binary() -> bool {
 
 /// Build the axum router (exposed so GUI mode can bind the listener
 /// synchronously before opening the webview).
-pub fn build_router(manager: Arc<SessionManager>) -> Router {
-    let state = Arc::new(ServerState { manager });
+pub fn build_router(
+    manager: Arc<SessionManager>,
+    push_manager: Arc<crate::push::PushManager>,
+) -> Router {
+    let state = Arc::new(ServerState {
+        manager,
+        push_manager,
+    });
     Router::new()
         .route("/", get(index))
         .route("/ws", get(ws_handler))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}", delete(delete_session))
+        .route("/api/vapid-public-key", get(vapid_public_key))
+        .route("/api/push-subscribe", post(push_subscribe))
         .route("/manifest.json", get(manifest))
         .route("/sw.js", get(service_worker))
         .route("/icon-192.png", get(icon_192))
@@ -131,8 +139,11 @@ pub fn build_router(manager: Arc<SessionManager>) -> Router {
 /// Binds to 127.0.0.1:8187 — safe behind an nginx reverse proxy.
 ///
 /// Returns when the shutdown signal fires (restart tool or Ctrl+C).
-pub async fn serve(manager: Arc<SessionManager>) -> anyhow::Result<()> {
-    let app = build_router(manager);
+pub async fn serve(
+    manager: Arc<SessionManager>,
+    push_manager: Arc<crate::push::PushManager>,
+) -> anyhow::Result<()> {
+    let app = build_router(manager, push_manager);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8187").await?;
     tracing::info!("web server on http://127.0.0.1:8187");
     axum::serve(listener, app)
@@ -145,6 +156,7 @@ pub async fn serve(manager: Arc<SessionManager>) -> anyhow::Result<()> {
 
 struct ServerState {
     manager: Arc<SessionManager>,
+    push_manager: Arc<crate::push::PushManager>,
 }
 
 // ── routes ──────────────────────────────────────────────────────
@@ -223,6 +235,28 @@ async fn delete_session(
 ) -> impl IntoResponse {
     state.manager.delete(&name).await;
     axum::Json(serde_json::json!({ "deleted": true })).into_response()
+}
+
+// ── push notification endpoints ─────────────────────────────────
+
+/// Return the VAPID public key so the client can subscribe to push.
+async fn vapid_public_key(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    let key = state.push_manager.vapid_public_key_b64();
+    axum::Json(serde_json::json!({ "publicKey": key }))
+}
+
+#[derive(Deserialize)]
+struct PushSubscribeBody {
+    subscription: web_push::SubscriptionInfo,
+}
+
+/// Accept a push subscription from the client.
+async fn push_subscribe(
+    State(state): State<Arc<ServerState>>,
+    axum::Json(body): axum::Json<PushSubscribeBody>,
+) -> impl IntoResponse {
+    state.push_manager.add_subscription(body.subscription);
+    axum::Json(serde_json::json!({ "ok": true }))
 }
 
 // ── websocket ───────────────────────────────────────────────────

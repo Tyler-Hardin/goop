@@ -79,6 +79,10 @@ pub struct Session {
     /// for tool invocation. Shared MCP servers live in [`SessionManager`].
     #[allow(dead_code)]
     session_mcp: Arc<crate::mcp::McpManager>,
+
+    /// Push notification sender — called when a prompt completes so PWAs
+    /// in the background get a system notification.
+    push_notifier: Arc<crate::push::PushManager>,
 }
 
 impl Session {
@@ -104,6 +108,7 @@ impl Session {
         capacity: usize,
         session_name: Option<String>,
         shared_mcp_manager: Arc<crate::mcp::McpManager>,
+        push_notifier: Arc<crate::push::PushManager>,
     ) -> anyhow::Result<Arc<Self>> {
         // ── persistence paths ──────────────────────────────────
         let name = session_name.unwrap_or_else(next_session_name);
@@ -233,6 +238,7 @@ impl Session {
             is_running: AtomicBool::new(false),
             events_file: Some(events_path),
             session_mcp: session_mcp_manager,
+            push_notifier,
         });
 
         // Spawn the background worker that serializes prompt processing.
@@ -352,6 +358,7 @@ impl Session {
                     _ = &mut cancel_rx => {
                         self.is_running.store(false, Ordering::SeqCst);
                         self.emit(SessionEvent::Cancelled).await;
+                        self.notify_push("Cancelled").await;
                         return;
                     }
 
@@ -407,6 +414,7 @@ impl Session {
                             Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
                                 self.clear_cancel().await;
                                 self.emit(SessionEvent::FinalResponse).await;
+                                self.notify_push("FinalResponse").await;
                                 return;
                             }
 
@@ -415,6 +423,7 @@ impl Session {
                             Some(Err(e)) => {
                                 self.clear_cancel().await;
                                 self.emit(SessionEvent::Error(e.to_string())).await;
+                                self.notify_push("Error").await;
                                 return;
                             }
 
@@ -422,6 +431,7 @@ impl Session {
                                 // Stream ended without FinalResponse.
                                 self.clear_cancel().await;
                                 self.emit(SessionEvent::FinalResponse).await;
+                                self.notify_push("FinalResponse").await;
                                 return;
                             }
                         }
@@ -435,6 +445,18 @@ impl Session {
     async fn clear_cancel(&self) {
         self.cancel_tx.lock().await.take();
         self.is_running.store(false, Ordering::SeqCst);
+    }
+
+    /// Fire a push notification so PWAs in the background know the
+    /// prompt has completed.  Spawned as a separate task so push
+    /// delivery latency doesn't block the session.
+    async fn notify_push(&self, event: &str) {
+        let notifier = Arc::clone(&self.push_notifier);
+        let name = self.name.clone();
+        let event = event.to_string();
+        tokio::spawn(async move {
+            notifier.notify(&name, &event).await;
+        });
     }
 
     /// Send an event to live subscribers, append to history, and
@@ -462,14 +484,18 @@ pub struct SessionManager {
     /// servers enabled globally.  Always present (empty manager when
     /// no shared servers are configured).  Cloned into each new session.
     global_mcp: tokio::sync::RwLock<Arc<crate::mcp::McpManager>>,
+    /// Push notification manager — cloned into each new session so
+    /// prompts can trigger push notifications on completion.
+    push_manager: Arc<crate::push::PushManager>,
 }
 
 impl SessionManager {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, push_manager: Arc<crate::push::PushManager>) -> Self {
         Self {
             sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             config,
             global_mcp: tokio::sync::RwLock::new(crate::mcp::McpManager::empty()),
+            push_manager,
         }
     }
 
@@ -521,7 +547,15 @@ impl SessionManager {
         // Slow path: create the session (may await SSH reconnect),
         // then insert under write lock.
         let shared_mcp = Arc::clone(&*self.global_mcp.read().await);
-        let session = Session::new(&self.config, 256, Some(name.clone()), shared_mcp).await?;
+        let push_manager = Arc::clone(&self.push_manager);
+        let session = Session::new(
+            &self.config,
+            256,
+            Some(name.clone()),
+            shared_mcp,
+            push_manager,
+        )
+        .await?;
         let mut sessions = self.sessions.write().await;
         // Double-check: another caller may have created it while we
         // were building the session.

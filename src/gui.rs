@@ -48,7 +48,8 @@ fn fetch_latest_session() -> Option<String> {
 /// GUI mode when we own the session + server.
 fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> anyhow::Result<()> {
     let config = crate::config::load_config(None, None)?;
-    let manager = Arc::new(SessionManager::new(config));
+    let push_manager = Arc::new(crate::push::PushManager::new());
+    let manager = Arc::new(SessionManager::new(config, Arc::clone(&push_manager)));
     rt.block_on(async {
         manager.init_global_mcp().await;
         manager.discover().await
@@ -60,7 +61,7 @@ fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> any
         tracing::info!("session · {}", session.name());
     }
 
-    let app = server::build_router(manager);
+    let app = server::build_router(manager, push_manager);
 
     // Bind the TCP listener synchronously on the main thread so that
     // the server is guaranteed to be listening before the webview loads.

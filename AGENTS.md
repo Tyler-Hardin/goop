@@ -10,13 +10,15 @@ shell access.
                   ┌─────────────────────────────────┐
                   │        SessionManager            │
                   │  HashMap<name, Arc<Session>>      │
-                  │  + Config                        │
+                  │  + Config  + PushManager         │
                   └──────────────┬──────────────────┘
                                  │
                   ┌─────────────────────────────────┐
                   │        Web Server (axum/WS)       │
                   │      127.0.0.1:8187               │
                   │   REST: /api/sessions             │
+                  │         /api/vapid-public-key      │
+                  │         /api/push-subscribe        │
                   │   WS:   /ws?session=<name>        │
                   └────┬──────────┬──────────┬───────┘
                        │          │          │
@@ -24,7 +26,10 @@ shell access.
               ┌────────┐  ┌────────┐  ┌──────────────┐
               │Terminal│  │WebView │  │  Browser /    │
               │ Client │  │(wry)   │  │  Phone / etc  │
-              └────────┘  └────────┘  └──────────────┘
+              └────────┘  └────────┘  └──────┬───────┘
+                                             │
+                                    Push notification
+                                    (background / locked)
 ```
 
 The server manages multiple sessions concurrently.  Each WebSocket connection
@@ -256,6 +261,8 @@ directly to pass the configurable `ollama_base_url` (from `Config` or
 - `GET /api/sessions` — returns sorted list of active session names
 - `POST /api/sessions` — create a new session; body `{"name": "optional"}`
 - `DELETE /api/sessions/{name}` — close session (remove from memory, mark as closed in `closed_sessions.json`; disk files preserved)
+- `GET /api/vapid-public-key` — return VAPID public key for push subscription
+- `POST /api/push-subscribe` — register a push subscription; body `{"subscription": {...}}`
 
 ### Session working directory (CWD)
 
@@ -325,6 +332,63 @@ Clicking a session disconnects the current WS and opens a new one to
 Each session has a delete (×) button.  The URL hash (`#session=<name>`)
 tracks the active session for bookmarking.  On mobile, the sidebar is a
 slide-out drawer.
+
+### PWA push notifications
+
+When a prompt completes (FinalResponse, Error, or Cancelled), the session
+fires a push notification via the [Web Push API](https://datatracker.ietf.org/doc/html/rfc8030)
+so the PWA can alert the user even when backgrounded or phone-locked.
+
+**Architecture:**
+
+```
+Session          PushManager        Browser Push Service      PWA (sw.js)
+  │                   │                    │                     │
+  │  prompt done      │                    │                     │
+  │ ──notify────────> │                    │                     │
+  │                   │  VAPID JWT +       │                     │
+  │                   │  aes128gcm POST    │                     │
+  │                   │ ─────────────────> │                     │
+  │                   │                    │  push event         │
+  │                   │                    │ ──────────────────> │
+  │                   │                    │                     │ showNotification()
+```
+
+- **`PushManager`** (`src/push.rs`) — owns a VAPID key pair (P-256, generated
+  once and persisted to `~/.config/goop/vapid.toml`) and a list of registered
+  push subscriptions (persisted to `~/.config/goop/push_subscriptions.json`).
+  Created at server startup; threaded through `SessionManager` → `Session`.
+  On `notify()`, encrypts a JSON payload (`{"session":"...","event":"..."}`)
+  via AES-128-GCM (RFC 8291) using [`ring`], signs a VAPID JWT (RFC 8292)
+  using `p256::ecdsa`, and POSTs to each subscription endpoint (FCM, APNs, …).
+  Expired endpoints (HTTP 410) are silently dropped.
+- **Client JS** (`assets/index.html`) — requests `Notification` permission,
+  fetches the VAPID public key from `GET /api/vapid-public-key`, calls
+  `pushManager.subscribe()`, and sends the resulting `PushSubscription` to
+  `POST /api/push-subscribe`.
+- **Service worker** (`assets/sw.js`) — handles `push` events by showing a
+  system notification tagged with the session name (so duplicates coalesce).
+  On `notificationclick`, focuses or opens the PWA window and navigates to
+  the relevant session.
+- **Crypto** — AES-128-GCM and HKDF via [`ring`] (pure Rust + ASM, no C
+  deps).  ECDH and ECDSA via [`p256`] (pure Rust).  VAPID JWT constructed
+  and signed manually (minimal DER→raw signature conversion, no JWT crate).
+  This avoids the `generic-array` version conflict between `russh` (v1.x)
+  and the RustCrypto stack (v0.14).
+
+**REST endpoints added:**
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/vapid-public-key` | Return `{"publicKey":"..."}` for `pushManager.subscribe()` |
+| `POST` | `/api/push-subscribe` | Accept `{"subscription":PushSubscription}` and store |
+
+**Persistence files added:**
+
+| File | Format | Purpose |
+|------|--------|---------|
+| `~/.config/goop/vapid.toml` | TOML | VAPID private key + public key + subject |
+| `~/.config/goop/push_subscriptions.json` | JSON | Array of `PushSubscription` objects |
 
 ## History
 

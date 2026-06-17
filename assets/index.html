@@ -1617,7 +1617,14 @@
       let deferredInstall = null;
 
       if ("serviceWorker" in navigator) {
-        navigator.serviceWorker.register("/sw.js").catch(() => {});
+        navigator.serviceWorker
+          .register("/sw.js")
+          .then((reg) => {
+            console.log("PWA: service worker registered");
+            // Subscribe to push after SW is ready.
+            subscribePush();
+          })
+          .catch(() => {});
         window.addEventListener("beforeinstallprompt", (e) => {
           e.preventDefault();
           deferredInstall = e;
@@ -1626,7 +1633,52 @@
         window.addEventListener("appinstalled", () => {
           console.log("PWA: installed");
           deferredInstall = null;
+          // Re-subscribe after install (keys may change).
+          subscribePush();
         });
+      }
+
+      // ── push subscription ────────────────────────
+      async function subscribePush() {
+        if (!("Notification" in window)) return;
+        if (!("PushManager" in window)) return;
+
+        const perm = await Notification.requestPermission();
+        if (perm !== "granted") return;
+
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (!reg) return;
+
+        // Get the VAPID public key from the server.
+        let publicKey;
+        try {
+          const resp = await fetch("/api/vapid-public-key");
+          const data = await resp.json();
+          publicKey = data.publicKey;
+        } catch (_) {
+          return;
+        }
+
+        try {
+          const sub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(publicKey),
+          });
+          await fetch("/api/push-subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ subscription: sub.toJSON() }),
+          });
+          console.log("PWA: push subscribed");
+        } catch (e) {
+          console.warn("PWA: push subscribe failed:", e);
+        }
+      }
+
+      function urlBase64ToUint8Array(s) {
+        const padding = "=".repeat((4 - (s.length % 4)) % 4);
+        const raw = atob(s.replace(/-/g, "+").replace(/_/g, "/") + padding);
+        return Uint8Array.from(raw, (c) => c.charCodeAt(0));
       }
     </script>
   </body>

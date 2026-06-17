@@ -64,7 +64,7 @@
 
           nativeBuildInputs = [ pkgs.pkg-config ] ++ pkgs.lib.optionals isLinux linuxNativeBuildInputs;
 
-          buildInputs = pkgs.lib.optionals isLinux linuxBuildInputs;
+          buildInputs = [ pkgs.openssl ] ++ pkgs.lib.optionals isLinux linuxBuildInputs;
 
           postFixup = pkgs.lib.optionalString isLinux ''
             wrapProgram $out/bin/goop \

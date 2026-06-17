@@ -5,6 +5,7 @@ mod mcp;
 mod memory;
 mod model;
 mod preamble;
+mod push;
 mod server;
 mod session;
 mod session_state;
@@ -81,13 +82,14 @@ async fn run_terminal(session_name: Option<String>) -> anyhow::Result<()> {
 /// Spawn the server in the background and return once it's listening.
 async fn start_server_in_background() -> anyhow::Result<()> {
     let config = config::load_config(None, None)?;
-    let manager = Arc::new(SessionManager::new(config));
+    let push_manager = Arc::new(push::PushManager::new());
+    let manager = Arc::new(SessionManager::new(config, Arc::clone(&push_manager)));
     manager.init_global_mcp().await;
     manager.discover().await?;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _ = ready_tx.send(());
-        if let Err(e) = server::serve(manager).await {
+        if let Err(e) = server::serve(manager, push_manager).await {
             tracing::error!("server exited: {e}");
         }
         // If restart was requested, spawn the new server binary.
@@ -105,7 +107,8 @@ async fn start_server_in_background() -> anyhow::Result<()> {
 
 async fn run_server(session_name: Option<String>) -> anyhow::Result<()> {
     let config = config::load_config(None, None)?;
-    let manager = Arc::new(SessionManager::new(config));
+    let push_manager = Arc::new(push::PushManager::new());
+    let manager = Arc::new(SessionManager::new(config, Arc::clone(&push_manager)));
     manager.init_global_mcp().await;
     manager.discover().await?;
     // If the user asked for a specific session, ensure it's loaded.
@@ -113,7 +116,7 @@ async fn run_server(session_name: Option<String>) -> anyhow::Result<()> {
         let session = manager.get_or_create(name).await?;
         tracing::info!("session · {}", session.name());
     }
-    server::serve(manager).await?;
+    server::serve(manager, push_manager).await?;
 
     // If restart was requested, spawn the new server and exit.
     // The new process takes over the :8187 port.

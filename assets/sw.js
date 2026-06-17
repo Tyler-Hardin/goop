@@ -55,3 +55,58 @@ self.addEventListener("fetch", (e) => {
     ),
   );
 });
+
+// ── push notifications ────────────────────────────────────────
+
+self.addEventListener("push", (event) => {
+  let data = {};
+  try {
+    if (event.data) data = event.data.json();
+  } catch (_) {}
+
+  const session = data.session || "goop";
+  const body =
+    data.event === "FinalResponse"
+      ? "Prompt completed"
+      : data.event === "Error"
+        ? "Prompt errored"
+        : data.event === "Cancelled"
+          ? "Prompt cancelled"
+          : "Prompt finished";
+
+  const title = `goop — ${session}`;
+  const options = {
+    body,
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
+    tag: `goop-${session}`,
+    data: { session },
+    requireInteraction: false,
+  };
+
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const session = event.notification.data?.session;
+  const target = session
+    ? `/#session=${encodeURIComponent(session)}`
+    : "/";
+
+  event.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((windows) => {
+      // Try to focus an existing window showing goop.
+      for (const w of windows) {
+        if (w.url.startsWith(self.location.origin)) {
+          // Try to navigate to the target session.
+          w.postMessage({ type: "goop-navigate", session });
+          w.focus();
+          return;
+        }
+      }
+      // No existing window — open a new one.
+      return clients.openWindow(target);
+    }),
+  );
+});
