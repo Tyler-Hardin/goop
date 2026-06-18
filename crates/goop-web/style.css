@@ -735,6 +735,12 @@ footer button.cancel-slide .icon-cancel {
   }
 }
 
+/* ── mobile floating new-session button ────────── */
+
+#newSessionFab {
+  display: none;
+}
+
 /* ── empty state ──────────────────────────────── */
 
 .empty-state {
@@ -850,8 +856,44 @@ footer button.cancel-slide .icon-cancel {
     font-size: 16px;
   } /* prevent iOS zoom */
   footer button {
-    padding: 11px 16px;
+    position: fixed;
+    bottom: 78px;
+    right: 14px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    z-index: 50;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
     font-size: 14px;
+    padding: 0;
+  }
+  #newSessionFab {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    bottom: 78px;
+    left: 14px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: var(--blue-dim);
+    color: #fff;
+    border: none;
+    font-size: 22px;
+    font-weight: 400;
+    cursor: pointer;
+    z-index: 50;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+    transition:
+      background 0.2s,
+      transform 0.15s;
+    font-family: var(--font);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #newSessionFab:active {
+    background: var(--blue);
+    transform: scale(0.92);
   }
   nav .sidebar-footer {
     min-height: 0;
