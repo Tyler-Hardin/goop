@@ -143,11 +143,13 @@ pub fn InputBar() -> impl IntoView {
     let on_touchend = {
         let state = state.clone();
         move |evt: ev::TouchEvent| {
-            evt.prevent_default();
             if let Some((next, cancelled)) = BtnState::end_recording(btn_state.get_untracked()) {
+                evt.prevent_default();
                 btn_state.set(next);
                 input_button::spawn_recording_stop(state.clone(), btn_state, cancelled);
             }
+            // When not in a recording state, do nothing — let the browser
+            // synthesize a click event so the on:click handler fires.
         }
     };
 

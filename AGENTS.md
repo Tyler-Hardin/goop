@@ -581,6 +581,11 @@ nix develop
 The web server binds to `127.0.0.1:8187` (designed to sit behind nginx
 with origin validation).
 
+**After making frontend changes**, rebuild with `(cd crates/goop-web && trunk build)`.
+The server reads the Trunk dist from disk at runtime — no `cargo build` needed,
+just refresh the browser.  Back-end (server) changes do require `cargo build`
+and a restart (the `restart` tool handles this when the new binary is ready).
+
 ## Coding conventions
 
 - Rust edition 2024.
