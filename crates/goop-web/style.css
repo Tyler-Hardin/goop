@@ -877,9 +877,9 @@ footer button.cancel-slide .icon-cancel {
     width: 44px;
     height: 44px;
     border-radius: 50%;
-    background: var(--blue-dim);
-    color: #fff;
-    border: none;
+    background: var(--surface2);
+    color: var(--dim);
+    border: 1px solid var(--border);
     font-size: 22px;
     font-weight: 400;
     cursor: pointer;
@@ -887,13 +887,21 @@ footer button.cancel-slide .icon-cancel {
     box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
     transition:
       background 0.2s,
-      transform 0.15s;
+      color 0.2s,
+      border-color 0.2s,
+      opacity 0.2s,
+      box-shadow 0.2s;
     font-family: var(--font);
     -webkit-tap-highlight-color: transparent;
   }
+  #newSessionFab:hover {
+    border-color: var(--blue);
+    color: var(--blue);
+    background: var(--surface2);
+  }
   #newSessionFab:active {
-    background: var(--blue);
-    transform: scale(0.92);
+    opacity: 0.85;
+    transform: scale(0.96);
   }
   nav .sidebar-footer {
     min-height: 0;
