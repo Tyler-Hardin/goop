@@ -321,5 +321,11 @@ fn lookup_context_length(provider: crate::config::Provider, model_name: &str) ->
 
             _ => None,
         },
+
+        Provider::Zai => match model_name {
+            // Only GLM-5.2 is supported — 1M context window.
+            "glm-5.2" => Some(1_000_000),
+            _ => None,
+        },
     }
 }

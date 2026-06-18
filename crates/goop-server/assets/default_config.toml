@@ -7,7 +7,7 @@
 
 # LLM model in litellm-style provider/model format.
 # Provider is the first segment before "/", model is everything after.
-# Supported providers: deepseek | openai | openrouter | groq | ollama | anthropic
+# Supported providers: deepseek | openai | openrouter | groq | ollama | anthropic | zai
 model = "{{ model }}"
 
 # Maximum tokens per response.

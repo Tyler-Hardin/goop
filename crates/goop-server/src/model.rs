@@ -14,7 +14,7 @@ use rig::agent::Agent;
 use rig::client::CompletionClient;
 use rig::completion::Message;
 use rig::memory::ConversationMemory;
-use rig::providers::{anthropic, deepseek, groq, ollama, openai, openrouter};
+use rig::providers::{anthropic, deepseek, groq, ollama, openai, openrouter, zai};
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 
 use crate::config::{self, Config, Provider};
@@ -37,6 +37,9 @@ pub(crate) enum AnyStreamingResponse {
     Groq(groq::StreamingCompletionResponse),
     Ollama(ollama::StreamingCompletionResponse),
     Anthropic(anthropic::streaming::StreamingCompletionResponse),
+    /// Z.ai uses an OpenAI-compatible streaming protocol, so the response
+    /// type is the same as OpenAI's.
+    Zai(openai::completion::streaming::StreamingCompletionResponse),
 }
 
 // ── agent enum ───────────────────────────────────────────────────
@@ -49,6 +52,8 @@ pub(crate) enum AnyAgent {
     Groq(Agent<groq::CompletionModel>),
     Ollama(Agent<ollama::CompletionModel>),
     Anthropic(Agent<anthropic::completion::CompletionModel>),
+    /// Z.ai / GLM — OpenAI-compatible API.  Only GLM-5.2 is used.
+    Zai(Agent<openai::completion::GenericCompletionModel<zai::ZAiExt>>),
 }
 
 impl AnyAgent {
@@ -61,6 +66,7 @@ impl AnyAgent {
             AnyAgent::Groq(a) => AnyStream::Groq(a.stream_prompt(prompt).await),
             AnyAgent::Ollama(a) => AnyStream::Ollama(a.stream_prompt(prompt).await),
             AnyAgent::Anthropic(a) => AnyStream::Anthropic(a.stream_prompt(prompt).await),
+            AnyAgent::Zai(a) => AnyStream::Zai(a.stream_prompt(prompt).await),
         }
     }
 
@@ -90,6 +96,7 @@ impl AnyAgent {
             AnyAgent::Groq(a) => do_append!(a),
             AnyAgent::Ollama(a) => do_append!(a),
             AnyAgent::Anthropic(a) => do_append!(a),
+            AnyAgent::Zai(a) => do_append!(a),
         }
     }
 }
@@ -105,6 +112,8 @@ pub(crate) enum AnyStream {
     Groq(rig::agent::StreamingResult<groq::StreamingCompletionResponse>),
     Ollama(rig::agent::StreamingResult<ollama::StreamingCompletionResponse>),
     Anthropic(rig::agent::StreamingResult<anthropic::streaming::StreamingCompletionResponse>),
+    /// Z.ai uses the same OpenAI-compatible streaming protocol.
+    Zai(rig::agent::StreamingResult<openai::completion::streaming::StreamingCompletionResponse>),
 }
 
 impl Stream for AnyStream {
@@ -126,6 +135,7 @@ impl Stream for AnyStream {
             AnyStream::Anthropic(inner) => {
                 map_stream_poll(inner, cx, AnyStreamingResponse::Anthropic)
             }
+            AnyStream::Zai(inner) => map_stream_poll(inner, cx, AnyStreamingResponse::Zai),
         }
     }
 }
@@ -277,6 +287,10 @@ pub fn build_agent(
         Provider::Anthropic => arm!(
             Anthropic,
             anthropic::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::Zai => arm!(
+            Zai,
+            zai::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
         ),
     };
 

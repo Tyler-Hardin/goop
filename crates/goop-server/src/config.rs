@@ -79,6 +79,9 @@ pub enum Provider {
     Groq,
     Ollama,
     Anthropic,
+    /// Z.ai / GLM — OpenAI-compatible API.
+    /// Only GLM-5.2 is supported (1M context window).
+    Zai,
 }
 
 impl Provider {
@@ -91,6 +94,7 @@ impl Provider {
             "groq" => Some(Provider::Groq),
             "ollama" => Some(Provider::Ollama),
             "anthropic" => Some(Provider::Anthropic),
+            "zai" => Some(Provider::Zai),
             _ => None,
         }
     }
@@ -104,6 +108,7 @@ impl Provider {
             Provider::Groq => "groq",
             Provider::Ollama => "ollama",
             Provider::Anthropic => "anthropic",
+            Provider::Zai => "zai",
         }
     }
 
@@ -116,6 +121,7 @@ impl Provider {
             Provider::Groq => "GROQ_API_KEY",
             Provider::Ollama => "", // local, no key needed
             Provider::Anthropic => "ANTHROPIC_API_KEY",
+            Provider::Zai => "ZAI_API_KEY",
         }
     }
 
@@ -128,6 +134,7 @@ impl Provider {
             Provider::Groq => "groq/llama-3.2-70b-versatile",
             Provider::Ollama => "ollama/llama3.2",
             Provider::Anthropic => "anthropic/claude-sonnet-4-6",
+            Provider::Zai => "zai/glm-5.2",
         }
     }
 
@@ -157,6 +164,7 @@ impl Provider {
             Provider::Groq => "Groq",
             Provider::Ollama => "Ollama",
             Provider::Anthropic => "Anthropic",
+            Provider::Zai => "Z.ai",
         }
     }
 }
@@ -207,7 +215,7 @@ impl FromStr for Model {
         let provider = Provider::from_model_prefix(prefix).ok_or_else(|| {
             ConfigError::InvalidModel(format!(
                 "unknown provider {prefix:?} — supported: deepseek, openai, \
-                 openrouter, groq, ollama, anthropic"
+                 openrouter, groq, ollama, anthropic, zai"
             ))
         })?;
 
@@ -715,6 +723,7 @@ mod tests {
             "groq/x",
             "ollama/x",
             "anthropic/x",
+            "zai/x",
         ] {
             let m: Model = input.parse().unwrap();
             assert_eq!(m.to_string(), input);
@@ -1002,6 +1011,7 @@ command = "my-indexer"
             ("groq", Provider::Groq),
             ("ollama", Provider::Ollama),
             ("anthropic", Provider::Anthropic),
+            ("zai", Provider::Zai),
         ] {
             assert_eq!(Provider::from_model_prefix(s), Some(p));
             assert_eq!(p.as_str(), s);
