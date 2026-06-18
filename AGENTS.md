@@ -6,6 +6,32 @@ shell access.
 
 ## Architecture
 
+### Workspace structure
+
+```
+goop/                         (workspace root)
+├── crates/
+│   ├── goop-shared/          shared types (SessionEvent, ClientMessage, PromptSource)
+│   ├── goop-server/          main binary ("goop") — axum server, tools, terminal, GUI
+│   │   └── assets/           embedded fallback HTML (fb.html, used when trunk dist absent)
+│   └── goop-web/             Leptos frontend (built by Trunk → wasm)
+│       ├── src/
+│       │   ├── components/   UI components (header, message_log, input_bar, etc.)
+│       │   ├── state.rs      AppState — global reactive state (RwSignals)
+│       │   ├── ws.rs         WebSocket connection + SessionEvent dispatch
+│       │   ├── markdown.rs   Markdown → HTML via marked.js + DOMPurify
+│       │   ├── stt.rs        Speech-to-text bridge (→ js/stt.js)
+│       │   ├── pwa.rs        Service worker + push subscription
+│       │   └── app.rs        Root component + layout
+│       ├── js/stt.js         MediaRecorder + WAV encoder (hybrid JS/Rust)
+│       ├── style.css         Full app stylesheet
+│       ├── index.html        Trunk entry point
+│       └── Trunk.toml
+└── flake.nix
+```
+
+### Data flow
+
 ```
                   ┌─────────────────────────────────┐
                   │        SessionManager            │
@@ -63,7 +89,8 @@ The web UI shows a session sidebar for switching between sessions.
   `ToolResult`, `FinalResponse`, `Error`, `Cancelled`.  Serialized as
   tagged JSON over the WebSocket.
 - **Server** (`src/server.rs`) — axum HTTP + WebSocket server bound to
-  `127.0.0.1:8187`. Serves `assets/index.html`, a REST API for session
+  `127.0.0.1:8187`. Serves the Leptos frontend from disk (trunk dist)
+  with an embedded `assets/fb.html` as fallback, a REST API for session
   management (`GET/POST /api/sessions`, `DELETE /api/sessions/{name}`),
   and WS upgrade at `/ws?session=<name>` with full history replay.
   Supports graceful self-restart: the `restart` tool sets a flag on
@@ -80,9 +107,50 @@ The web UI shows a session sidebar for switching between sessions.
   drives the streamdown parser + renderer. Passes its session name in the
   WS URL.
 - **Desktop GUI** (`src/main.rs` `run_gui`) — opens a native `wry` webview
-  pointing at `http://127.0.0.1:8187`. The existing web UI
-  (`assets/index.html`) is reused verbatim. If `--session` is given, the
-  session name is passed in the URL hash so the web UI pre-selects it.
+  pointing at `http://127.0.0.1:8187`. Uses the Leptos frontend when
+  trunk-built, falling back to the embedded `assets/fb.html`. If
+  `--session` is given, the session name is passed in the URL hash.
+- **Leptos frontend** (`crates/goop-web/`) — Trunk-built WASM app. Reactive
+  state via `AppState` (RwSignals), WebSocket dispatch to `UiMessage` enum,
+  markdown rendering via marked.js/DOMPurify, speech-to-text with hybrid
+  JS/Rust, PWA push subscription. Touch gestures (sidebar swipe,
+  pull-to-refresh) use raw web-sys event listeners.
+
+  See `crates/goop-web/leptos_style_guide.md` for the Leptos coding
+  conventions (FSMs over booleans, hydration, layout stability, etc.).
+
+  **Frontend state machines:** Two explicit FSMs prevent "impossible state"
+  bugs:
+  - `BtnState` (`components/input_button.rs`) — unified send/mic/cancel
+    button: `Idle | Recording | CancelSlide | Running | Disabled`.  All
+    transitions go through pure methods; DOM handlers never set the state
+    directly.
+  - `ConnectionState` (`state.rs`) — WebSocket lifecycle:
+    `Disconnected | CatchingUp | Connected`.  Replaces a pair of implicit
+    booleans (`connected` + `catching_up`).  During `CatchingUp` the
+    `EmptyState` component hides its hint text and acts as a layout-stable
+    skeleton, preventing a flash-before-history.
+
+  **ToolResult routing** (`state.rs` `dispatch()`) — the live `ToolResult`
+  handler does NOT store a message index (the former `last_tool_idx` was
+  fragile: `build_messages` didn't set it, so after history replay or
+  session switches it could point to a wrong or nonexistent message).
+  Instead it scans the `messages` vec backwards for the most-recent
+  `ToolCall` whose `result` is `None`.  The server serialises tool
+  execution, so the first `None`-result `ToolCall` from the end is always
+  the right target.  The scan is O(n) but stops at the first match,
+  effectively O(1) in practice.
+
+  **TurnState FSM** (`state.rs`) — `TurnState { Idle, Thinking, Active }`.
+  Replaces the former `thinking: bool` + `remove_last_thinking()` pattern.
+  The invariant: a `UiMessage::Thinking` is at the end of `messages` **iff**
+  the state is `Thinking`.  Every transition out of `Thinking` must pop
+  that message; every transition into `Thinking` must push one.  Both the
+  live `dispatch()` path and the pure `build_messages()` history path use
+  the same `leave_thinking()` helper — no more duplicated removal logic.
+  After `HistoryComplete`, the initial live state is derived from the last
+  message in the batch, so the FSM is always in sync with the message list.
+
 - **Tools** (`src/tools/`) — each tool implements `rig::tool::Tool` on a
   struct that holds an `Arc<SessionState>`.  Tools are organised by group:
   `file.rs` (read, write, replace, read_html, cd), `shell.rs` (shell),
@@ -336,12 +404,12 @@ Connection logic lives in `src/ssh.rs`, which:
   unknown hosts are learned on first use (TOFU); changed keys are rejected.
 
 ### Web UI sidebar
-The web UI (`assets/index.html`) has a left sidebar listing all sessions.
-Clicking a session disconnects the current WS and opens a new one to
-`/ws?session=<clicked>`.  A "+ New session" button creates via the REST API.
-Each session has a delete (×) button.  The URL hash (`#session=<name>`)
-tracks the active session for bookmarking.  On mobile, the sidebar is a
-slide-out drawer.
+The web UI (`crates/goop-web/`, built by Trunk) has a left sidebar listing
+all sessions. Clicking a session disconnects the current WS and opens a new
+one to `/ws?session=<clicked>`. A "+ New session" button creates via the REST
+API. Each session has a delete (×) button. The URL hash (`#session=<name>`)
+tracks the active session for bookmarking. On mobile, the sidebar is a
+slide-out drawer with touch gesture support.
 
 ### PWA push notifications
 
@@ -372,10 +440,10 @@ Session          PushManager        Browser Push Service      PWA (sw.js)
   via AES-128-GCM (RFC 8291) using [`ring`], signs a VAPID JWT (RFC 8292)
   using `p256::ecdsa`, and POSTs to each subscription endpoint (FCM, APNs, …).
   Expired endpoints (HTTP 410) are silently dropped.
-- **Client JS** (`assets/index.html`) — requests `Notification` permission,
-  fetches the VAPID public key from `GET /api/vapid-public-key`, calls
-  `pushManager.subscribe()`, and sends the resulting `PushSubscription` to
-  `POST /api/push-subscribe`.
+- **Client** (`crates/goop-web/src/pwa.rs`) — registers the service worker
+  (`/sw.js`), requests `Notification` permission, fetches the VAPID public
+  key from `GET /api/vapid-public-key`, calls `pushManager.subscribe()`, and
+  sends the resulting `PushSubscription` to `POST /api/push-subscribe`.
 - **Service worker** (`assets/sw.js`) — handles `push` events by showing a
   system notification tagged with the session name (so duplicates coalesce).
   On `notificationclick`, focuses or opens the PWA window and navigates to
@@ -477,6 +545,10 @@ Two independent history systems:
 ## Building & running
 
 ```bash
+# Build the Leptos frontend first (one-time, or after frontend changes).
+# The server falls back to an embedded fb.html if the dist is missing.
+(cd crates/goop-web && trunk build)
+
 # DeepSeek (default)
 DEEPSEEK_API_KEY=… cargo run
 
@@ -497,7 +569,7 @@ DEEPSEEK_API_KEY=… cargo run -- serve &
 DEEPSEEK_API_KEY=… cargo run              # terminal REPL (auto-connects)
 DEEPSEEK_API_KEY=… cargo run -- gui       # desktop GUI (auto-connects)
 
-# Nix (all deps included)
+# Nix (all deps included — trunk build is part of the package)
 nix build
 DEEPSEEK_API_KEY=… ./result/bin/goop serve &
 DEEPSEEK_API_KEY=… ./result/bin/goop gui

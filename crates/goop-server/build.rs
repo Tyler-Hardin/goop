@@ -1,18 +1,28 @@
 // build.rs — generate versioned service worker
 //
-// Hashes assets/index.html and bakes the short hash into the service
-// worker cache name so that any HTML change invalidates the SW cache.
-// The generated sw.js is written to OUT_DIR and included at compile time.
+// Hashes the active index.html (trunk dist first, then fallback assets)
+// and bakes the short hash into the service worker cache name so that
+// any HTML change invalidates the SW cache.  The generated sw.js is
+// written to OUT_DIR and included at compile time.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 fn main() {
-    // Re-run if either source file changes.
-    println!("cargo:rerun-if-changed=assets/index.html");
+    // Re-run if any of these source files change.
+    println!("cargo:rerun-if-changed=assets/fb.html");
     println!("cargo:rerun-if-changed=assets/sw.js");
+    println!("cargo:rerun-if-changed=../goop-web/dist/index.html");
 
-    let index = std::fs::read_to_string("assets/index.html").expect("assets/index.html not found");
+    // Use the trunk-built HTML if available, otherwise the embedded fallback.
+    let index_path = if std::path::Path::new("../goop-web/dist/index.html").exists() {
+        "../goop-web/dist/index.html"
+    } else {
+        "assets/fb.html"
+    };
+
+    let index =
+        std::fs::read_to_string(index_path).unwrap_or_else(|_| panic!("{index_path} not found"));
 
     let mut hasher = DefaultHasher::new();
     index.hash(&mut hasher);

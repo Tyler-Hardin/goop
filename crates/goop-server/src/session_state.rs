@@ -653,12 +653,18 @@ mod tests {
 
     #[test]
     fn is_goop_project_dir_detects_self() {
-        // We're running from the goop source tree — the marker file exists.
+        // Walk up from the current directory to find the workspace root
+        // (which contains AGENTS.md).  `cargo test` sets CWD to the crate
+        // directory, which is nested inside the workspace.
         let cwd = std::env::current_dir().unwrap();
+        let root = cwd
+            .ancestors()
+            .find(|p| p.join("AGENTS.md").exists())
+            .unwrap_or(&cwd);
         assert!(
-            is_goop_project_dir(&cwd),
+            is_goop_project_dir(root),
             "expected to detect goop project at {}",
-            cwd.display()
+            root.display()
         );
     }
 }

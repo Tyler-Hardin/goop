@@ -11,11 +11,14 @@ use axum::routing::{delete, get, post};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::{Notify, broadcast};
+use tower_http::services::ServeDir;
 
-use crate::events::PromptSource;
+use crate::events::{ClientMessage, PromptSource};
 use crate::session::{Session, SessionManager};
 
-const PAGE: &str = include_str!("../assets/index.html");
+// Embedded fallback HTML — served when the trunk-built frontend dist
+// is not available (e.g. during development without trunk).
+const PAGE: &str = include_str!("../assets/fb.html");
 const MANIFEST: &str = include_str!("../assets/manifest.json");
 const SERVICE_WORKER: &str = include_str!(concat!(env!("OUT_DIR"), "/sw.js"));
 const ICON: &[u8] = include_bytes!("../assets/goop_icon_full.png");
@@ -121,8 +124,11 @@ pub fn build_router(
         manager,
         push_manager,
     });
-    Router::new()
-        .route("/", get(index))
+
+    // Find the trunk-built frontend dist directory.
+    let web_dist = find_web_dist();
+
+    let mut router = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}", delete(delete_session))
@@ -132,7 +138,67 @@ pub fn build_router(
         .route("/sw.js", get(service_worker))
         .route("/icon-192.png", get(icon_192))
         .route("/icon-512.png", get(icon_512))
-        .with_state(state)
+        // Always serve the fallback HTML at this path, even
+        // when the trunk dist is available — useful for comparison.
+        .route("/fb.html", get(index_fallback))
+        .with_state(state);
+
+    if let Some(dist_dir) = web_dist {
+        tracing::info!("serving frontend from {}", dist_dir.display());
+        // ServeDir handles "/" (index.html) and all static assets.
+        router = router.fallback_service(ServeDir::new(&dist_dir));
+    } else {
+        tracing::info!("trunk dist not found, using embedded fallback");
+        router = router.route("/", get(index_fallback));
+    }
+
+    router
+}
+
+/// Try to find the trunk-built frontend dist directory.
+///
+/// Checks, in order:
+/// 1. `GOOP_WEB_DIST` environment variable
+/// 2. `crates/goop-web/dist/` relative to workspace root (cargo run from root)
+/// 3. `../goop-web/dist/` relative to the goop-server crate dir
+fn find_web_dist() -> Option<std::path::PathBuf> {
+    // Env var override.
+    if let Ok(dir) = std::env::var("GOOP_WEB_DIST") {
+        let p = std::path::PathBuf::from(&dir);
+        if p.join("index.html").exists() {
+            return Some(p);
+        }
+    }
+
+    // Look relative to workspace root (most common for `cargo run`).
+    let candidates = ["crates/goop-web/dist", "../goop-web/dist"];
+
+    // Also check relative to the server executable.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        for rel in &candidates {
+            let p = parent.join(rel);
+            if p.join("index.html").exists() {
+                return Some(p);
+            }
+        }
+        // For nix install: dist is alongside the binary.
+        let p = parent.join("dist");
+        if p.join("index.html").exists() {
+            return Some(p);
+        }
+    }
+
+    // Check relative to current directory.
+    for rel in &candidates {
+        let p = std::path::PathBuf::from(rel);
+        if p.join("index.html").exists() {
+            return Some(p);
+        }
+    }
+
+    None
 }
 
 /// Launch the axum HTTP + WebSocket server.
@@ -161,7 +227,8 @@ struct ServerState {
 
 // ── routes ──────────────────────────────────────────────────────
 
-async fn index() -> impl IntoResponse {
+/// Serves the embedded fallback fb.html (when trunk dist not found).
+async fn index_fallback() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Html(PAGE))
 }
 
@@ -385,13 +452,4 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
         _ = &mut send_task => { recv_task.abort(); }
         _ = &mut recv_task => { send_task.abort(); }
     }
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "type")]
-enum ClientMessage {
-    #[serde(rename = "prompt")]
-    Prompt { content: String },
-    #[serde(rename = "cancel")]
-    Cancel,
 }

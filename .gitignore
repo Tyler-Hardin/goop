@@ -1,1 +1,5 @@
-/target
+result
+target
+
+crates/goop-web/dist/
+crates/goop-web/dist/

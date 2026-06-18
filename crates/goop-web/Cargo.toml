@@ -1,0 +1,57 @@
+[package]
+name = "goop-web"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+goop-shared = { path = "../goop-shared" }
+leptos = { version = "0.7", features = ["csr"] }
+leptos_router = "0.7"
+leptos-use = "0.14"
+wasm-bindgen = "=0.2.121"
+js-sys = "=0.3.98"
+web-sys = { version = "=0.3.98", features = [
+    "WebSocket",
+    "BinaryType",
+    "MessageEvent",
+    "CloseEvent",
+    "MediaRecorder",
+    "MediaRecorderOptions",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "AudioContext",
+    "AudioBuffer",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlTextAreaElement",
+    "HtmlButtonElement",
+    "DomTokenList",
+    "CssStyleDeclaration",
+    "ServiceWorkerContainer",
+    "ServiceWorkerRegistration",
+    "PushManager",
+    "PushSubscription",
+    "Notification",
+    "NotificationPermission",
+    "Navigator",
+    "MediaDevices",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "TouchEvent",
+    "Touch",
+    "Event",
+    "CacheStorage",
+] }
+gloo-net = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wasm-bindgen-futures = "=0.4.71"
+console_log = "1"
+console_error_panic_hook = "0.1"
+log = "0.4"

@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 /// Which view submitted this prompt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[allow(dead_code)]
 pub enum PromptSource {
     Terminal,
     Web,
@@ -11,7 +10,6 @@ pub enum PromptSource {
 /// Events emitted by the session as the agent processes a prompt.
 /// Views (terminal, web, phone, …) subscribe and render in their own way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // some variants/fields are consumed by future views
 #[serde(tag = "type", content = "data")]
 pub enum SessionEvent {
     /// Session metadata — sent first on connect so clients know the
@@ -20,7 +18,7 @@ pub enum SessionEvent {
 
     /// The session is currently processing a prompt (true) or idle (false).
     /// Sent to late-joining clients after history replay so they know
-    /// whether to show a Cancel button. Not persisted to disk.
+    /// whether to show a Cancel button.  Not persisted to disk.
     SessionState { running: bool },
 
     /// A user submitted a prompt.  Arrives *before* Thinking.
@@ -57,4 +55,23 @@ pub enum SessionEvent {
     /// can edit and resubmit.  When `None`, completed tool turns were
     /// already saved to memory and the next prompt starts fresh.
     Cancelled { prompt: Option<String> },
+
+    /// Sent by the server to a **single** subscriber after all history
+    /// events have been replayed.  Not persisted to disk or emitted to
+    /// other subscribers.  The client uses this to switch from bulk
+    /// catch-up mode to live-event mode — all prior events are flushed
+    /// into the message list in one batch instead of one by one.
+    HistoryComplete,
+}
+
+/// Messages sent from client to server over WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ClientMessage {
+    /// Submit a text prompt.
+    #[serde(rename = "prompt")]
+    Prompt { content: String },
+    /// Cancel the current prompt.
+    #[serde(rename = "cancel")]
+    Cancel,
 }

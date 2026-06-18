@@ -584,6 +584,11 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 state.in_turn = false;
                 done_tx.send(None).ok();
             }
+
+            SessionEvent::HistoryComplete => {
+                // Web-only sentinel marking end of history replay.
+                // The terminal doesn't batch-render, so ignore it.
+            }
         }
     }
 }

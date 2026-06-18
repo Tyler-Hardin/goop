@@ -23,36 +23,48 @@ self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
   if (url.origin !== self.location.origin) return;
 
-  // Network-first for the root page — during development the HTML
-  // changes constantly and we never want a stale cached copy.
-  if (url.pathname === "/") {
+  // API calls are never cached — they must always hit the network.
+  if (url.pathname.startsWith("/api/")) {
+    e.respondWith(fetch(e.request));
+    return;
+  }
+
+  // Trunk builds produce hashed filenames (e.g. goop_web-abc123.js).
+  // These are immutable, so cache-first is safe.  We also cache the
+  // shell assets (icons, manifest) that are preloaded on install.
+  const cacheable =
+    /\.(?:js|wasm|css|png|ico)$/.test(url.pathname) ||
+    url.pathname === "/manifest.json";
+
+  if (cacheable) {
     e.respondWith(
-      fetch(e.request)
-        .then((resp) => {
-          if (resp.ok) {
-            const clone = resp.clone();
-            caches.open(CACHE).then((cache) => cache.put(e.request, clone));
-          }
-          return resp;
-        })
-        .catch(() => caches.match(e.request)),
+      caches.match(e.request).then(
+        (cached) =>
+          cached ||
+          fetch(e.request).then((resp) => {
+            if (resp.ok) {
+              const clone = resp.clone();
+              caches.open(CACHE).then((cache) => cache.put(e.request, clone));
+            }
+            return resp;
+          }),
+      ),
     );
     return;
   }
 
-  // Cache-first for everything else.
+  // Everything else (including the root page) — network-first so we
+  // never serve stale content, but fall back to cache when offline.
   e.respondWith(
-    caches.match(e.request).then(
-      (cached) =>
-        cached ||
-        fetch(e.request).then((resp) => {
-          if (resp.ok) {
-            const clone = resp.clone();
-            caches.open(CACHE).then((cache) => cache.put(e.request, clone));
-          }
-          return resp;
-        }),
-    ),
+    fetch(e.request)
+      .then((resp) => {
+        if (resp.ok) {
+          const clone = resp.clone();
+          caches.open(CACHE).then((cache) => cache.put(e.request, clone));
+        }
+        return resp;
+      })
+      .catch(() => caches.match(e.request)),
   );
 });
 

@@ -27,14 +27,26 @@ use crate::transport::{PersistedTransport, Transport};
 /// before yielding live events.
 pub struct SessionSubscriber {
     history: Vec<SessionEvent>,
+    history_cursor: usize,
+    history_done: bool,
     rx: broadcast::Receiver<SessionEvent>,
 }
 
 impl SessionSubscriber {
     /// Wait for the next event (history first, then live).
+    ///
+    /// After the last history event, the next call returns
+    /// [`SessionEvent::HistoryComplete`] to signal the transition to
+    /// live events.
     pub async fn recv(&mut self) -> Result<SessionEvent, broadcast::error::RecvError> {
-        if !self.history.is_empty() {
-            return Ok(self.history.remove(0));
+        if self.history_cursor < self.history.len() {
+            let event = self.history[self.history_cursor].clone();
+            self.history_cursor += 1;
+            return Ok(event);
+        }
+        if !self.history_done {
+            self.history_done = true;
+            return Ok(SessionEvent::HistoryComplete);
         }
         self.rx.recv().await
     }
@@ -323,6 +335,7 @@ impl Session {
     }
 
     /// Whether the session is currently processing a prompt.
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::SeqCst)
     }
@@ -343,13 +356,14 @@ impl Session {
     /// Late-joining views (web, phone, …) receive every event since
     /// session creation before transitioning to live events.
     pub async fn subscribe_all(&self) -> SessionSubscriber {
-        let mut history = self.history.lock().await.clone();
+        let history = self.history.lock().await.clone();
         let rx = self.tx.subscribe();
-        // Let late-joining clients know whether the session is mid-conversation.
-        if self.is_running() {
-            history.push(SessionEvent::SessionState { running: true });
+        SessionSubscriber {
+            history,
+            history_cursor: 0,
+            history_done: false,
+            rx,
         }
-        SessionSubscriber { history, rx }
     }
 
     // ── internals ────────────────────────────────────────────────

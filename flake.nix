@@ -93,6 +93,10 @@
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.cmake
+            pkgs.lld
+            pkgs.trunk
+            pkgs.wasm-bindgen-cli
+            pkgs.binaryen
           ]
           ++ pkgs.lib.optionals isLinux linuxNativeBuildInputs
           ++ pkgs.lib.optionals isLinux cudaNativeBuildInputs;
@@ -102,6 +106,46 @@
           ]
           ++ pkgs.lib.optionals isLinux linuxBuildInputs
           ++ pkgs.lib.optionals isLinux cudaBuildInputs;
+
+          # Build the Leptos frontend with trunk before compiling the server.
+          preBuild = ''
+            export HOME="$TMPDIR/home"
+            mkdir -p "$HOME/.config/goop"
+
+            echo "=== trunk build ==="
+            cd crates/goop-web
+
+            # Trunk normally downloads wasm-bindgen and wasm-opt from GitHub,
+            # but the Nix sandbox has no network.  Tell trunk to use the Nix-
+            # provided versions and pre-populate its cache with symlinks.
+            BINDGEN="$(command -v wasm-bindgen)"
+            WASMOPT="$(command -v wasm-opt)"
+
+            # Derive versions from the Nix binaries.
+            BINDGEN_VER="$("$BINDGEN" --version | awk '{print $2}')"
+            WASMOPT_VER="$("$WASMOPT" --version | awk '{print $3}')"
+
+            export TRUNK_TOOLS_WASM_BINDGEN="$BINDGEN_VER"
+            export TRUNK_TOOLS_WASM_OPT="$WASMOPT_VER"
+
+            mkdir -p "$HOME/.cache/trunk/wasm-bindgen-$BINDGEN_VER"
+            ln -sf "$BINDGEN" "$HOME/.cache/trunk/wasm-bindgen-$BINDGEN_VER/wasm-bindgen"
+
+            mkdir -p "$HOME/.cache/trunk/wasm-opt-$WASMOPT_VER"
+            ln -sf "$WASMOPT" "$HOME/.cache/trunk/wasm-opt-$WASMOPT_VER/wasm-opt"
+
+            echo "Using wasm-bindgen $BINDGEN_VER, wasm-opt $WASMOPT_VER"
+
+            RUSTFLAGS="-C linker=lld" trunk build --release --offline
+            cd ../..
+            echo "=== trunk done ==="
+          '';
+
+          # Copy the trunk dist alongside the binary.
+          postInstall = ''
+            mkdir -p "$out/dist"
+            cp -r crates/goop-web/dist/* "$out/dist/"
+          '';
 
           postFixup = pkgs.lib.optionalString isLinux ''
             wrapProgram $out/bin/goop \
@@ -139,9 +183,13 @@
               cargo
               clippy
               cmake
+              lld
               rustc
               rustfmt
               rust-analyzer
+              trunk
+              wasm-bindgen-cli
+              binaryen
             ]
             ++ pkgs.lib.optionals isLinux linuxRuntimeDeps;
 
