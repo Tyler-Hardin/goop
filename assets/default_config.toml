@@ -53,3 +53,11 @@ enabled_tool_groups = [{% for g in groups %}"{{ g }}"{% if not loop.last %}, {% 
 
 # MCP servers enabled for all sessions.
 # enabled_mcp_servers = []
+
+# ── Speech-to-text (STT) ──────────────────────────────────────────────
+# Local speech recognition via OpenAI Whisper.
+# Models are downloaded once and cached in ~/.config/goop/models/whisper/
+#
+# [stt]
+# enabled = true       # set to true to enable microphone input in the web UI
+# model = "base"       # tiny | base | small | medium | large

@@ -10,6 +10,7 @@ mod server;
 mod session;
 mod session_state;
 mod ssh;
+mod stt;
 mod terminal;
 mod tools;
 mod transport;
@@ -85,6 +86,7 @@ async fn start_server_in_background() -> anyhow::Result<()> {
     let push_manager = Arc::new(push::PushManager::new());
     let manager = Arc::new(SessionManager::new(config, Arc::clone(&push_manager)));
     manager.init_global_mcp().await;
+    manager.init_stt().await;
     manager.discover().await?;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -110,6 +112,7 @@ async fn run_server(session_name: Option<String>) -> anyhow::Result<()> {
     let push_manager = Arc::new(push::PushManager::new());
     let manager = Arc::new(SessionManager::new(config, Arc::clone(&push_manager)));
     manager.init_global_mcp().await;
+    manager.init_stt().await;
     manager.discover().await?;
     // If the user asked for a specific session, ensure it's loaded.
     if let Some(name) = session_name {

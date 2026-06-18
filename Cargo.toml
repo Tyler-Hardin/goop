@@ -44,3 +44,9 @@ rand = "0.8"
 russh = "0.61.2"
 russh-sftp = "2.3.0"
 web-push = "0.11.0"
+whisper-rs = "0.16.0"
+hound = "3.5.1"
+
+[features]
+default = []
+cuda = ["whisper-rs/cuda"]

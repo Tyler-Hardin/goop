@@ -91,6 +91,16 @@ The web UI shows a session sidebar for switching between sessions.
   open_url).  The active set is built in `build_tools()` based on
   `Config::enabled_tool_groups` and passed to the agent via the builder's
   `.tools()` method, which takes `Vec<Box<dyn ToolDyn>>`.
+- **STT** (`src/stt.rs`) — speech-to-text via whisper.cpp, loaded locally.
+  A server-level singleton (`SpeechToText`) wraps a Whisper model (default:
+  `base`, ~142 MB, auto-downloaded from HuggingFace on first use and cached
+  in `~/.config/goop/models/whisper/`).  Transcription is batch-only
+  (push-to-talk): the web UI sends a complete WAV file as a binary WS frame;
+  `Session::submit_audio` transcribes it and submits the resulting text as a
+  normal prompt.  STT is opt-in — set `[stt] enabled = true` in config.toml.
+  whisper.cpp contexts are not `Sync`, so transcription is serialised behind
+  a tokio `Mutex` (contention is negligible — prompts are already serial).
+  WAV parsing uses `hound`; resampling is linear.
 - **`SessionState`** (`src/session_state.rs`) — runtime per-session shared
   mutable state: `name`, `home_dir` (from Config), `cwd` (Mutex<PathBuf>),
   `transport` (Mutex<Transport>), and a `state_path` for persistence.  Tools

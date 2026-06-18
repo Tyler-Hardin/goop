@@ -619,38 +619,135 @@
       }
 
       footer button {
-        background: var(--blue);
-        color: #0a0d11;
-        border: none;
+        background: var(--surface2);
+        color: var(--dim);
+        border: 1px solid var(--border);
         border-radius: var(--radius-sm);
-        padding: 11px 22px;
-        font-weight: 650;
-        font-size: 14px;
+        padding: 0;
+        width: 46px;
+        height: 46px;
         cursor: pointer;
         transition:
           background 0.2s,
+          color 0.2s,
+          border-color 0.2s,
           opacity 0.2s,
           box-shadow 0.2s;
-        white-space: nowrap;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
       }
+      footer button svg {
+        width: 20px;
+        height: 20px;
+        display: none;
+      }
+      /* Show the right icon based on state. */
+      footer button .icon-mic {
+        display: block;
+      }
+      /* When input has text, hide mic, show send. */
+      footer button.has-text .icon-mic {
+        display: none;
+      }
+      footer button.has-text .icon-send {
+        display: block;
+      }
+      footer button .icon-rec {
+        display: none;
+      }
+      footer button .icon-cancel {
+        display: none;
+      }
+      footer button.recording .icon-mic {
+        display: none;
+      }
+      footer button.recording .icon-send {
+        display: none;
+      }
+      footer button.recording .icon-rec {
+        display: block;
+      }
+      footer button.cancel .icon-mic {
+        display: none;
+      }
+      footer button.cancel .icon-send {
+        display: none;
+      }
+      footer button.cancel .icon-rec {
+        display: none;
+      }
+      footer button.cancel .icon-cancel {
+        display: block;
+      }
+
       footer button:hover {
-        background: #8bc7f6;
+        border-color: var(--blue);
+        color: var(--blue);
+        background: var(--surface2);
       }
       footer button:active {
         opacity: 0.85;
-        transform: scale(0.98);
+        transform: scale(0.96);
       }
       footer button:disabled {
         opacity: 0.35;
         cursor: default;
         pointer-events: none;
       }
+      footer button:disabled:hover {
+        border-color: var(--border);
+        color: var(--dim);
+      }
       footer button.cancel {
         background: var(--red);
         color: #fff;
+        border-color: var(--red);
       }
       footer button.cancel:hover {
         background: #f87870;
+        border-color: #f87870;
+        color: #fff;
+      }
+      footer button.recording {
+        background: var(--red);
+        color: #fff;
+        border-color: var(--red);
+        animation: micPulse 1.2s ease-in-out infinite;
+      }
+      footer button.recording:hover {
+        background: #f87870;
+        border-color: #f87870;
+        color: #fff;
+      }
+      /* Slide-up-to-cancel: solid red + X icon, no pulse. */
+      footer button.cancel-slide {
+        background: var(--red);
+        color: #fff;
+        border-color: var(--red);
+        animation: none;
+      }
+      footer button.cancel-slide .icon-mic {
+        display: none;
+      }
+      footer button.cancel-slide .icon-send {
+        display: none;
+      }
+      footer button.cancel-slide .icon-rec {
+        display: none;
+      }
+      footer button.cancel-slide .icon-cancel {
+        display: block;
+      }
+      @keyframes micPulse {
+        0%,
+        100% {
+          box-shadow: 0 0 0 0 rgba(242, 98, 90, 0.4);
+        }
+        50% {
+          box-shadow: 0 0 0 8px rgba(242, 98, 90, 0);
+        }
       }
 
       /* ── empty state ──────────────────────────────── */
@@ -882,7 +979,48 @@
           autofocus
           rows="1"
         ></textarea>
-        <button id="send" disabled>Send</button>
+        <button id="send" disabled title="Hold to talk">
+          <svg
+            class="icon-mic"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            <line x1="12" y1="19" x2="12" y2="23" />
+            <line x1="8" y1="23" x2="16" y2="23" />
+          </svg>
+          <svg
+            class="icon-send"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <line x1="22" y1="2" x2="11" y2="13" />
+            <polygon points="22 2 15 22 11 13 2 9 22 2" />
+          </svg>
+          <svg class="icon-rec" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="6" y="6" width="12" height="12" rx="2" />
+          </svg>
+          <svg
+            class="icon-cancel"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+          >
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
       </footer>
     </div>
 
@@ -1556,18 +1694,24 @@
         }
       });
 
-      sendBtn.addEventListener("click", doSend);
-
       function setRunning(v) {
         running = v;
         if (v) {
-          sendBtn.textContent = "Cancel";
           sendBtn.classList.add("cancel");
+          sendBtn.title = "Cancel";
         } else {
-          sendBtn.textContent = "Send";
           sendBtn.classList.remove("cancel");
+          updateSendIcon();
         }
       }
+
+      // Toggle mic / send icon based on input content.
+      function updateSendIcon() {
+        const hasText = input.value.trim().length > 0;
+        sendBtn.classList.toggle("has-text", hasText);
+        sendBtn.title = hasText ? "Send" : "Hold to talk";
+      }
+      input.addEventListener("input", updateSendIcon);
 
       function doSend() {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -1583,8 +1727,309 @@
         input.value = "";
         input.style.height = "auto";
         input.focus();
+        updateSendIcon();
         setRunning(true);
       }
+
+      // Unified send/mic button: pointerdown on empty = start recording,
+      // click on text = send, click when running = cancel.
+      sendBtn.addEventListener("click", (e) => {
+        // If recording, let pointerup handle it — don't also send.
+        if (sendBtn.classList.contains("recording")) return;
+        doSend();
+      });
+
+      // ── mic / speech-to-text ──────────────────────
+      //
+      // Button state machine.  Exactly one state is active at all times:
+      //   idle      — mic icon (empty input) or send icon (has text)
+      //   recording — red pulsing stop square
+      //   running   — red X (LLM processing)
+      //
+      // Touch events only preventDefault when entering/leaving 'recording'.
+      // In 'idle' and 'running' the browser's native touch→click emulation
+      // handles text send and cancel.
+      (function () {
+        let state = "idle"; // 'idle' | 'recording' | 'running'
+        let stream = null;
+        let recorder = null;
+        let recStartY = 0;
+        let cancelMode = false;
+        const CANCEL_THRESHOLD = 120; // px — slide up this far to cancel
+
+        function setState(s) {
+          state = s;
+          sendBtn.classList.remove("recording", "cancel", "cancel-slide");
+          sendBtn.title = "";
+          if (s === "idle") {
+            updateSendIcon();
+          } else if (s === "recording") {
+            sendBtn.classList.add("recording");
+          } else if (s === "running") {
+            sendBtn.classList.add("cancel");
+            sendBtn.title = "Cancel";
+          }
+        }
+
+        // Override the global setRunning so LLM state changes go through
+        // the state machine.
+        const _origSetRunning = setRunning;
+        setRunning = function (v) {
+          _origSetRunning(v);
+          if (state === "recording") return; // don't clobber recording state
+          setState(v ? "running" : "idle");
+        };
+
+        // ── helpers ──────────────────────────────────
+
+        function pcmToWav(samples, sampleRate) {
+          const numChannels = 1;
+          const bitsPerSample = 16;
+          const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+          const blockAlign = numChannels * (bitsPerSample / 8);
+          const dataSize = samples.length * (bitsPerSample / 8);
+          const buf = new ArrayBuffer(44 + dataSize);
+          const view = new DataView(buf);
+          function writeStr(off, s) {
+            for (let i = 0; i < s.length; i++)
+              view.setUint8(off + i, s.charCodeAt(i));
+          }
+          writeStr(0, "RIFF");
+          view.setUint32(4, 36 + dataSize, true);
+          writeStr(8, "WAVE");
+          writeStr(12, "fmt ");
+          view.setUint32(16, 16, true);
+          view.setUint16(20, 1, true);
+          view.setUint16(22, numChannels, true);
+          view.setUint32(24, sampleRate, true);
+          view.setUint32(28, byteRate, true);
+          view.setUint16(32, blockAlign, true);
+          view.setUint16(34, bitsPerSample, true);
+          writeStr(36, "data");
+          view.setUint32(40, dataSize, true);
+          for (let i = 0; i < samples.length; i++) {
+            const s = Math.max(-1, Math.min(1, samples[i]));
+            view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+          }
+          return buf;
+        }
+
+        async function pickBestMic() {
+          let devices;
+          try {
+            devices = await navigator.mediaDevices.enumerateDevices();
+          } catch {
+            return null;
+          }
+          const inputs = devices.filter((d) => d.kind === "audioinput");
+          if (inputs.length === 0) return null;
+          const skip = /earpiece|handset|headset|communications/i;
+          const prefer = /speakerphone|speaker/i;
+          for (const d of inputs) {
+            if (d.label && prefer.test(d.label) && !skip.test(d.label))
+              return d.deviceId;
+          }
+          for (const d of inputs) {
+            if (d.label && !skip.test(d.label)) return d.deviceId;
+          }
+          for (const d of inputs) {
+            if (!d.label) return d.deviceId;
+          }
+          return inputs[0].deviceId;
+        }
+
+        async function ensureStream() {
+          if (stream) return stream;
+          const deviceId = await pickBestMic();
+          const constraints = {
+            audio: {
+              channelCount: 1,
+              sampleRate: 16000,
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          };
+          if (deviceId) constraints.audio.deviceId = { ideal: deviceId };
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          return stream;
+        }
+
+        // ── recording lifecycle ──────────────────────
+
+        async function startRecording(startY) {
+          setState("recording");
+          recStartY = startY;
+          cancelMode = false;
+          try {
+            const s = await ensureStream();
+            // If the user already released / cancelled while we were
+            // waiting for the mic, bail out — stopRecording already ran.
+            if (state !== "recording") return;
+
+            let mimeType = "";
+            for (const m of ["audio/webm", "audio/mp4", "audio/ogg"]) {
+              if (MediaRecorder.isTypeSupported(m)) {
+                mimeType = m;
+                break;
+              }
+            }
+            if (!mimeType) {
+              append("error", "MediaRecorder not supported in this browser.");
+              setState("idle");
+              return;
+            }
+            recorder = new MediaRecorder(s, { mimeType });
+            recorder.start();
+          } catch (err) {
+            console.error("mic error:", err);
+            append(
+              "error",
+              "Microphone access denied — check browser permissions.",
+            );
+            setState("idle");
+          }
+        }
+
+        async function stopRecording() {
+          // If touchend fires before startRecording's ensureStream() completes,
+          // recorder is still null — treat as cancel.
+          if (!recorder) {
+            setState("idle");
+            return;
+          }
+
+          // Always resolve, even for zero-size blobs.
+          const blob = await new Promise((resolve) => {
+            recorder.ondataavailable = (ev) => resolve(ev.data);
+            recorder.stop();
+          });
+          recorder = null;
+
+          if (cancelMode) {
+            cancelMode = false;
+            setState("idle");
+            statusEl.textContent = "cancelled";
+            return;
+          }
+          if (!blob || blob.size === 0) {
+            setState("idle");
+            return;
+          }
+
+          // Decode to PCM via browser's native decoder.
+          const ctx = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 16000,
+          });
+          const arrayBuf = await blob.arrayBuffer();
+          let audioBuf;
+          try {
+            audioBuf = await ctx.decodeAudioData(arrayBuf);
+          } catch (err) {
+            console.error("decode error:", err);
+            ctx.close();
+            setState("idle");
+            return;
+          }
+          ctx.close();
+
+          const channelData = audioBuf.getChannelData(0);
+          const actualRate = audioBuf.sampleRate;
+          console.log(
+            "STT: rate =",
+            actualRate,
+            "Hz, samples =",
+            channelData.length,
+            "duration =",
+            (channelData.length / actualRate).toFixed(2),
+            "s",
+          );
+          const wav = pcmToWav(channelData, actualRate);
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            setState("idle");
+            return;
+          }
+          ws.send(wav);
+          setState("running");
+          statusEl.textContent = "transcribing…";
+        }
+
+        // ── pointer events (desktop) ─────────────────
+
+        sendBtn.addEventListener("pointerdown", (e) => {
+          if (state !== "idle") return;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          if (input.value.trim().length > 0) return;
+          e.preventDefault();
+          startRecording(e.clientY);
+        });
+
+        sendBtn.addEventListener("pointermove", (e) => {
+          if (state !== "recording") return;
+          const dy = recStartY - e.clientY;
+          if (dy > CANCEL_THRESHOLD && !cancelMode) {
+            cancelMode = true;
+            sendBtn.classList.add("cancel-slide");
+            sendBtn.title = "Release to cancel";
+          } else if (dy <= CANCEL_THRESHOLD && cancelMode) {
+            cancelMode = false;
+            sendBtn.classList.remove("cancel-slide");
+            sendBtn.title = "";
+          }
+        });
+
+        sendBtn.addEventListener("pointerup", (e) => {
+          if (state !== "recording") return;
+          e.preventDefault();
+          stopRecording();
+        });
+
+        // ── touch events (mobile) ────────────────────
+        // Must be non-passive so preventDefault() actually suppresses
+        // scrolling during recording and touchmove reaches the button
+        // (Chrome makes touchstart/touchmove passive by default).
+        const touchOpts = { passive: false };
+
+        sendBtn.addEventListener(
+          "touchstart",
+          (e) => {
+            if (state !== "idle") return;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (input.value.trim().length > 0) return;
+            e.preventDefault();
+            startRecording(e.touches[0].clientY);
+          },
+          touchOpts,
+        );
+
+        sendBtn.addEventListener(
+          "touchmove",
+          (e) => {
+            if (state !== "recording") return;
+            e.preventDefault();
+            const dy = recStartY - e.touches[0].clientY;
+            if (dy > CANCEL_THRESHOLD && !cancelMode) {
+              cancelMode = true;
+              sendBtn.classList.add("cancel-slide");
+              sendBtn.title = "Release to cancel";
+            } else if (dy <= CANCEL_THRESHOLD && cancelMode) {
+              cancelMode = false;
+              sendBtn.classList.remove("cancel-slide");
+              sendBtn.title = "";
+            }
+          },
+          touchOpts,
+        );
+
+        sendBtn.addEventListener(
+          "touchend",
+          (e) => {
+            if (state !== "recording") return;
+            e.preventDefault();
+            stopRecording();
+          },
+          touchOpts,
+        );
+      })();
 
       // ── start ────────────────────────────────────
       async function init() {

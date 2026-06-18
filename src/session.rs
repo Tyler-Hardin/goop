@@ -86,6 +86,10 @@ pub struct Session {
     /// Push notification sender — called when a prompt completes so PWAs
     /// in the background get a system notification.
     push_notifier: Arc<crate::push::PushManager>,
+
+    /// Speech-to-text engine — shared across all sessions, loaded lazily.
+    /// `None` if STT is not configured (disabled in config).
+    stt: Option<Arc<crate::stt::SpeechToText>>,
 }
 
 impl Session {
@@ -112,6 +116,7 @@ impl Session {
         session_name: Option<String>,
         shared_mcp_manager: Arc<crate::mcp::McpManager>,
         push_notifier: Arc<crate::push::PushManager>,
+        stt: Option<Arc<crate::stt::SpeechToText>>,
     ) -> anyhow::Result<Arc<Self>> {
         // ── persistence paths ──────────────────────────────────
         let name = session_name.unwrap_or_else(next_session_name);
@@ -242,6 +247,7 @@ impl Session {
             events_file: Some(events_path),
             session_mcp: session_mcp_manager,
             push_notifier,
+            stt,
         });
 
         // Spawn the background worker that serializes prompt processing.
@@ -270,6 +276,44 @@ impl Session {
     pub async fn cancel(&self) {
         if let Some(tx) = self.cancel_tx.lock().await.take() {
             let _ = tx.send(());
+        }
+    }
+
+    /// Submit audio for speech-to-text transcription.
+    ///
+    /// The WAV-encoded audio is transcribed using the server's local
+    /// Whisper model.  On success the resulting text is submitted as a
+    /// normal prompt via [`submit`](Self::submit).  On failure an
+    /// [`Error`](SessionEvent::Error) is emitted.
+    ///
+    /// Returns immediately if STT is not configured.
+    pub async fn submit_audio(&self, wav_bytes: Vec<u8>, source: PromptSource) {
+        let stt = match self.stt.as_ref() {
+            Some(s) => s,
+            None => {
+                self.emit(SessionEvent::Error(
+                    "STT is not enabled — set [stt] enabled = true in config.toml".into(),
+                ))
+                .await;
+                return;
+            }
+        };
+
+        match stt.transcribe_wav(&wav_bytes).await {
+            Ok(text) => {
+                tracing::info!("STT → {:?}", text);
+                self.submit(text, source);
+            }
+            Err(e) => {
+                tracing::warn!("STT failed: {e}");
+                self.emit(SessionEvent::Error(format!("STT: {e}"))).await;
+            }
+        }
+
+        // Debug: write the last audio to /tmp/goop-last-audio.wav so the
+        // user can listen to what whisper received.  Overwritten each time.
+        if let Err(e) = tokio::fs::write("/tmp/goop-last-audio.wav", &wav_bytes).await {
+            tracing::warn!("failed to write debug WAV: {e}");
         }
     }
 
@@ -555,6 +599,10 @@ pub struct SessionManager {
     /// Push notification manager — cloned into each new session so
     /// prompts can trigger push notifications on completion.
     push_manager: Arc<crate::push::PushManager>,
+    /// Speech-to-text engine — shared across all sessions, loaded lazily
+    /// via [`init_stt`](Self::init_stt).  `None` until initialised or
+    /// when STT is disabled in config.
+    stt: tokio::sync::RwLock<Option<Arc<crate::stt::SpeechToText>>>,
 }
 
 impl SessionManager {
@@ -564,6 +612,7 @@ impl SessionManager {
             config,
             global_mcp: tokio::sync::RwLock::new(crate::mcp::McpManager::empty()),
             push_manager,
+            stt: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -594,6 +643,35 @@ impl SessionManager {
         *self.global_mcp.write().await = manager;
     }
 
+    /// Load the speech-to-text engine (Whisper model).
+    ///
+    /// Must be called after construction and before any session uses STT.
+    /// No-ops if STT is disabled in config.  Downloads the model on first
+    /// use (one-time, cached to `~/.config/goop/models/whisper/`).
+    pub async fn init_stt(&self) {
+        if !self.config.stt.enabled {
+            tracing::info!("STT is disabled in config — skipping model load");
+            return;
+        }
+
+        let model = self.config.stt.model;
+        let models_dir = crate::config::config_dir().join("models").join("whisper");
+
+        match crate::stt::ensure_model(model, &models_dir).await {
+            Ok(model_path) => match crate::stt::SpeechToText::load(&model_path).await {
+                Ok(engine) => {
+                    *self.stt.write().await = Some(Arc::new(engine));
+                }
+                Err(e) => {
+                    tracing::error!("failed to load STT model: {e}");
+                }
+            },
+            Err(e) => {
+                tracing::error!("failed to ensure STT model: {e}");
+            }
+        }
+    }
+
     /// Get an existing session or create one.
     ///
     /// If the session already exists in the map, returns it directly.
@@ -616,12 +694,14 @@ impl SessionManager {
         // then insert under write lock.
         let shared_mcp = Arc::clone(&*self.global_mcp.read().await);
         let push_manager = Arc::clone(&self.push_manager);
+        let stt = self.stt.read().await.clone();
         let session = Session::new(
             &self.config,
             256,
             Some(name.clone()),
             shared_mcp,
             push_manager,
+            stt,
         )
         .await?;
         let mut sessions = self.sessions.write().await;

@@ -312,6 +312,22 @@ fn default_enabled_mcp_servers() -> Vec<String> {
     Vec::new()
 }
 
+// ── STT config ───────────────────────────────────────────────────────
+
+/// Speech-to-text configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SttConfig {
+    /// Whisper model to use: `tiny`, `base`, `small`, `medium`, or `large`.
+    /// Default: `base` (~142 MB download).
+    #[serde(default)]
+    pub model: crate::stt::WhisperModel,
+
+    /// Whether STT is enabled.  When `false`, audio messages from the
+    /// web UI are ignored with an error.  Default: `false` (opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 // ── config ──────────────────────────────────────────────────────────
 
 /// Compaction budget for the conversation memory.
@@ -412,6 +428,10 @@ pub struct Config {
     /// Names of MCP servers to enable globally (for all sessions).
     #[serde(default = "default_enabled_mcp_servers")]
     pub enabled_mcp_servers: Vec<String>,
+
+    /// Speech-to-text configuration.
+    #[serde(default)]
+    pub stt: SttConfig,
 }
 
 fn default_model() -> Model {
@@ -442,6 +462,7 @@ impl Default for Config {
             ollama_base_url: default_ollama_base_url(),
             mcp_servers: default_mcp_servers(),
             enabled_mcp_servers: default_enabled_mcp_servers(),
+            stt: SttConfig::default(),
         }
     }
 }

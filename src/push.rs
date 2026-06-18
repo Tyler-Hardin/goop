@@ -67,6 +67,7 @@ fn load_or_generate_vapid() -> (String, String, String) {
 
     // Generate fresh keys.
     let sk = p256::SecretKey::random(&mut rand::thread_rng());
+    #[allow(deprecated)]
     let private_b64 = encode_base64url(sk.to_bytes().as_slice());
     let pk = sk.public_key();
     let public_b64 = encode_base64url(pk.to_sec1_bytes().as_ref());

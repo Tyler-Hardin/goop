@@ -369,6 +369,11 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
                         }
                     }
                 }
+                Message::Binary(data) => {
+                    // Audio data for speech-to-text.  The client sends a
+                    // complete WAV file as a binary frame (push-to-talk).
+                    session.submit_audio(data.to_vec(), PromptSource::Web).await;
+                }
                 Message::Close(_) => break,
                 _ => {}
             }
