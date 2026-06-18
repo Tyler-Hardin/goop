@@ -64,6 +64,53 @@ pub fn App() -> impl IntoView {
         handler.forget();
     }
 
+    // ── PWA foreground reconnect ─────────────────────────────────────
+
+    // When the page becomes visible again after being backgrounded (PWA
+    // pause/resume on mobile), the WebSocket is often dead but the
+    // on_close setTimeout callback may not have fired yet, so
+    // `connection` still reads Connected.  Check the actual socket
+    // state and reconnect if needed.
+    {
+        let state = state.clone();
+        let handler = Closure::wrap(Box::new(move || {
+            let visible = web_sys::window()
+                .and_then(|w| w.document())
+                .map(|d| !d.hidden())
+                .unwrap_or(false);
+            if !visible {
+                return;
+            }
+            let session = match state.current_session.get_untracked() {
+                Some(ref s) => s.clone(),
+                None => return,
+            };
+            // If we're already Connected, verify the socket is still open
+            // (the browser may have closed it while backgrounded without
+            // the setTimeout callback having run yet).
+            if state.connection.get_untracked().is_connected() {
+                let alive = state
+                    .ws
+                    .get_untracked()
+                    .map(|ws| ws.ready_state() == web_sys::WebSocket::OPEN)
+                    .unwrap_or(false);
+                if alive {
+                    return;
+                }
+            }
+            log::info!("visibilitychange: reconnecting to {session}");
+            state.connect_session(session);
+        }) as Box<dyn FnMut()>);
+
+        if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+            let _ = document.add_event_listener_with_callback(
+                "visibilitychange",
+                handler.as_ref().unchecked_ref(),
+            );
+        }
+        handler.forget();
+    }
+
     // Provide state to all descendants.
     provide_context(state.clone());
 
