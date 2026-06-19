@@ -201,26 +201,40 @@ The web UI shows a session sidebar for switching between sessions.
   snapshot).  `Transport::to_persisted()` converts a live transport into
   its persistable form.  File and shell tools route through the transport
   so they work transparently on local or remote hosts.
-- **LogReplayMemory** (`src/memory.rs`) — implements rig's
+- **TransactionLog** (`src/memory/transaction_log.rs`) — the append-only
+  log struct with **private fields** (`entries`, `next_seq`, `path`).
+  `open(path, name)` is the RAII constructor: loads from disk (with legacy
+  migration), injects `SessionInfo` if absent, persists if new.  `append()`
+  is the **sole mutation path** — assigns seq, computes parent, stamps ts,
+  all under the caller's lock.  `persist()` does best-effort async file
+  write.  Keeping `next_seq` inside the struct (not a separate `AtomicU64`
+  on `Session`) makes the ordering invariant (seq == parent == file order)
+  structural, so a future background appender (tool-pair summarizer) can't
+  corrupt the tree by racing the lock.
+- **LogReplayMemory** (`src/memory/mod.rs`) — implements rig's
   `ConversationMemory` trait by **replaying the session's append-only
   transaction log** into `Vec<Message>` (the agent view). The events log
   (`~/.config/goop/sessions/<name>.jsonl`) is the single source of
   truth — the old separate `<name>.messages.jsonl` is eliminated.
   `load()` replays; `append()`/`clear()` are no-ops (the session writes
   every event to the log during streaming). The log is shared
-  (`Arc<Mutex<Vec<LogEntry>>>`) between the session and the memory. See
+  (`Arc<Mutex<TransactionLog>>`) between the session and the memory. See
   `docs/compaction-redesign.md`.
-- **Log replay** (`replay_visible` in `src/memory.rs`) — turns are
+- **Log replay** (`replay_visible` in `src/memory/replay.rs`) — turns are
   buffered and committed only at a `TurnEnded` event;
   `TurnEnded::Cancelled { prompt: Some(_) }` drops the turn (no work
   committed), every other reason commits it. A trailing in-progress turn
   is dropped (rig appends the current prompt itself, so replay omits it).
   An orphan-tool-pair net drops any `ToolCall` whose `ToolResult` is
-  absent. Legacy pre-redesign events (removed
-  `FinalResponse`/`Error`/`Cancelled`; `ToolCall`/`ToolResult` with no
-  `id`) are migrated on load — turn-end variants map to `TurnEnded` and
-  tool calls/results get order-paired synthetic ids.
-- **Compaction** (`src/memory.rs` + `src/session.rs`) — when the
+  absent. Replay is a **pure projection** (takes `&[LogEntry]`, returns
+  `Vec<Message>`) — kept separate from `TransactionLog` for independent
+  testability and to respect the distinction between the source of truth
+  and its consumer-specific projections. Legacy pre-redesign events
+  (removed `FinalResponse`/`Error`/`Cancelled`; `ToolCall`/`ToolResult`
+  with no `id`) are migrated on load (in `transaction_log.rs`) — turn-end
+  variants map to `TurnEnded` and tool calls/results get order-paired
+  synthetic ids.
+- **Compaction** (`src/memory/mod.rs` + `src/session.rs`) — when the
   agent-visible conversation exceeds a token threshold, the whole prefix
   is summarized into a rolling `Compacted { summary, model, covers,
   manual }` event before the next turn. Replay applies it: the covered

@@ -166,6 +166,58 @@ session state, persisted in `<name>.state.toml` (added when forking lands;
 until then it's always the last seq).  Replay walks backward from the active
 tip to the root, collecting events along the way.
 
+### 2.2a TransactionLog — encapsulated append-only log (RAII)
+
+The entry vector, sequence counter, and on-disk path are bundled in a
+`TransactionLog` struct with **private fields**.  No external code can assign
+seqs, push entries directly, or observe `next_seq`.  This makes the ordering
+invariant structural rather than conventional:
+
+> seq order == parent-pointer order == entry-vector order
+
+That invariant is what the backward branch walk (for forking, §2.9) depends
+on.  It must hold even when multiple tasks append concurrently (e.g. a future
+background tool-pair summarizer).  By keeping `next_seq` inside the struct
+instead of a separate `AtomicU64` on `Session`, no caller can assign a seq
+and then lose the lock race to another appender — which would produce
+out-of-order file writes and forward parent edges (`parent > seq`) that
+corrupt the tree.
+
+```rust
+pub(crate) struct TransactionLog {
+    entries: Vec<LogEntry>,   // private
+    next_seq: u64,            // private
+    path: Option<PathBuf>,    // private (None = in-memory, tests)
+}
+```
+
+**RAII constructor** — `TransactionLog::open(path, session_name) -> Self`
+handles all initialization: loading from disk (with legacy bare-event
+migration), injecting a `SessionInfo` root if absent, and persisting it for
+brand-new sessions.  `Session::new` just calls `open()` and broadcasts the
+`SessionInfo` — it never touches seqs, parent pointers, or file paths.
+
+**Sole mutation path** — `append(event) -> LogEntry` assigns the next
+monotonic `seq`, computes `parent` from the current last entry, stamps `ts`,
+and pushes.  It is sync and pure (no I/O) so it can be unit-tested without
+a runtime or temp files.  Persistence is a separate `persist(&entry)` method
+(best-effort async file write); the caller (`Session::emit`) orchestrates
+`append → persist → broadcast` under the history lock.
+
+**Module structure** — `src/memory/` is a module directory:
+- `transaction_log.rs` — `TransactionLog` (struct, `open`, `append`,
+  `persist`, `entries`), plus legacy loading/migration (private).
+- `replay.rs` — pure replay functions (`replay_log`, `replay_visible`) that
+  take `&[LogEntry]` and produce `Vec<Message>` or `Vec<VisibleItem>`.  This
+  is a *projection* (log → agent-visible messages), not a property of the
+  log — it applies compaction, overlays, and turn buffering to derive what
+  the LLM sees.  Kept separate from `TransactionLog` for independent
+  testability and to respect the distinction between the source of truth
+  (the log) and its consumer-specific projections.
+- `mod.rs` — `LogReplayMemory` (implements rig's `ConversationMemory` by
+  replaying the shared `Arc<Mutex<TransactionLog>>`), context-length lookup
+  table.
+
 ### 2.3 Enriched and new event types
 
 Current events need enrichment for agent-memory reconstruction.  Critically,

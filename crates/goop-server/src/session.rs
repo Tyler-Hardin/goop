@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use chrono::{Local, Utc};
+use chrono::Local;
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
 use rig::completion::Message;
@@ -13,7 +13,9 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::config::{self, Config, McpServerDef};
 use crate::events::{LogEntry, PromptSource, SessionEvent, TurnEndReason};
-use crate::memory::{self, LogReplayMemory, build_session_memory, prompt_history_path};
+use crate::memory::{
+    self, LogReplayMemory, TransactionLog, build_session_memory, prompt_history_path,
+};
 use crate::model;
 use crate::preamble::build_preamble;
 use crate::session_state::{PersistedSessionState, SessionState};
@@ -68,16 +70,11 @@ pub struct Session {
     pub(crate) state: Arc<SessionState>,
     agent: Arc<crate::model::AnyAgent>,
     tx: broadcast::Sender<SessionEvent>,
-    history: Arc<Mutex<Vec<LogEntry>>>,
-
-    /// Monotonic sequence counter for [`LogEntry`]s, assigned at append
-    /// time in [`emit`](Self::emit).  Initialised from the loaded log so
-    /// new entries continue past the last persisted seq.
-    next_seq: AtomicU64,
+    history: Arc<Mutex<TransactionLog>>,
 
     /// Clone of the log-replay memory, used to estimate token counts for
     /// the context-usage progress bar.  Shares the same transaction-log
-    /// `Arc<Mutex<Vec<LogEntry>>>` as the agent's memory, so it always
+    /// `Arc<Mutex<TransactionLog>>` as the agent's memory, so it always
     /// reflects the latest conversation state.
     memory: LogReplayMemory,
 
@@ -109,9 +106,6 @@ pub struct Session {
     /// Whether the session is currently processing a prompt.
     /// Used to tell late-joining clients whether to show a Cancel button.
     is_running: AtomicBool,
-
-    /// If set, every event is appended to this file as JSONL.
-    events_file: Option<PathBuf>,
 
     /// Per-session MCP manager — kept alive so peer connections stay open
     /// for tool invocation. Shared MCP servers live in [`SessionManager`].
@@ -160,10 +154,6 @@ impl Session {
         std::fs::create_dir_all(&dir)?;
         let events_path = dir.join(format!("{name}.jsonl"));
         let state_path = crate::session_state::state_path(&name);
-        // Load pre-existing log entries for history replay.  Returns the
-        // entries plus the next free seq number.
-        let (mut existing_entries, mut next_seq) =
-            load_log_from_file(&events_path).unwrap_or((Vec::new(), 0));
 
         // ── load persisted state (config overrides + CWD + transport) ──
         let persisted = PersistedSessionState::load(&name).unwrap_or_default();
@@ -253,40 +243,17 @@ impl Session {
         let (tx, _) = broadcast::channel(capacity);
         let (submit_tx, submit_rx) = mpsc::unbounded_channel();
 
-        let session_info = SessionEvent::SessionInfo { name: name.clone() };
-        // Ensure SessionInfo is first in history for replay to new clients.
-        // It's metadata (skipped during agent-memory replay), so its seq
-        // need only be unique — for a fresh session it's seq 0; for a
-        // resumed session lacking it (legacy), it gets the next free seq.
-        let need_inject = existing_entries.is_empty()
-            || !matches!(
-                existing_entries.first().map(|e| &e.event),
-                Some(SessionEvent::SessionInfo { .. }),
-            );
-        if need_inject {
-            let seq = next_seq;
-            next_seq += 1;
-            let entry = LogEntry {
-                seq,
-                parent: None,
-                ts: Utc::now(),
-                event: session_info.clone(),
-            };
-            // Persist only for a brand-new session; for resumed legacy
-            // sessions the entry lives in memory only (it's re-injected
-            // each load until the file is rewritten).
-            if existing_entries.is_empty() {
-                append_logentry_to_file(&events_path, &entry).await;
-            }
-            existing_entries.insert(0, entry);
-        }
-        // Broadcast immediately so live subscribers see it.
-        let _ = tx.send(session_info);
+        // ── open the transaction log (RAII: loads, migrates, injects
+        //    SessionInfo, persists if new) ──────────────────────────
+        let log = TransactionLog::open(events_path, &name).await?;
+        // Broadcast SessionInfo immediately so live subscribers see it.
+        // (The log already has it; this is the delivery mechanism.)
+        let _ = tx.send(SessionEvent::SessionInfo { name: name.clone() });
 
         // ── shared transaction log: the source of truth for agent memory ──
         // The same `Arc` is handed to the `LogReplayMemory` below, so every
         // event emitted via `emit()` is visible to `ConversationMemory::load`.
-        let history = Arc::new(Mutex::new(existing_entries));
+        let history = Arc::new(Mutex::new(log));
 
         let mem = build_session_memory(history.clone());
         // Clone for the context-usage progress bar (shares the log `Arc`).
@@ -313,7 +280,6 @@ impl Session {
             agent,
             tx,
             history,
-            next_seq: AtomicU64::new(next_seq),
             memory: memory_for_usage,
             context_limit,
             compaction_threshold,
@@ -321,7 +287,6 @@ impl Session {
             submit_tx,
             cancel_tx: Mutex::new(None),
             is_running: AtomicBool::new(false),
-            events_file: Some(events_path),
             session_mcp: session_mcp_manager,
             push_notifier,
             stt,
@@ -431,7 +396,7 @@ impl Session {
     /// Late-joining views (web, phone, …) receive every event since
     /// session creation before transitioning to live events.
     pub async fn subscribe_all(&self) -> SessionSubscriber {
-        let history = self.history.lock().await.clone();
+        let history = self.history.lock().await.entries_vec();
         let rx = self.tx.subscribe();
         SessionSubscriber {
             history,
@@ -764,32 +729,28 @@ impl Session {
     }
 
     /// Send an event to live subscribers, append to history, and
-    /// persist to the events file (if one is configured).
+    /// persist to the on-disk log.
     ///
-    /// The event is wrapped in a [`LogEntry`] envelope (assigning the next
-    /// monotonic `seq`, a `parent` pointing at the previous entry, and a
-    /// UTC `ts`) before being persisted and stored.  Live subscribers
-    /// receive the bare event over the WebSocket — the envelope lives in
-    /// the on-disk log and the in-memory history (the sources for replay).
+    /// `TransactionLog::append` assigns the next monotonic `seq`, computes
+    /// `parent` from the last entry, and stamps `ts` — all under the history
+    /// lock, so seq order, parent-pointer order, and file-append order can
+    /// never diverge.  `persist` writes the JSONL line (best-effort).  Live
+    /// subscribers receive the bare event over the WebSocket; the envelope
+    /// lives in the on-disk log and the in-memory history (the sources for
+    /// replay).
+    ///
+    /// The file write and broadcast stay under the lock deliberately:
+    /// `subscribe_all` does `lock → snapshot entries → subscribe to tx`,
+    /// so keeping `append + persist + send` atomic with respect to that
+    /// ensures every subscriber sees each event exactly once (history XOR
+    /// live — never both, never neither).
     async fn emit(&self, event: SessionEvent) {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let mut hist = self.history.lock().await;
-        let parent = hist.last().map(|e| e.seq);
-        let entry = LogEntry {
-            seq,
-            parent,
-            ts: Utc::now(),
-            event: event.clone(),
-        };
+        let mut log = self.history.lock().await;
+        let entry = log.append(event.clone());
         // Persist to file before broadcasting so the file is always
-        // ahead of any subscriber that might race a crash.  Held under
-        // the history lock so parent pointers stay consistent; emits are
-        // nearly serial (single drain task) so this is uncontended.
-        if let Some(ref path) = self.events_file {
-            append_logentry_to_file(path, &entry).await;
-        }
+        // ahead of any subscriber that might race a crash.
+        log.persist(&entry).await;
         let _ = self.tx.send(event);
-        hist.push(entry);
     }
 }
 
@@ -1140,191 +1101,6 @@ fn resolve_compaction_threshold(config: &Config) -> Option<usize> {
     }
 }
 
-/// Load the transaction log from a JSONL file.
-///
-/// Each line is a [`LogEntry`] envelope.  Lines that fail to parse as a
-/// `LogEntry` are retried as a bare [`SessionEvent`] (the legacy
-/// pre-redesign format) and wrapped in a synthesised envelope — the `seq`
-/// is the next free number, `parent` the previous entry's seq, and `ts`
-/// the current time (legacy files carried no timestamps).
-///
-/// Returns the entries in file order plus the next free `seq` (for
-/// initialising the session's counter so new entries continue past the
-/// last persisted one).
-fn load_log_from_file(path: &std::path::Path) -> Result<(Vec<LogEntry>, u64), anyhow::Error> {
-    if !path.exists() {
-        return Ok((Vec::new(), 0));
-    }
-    let file = std::fs::File::open(path)?;
-    let mut entries = Vec::new();
-    let mut next_seq: u64 = 0;
-    let mut prev_seq: Option<u64> = None;
-    // Counters for synthesising tool-call IDs on legacy bare events:
-    // pre-redesign `ToolCall`/`ToolResult` had no `id`, so we pair them by
-    // document order (the i-th call matches the i-th result).
-    let mut legacy_call_n: u64 = 0;
-    let mut legacy_result_n: u64 = 0;
-
-    for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry = match serde_json::from_str::<LogEntry>(&line) {
-            Ok(le) => {
-                // Preserve the persisted seq; advance the counter past it.
-                if le.seq >= next_seq {
-                    next_seq = le.seq + 1;
-                }
-                le
-            }
-            Err(_) => match migrate_legacy_bare_event(
-                &line,
-                &mut next_seq,
-                prev_seq,
-                &mut legacy_call_n,
-                &mut legacy_result_n,
-            ) {
-                Some(e) => e,
-                None => {
-                    // Truly unparseable line — skip rather than abort the
-                    // whole session.  Better to lose one event than all.
-                    tracing::warn!("skipping unparseable log line in {path:?}");
-                    continue;
-                }
-            },
-        };
-        prev_seq = Some(entry.seq);
-        entries.push(entry);
-    }
-    Ok((entries, next_seq))
-}
-
-/// Build a [`LogEntry`] envelope for a migrated legacy line.
-fn log_envelope(seq: u64, parent: Option<u64>, event: SessionEvent) -> LogEntry {
-    LogEntry {
-        seq,
-        parent,
-        ts: Utc::now(),
-        event,
-    }
-}
-
-/// Migrate a legacy bare-event line (the pre-redesign on-disk format) into a
-/// [`LogEntry`] envelope.
-///
-/// Handles three categories of legacy lines:
-/// 1. **Unchanged variants** (`UserPrompt`, `Thinking`, `AssistantText`,
-///    `ContextUsage`, …) — parsed directly as the current `SessionEvent`.
-/// 2. **Removed turn-end variants** — mapped to `TurnEnded`:
-///    `FinalResponse` → `Completed`, `Error(String)` → `Error`, and
-///    `Cancelled` (unit, or `{ prompt }`) → `Cancelled { prompt }`.
-///    Without this, legacy sessions would have no turn-end markers and
-///    replay would commit nothing.
-/// 3. **`ToolCall`/`ToolResult` without `id`** — synthesise `legacy_{n}`
-///    ids, paired by document order so each call matches its result.
-///
-/// Returns `None` for lines that can't be interpreted at all (the caller
-/// skips them).
-fn migrate_legacy_bare_event(
-    line: &str,
-    next_seq: &mut u64,
-    parent: Option<u64>,
-    call_n: &mut u64,
-    result_n: &mut u64,
-) -> Option<LogEntry> {
-    // 1. Current SessionEvent format (unchanged bare variants).
-    if let Ok(event) = serde_json::from_str::<SessionEvent>(line) {
-        let seq = *next_seq;
-        *next_seq += 1;
-        return Some(log_envelope(seq, parent, event));
-    }
-
-    // 2. Inspect as generic JSON for removed/changed variants.
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    let ty = v.get("type").and_then(|t| t.as_str())?;
-    let data = v.get("data");
-    let event = match ty {
-        "FinalResponse" => SessionEvent::TurnEnded {
-            reason: TurnEndReason::Completed,
-        },
-        "Error" => SessionEvent::TurnEnded {
-            reason: TurnEndReason::Error {
-                message: data
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("(unknown error)")
-                    .to_string(),
-            },
-        },
-        "Cancelled" => SessionEvent::TurnEnded {
-            reason: TurnEndReason::Cancelled {
-                // Legacy unit `Cancelled` (no data) → `None` (committed).
-                prompt: data
-                    .and_then(|d| d.get("prompt"))
-                    .and_then(|p| p.as_str())
-                    .map(String::from),
-            },
-        },
-        "ToolCall" => {
-            let d = data?;
-            let id = format!("legacy_{call_n}");
-            *call_n += 1;
-            let name = d.get("name").and_then(|n| n.as_str())?.to_string();
-            let arguments = d
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            SessionEvent::ToolCall {
-                id,
-                name,
-                arguments,
-            }
-        }
-        "ToolResult" => {
-            let d = data?;
-            let id = format!("legacy_{result_n}");
-            *result_n += 1;
-            let content = d
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            SessionEvent::ToolResult { id, content }
-        }
-        _ => return None,
-    };
-    let seq = *next_seq;
-    *next_seq += 1;
-    Some(log_envelope(seq, parent, event))
-}
-
-/// Append a single [`LogEntry`] as a JSON line to the events file.
-async fn append_logentry_to_file(path: &std::path::Path, entry: &LogEntry) {
-    let json = match serde_json::to_string(entry) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::error!("failed to serialize log entry: {e}");
-            return;
-        }
-    };
-    // Use tokio async file I/O so we don't block the runtime.
-    let mut file = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!("failed to open events file {path:?}: {e}");
-            return;
-        }
-    };
-    if let Err(e) = file.write_all(format!("{json}\n").as_bytes()).await {
-        tracing::error!("failed to write entry to {path:?}: {e}");
-    }
-}
-
 /// Append a prompt to the global prompt history file as a JSON-encoded
 /// string (handles multi-line prompts safely).
 async fn append_prompt_to_history(prompt: &str) {
@@ -1352,174 +1128,5 @@ async fn append_prompt_to_history(prompt: &str) {
     };
     if let Err(e) = file.write_all(format!("{json}\n").as_bytes()).await {
         tracing::error!("failed to write to history file {path:?}: {e}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Legacy bare-event lines (the pre-redesign on-disk format) are
-    /// migrated into `LogEntry` envelopes with sequential seqs, parent
-    /// pointers chaining to the previous entry, and synthetic timestamps.
-    #[test]
-    fn load_log_migrates_legacy_bare_events() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let line1 = serde_json::to_string(&SessionEvent::SessionInfo { name: "s".into() }).unwrap();
-        let line2 = serde_json::to_string(&SessionEvent::UserPrompt {
-            content: "hi".into(),
-            source: PromptSource::Terminal,
-        })
-        .unwrap();
-        std::fs::write(tmp.path(), format!("{line1}\n{line2}\n")).unwrap();
-
-        let (entries, next_seq) = load_log_from_file(tmp.path()).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].seq, 0);
-        assert_eq!(entries[0].parent, None);
-        assert_eq!(entries[1].seq, 1);
-        assert_eq!(entries[1].parent, Some(0));
-        assert_eq!(next_seq, 2);
-    }
-
-    /// New-format `LogEntry` lines preserve their persisted seqs (even with
-    /// gaps) so seq references in later phases (Compacted.covers, etc.)
-    /// stay stable across reloads.
-    #[test]
-    fn load_log_preserves_envelope_seqs() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let mk = |seq, parent, event| {
-            serde_json::to_string(&LogEntry {
-                seq,
-                parent,
-                ts: Utc::now(),
-                event,
-            })
-            .unwrap()
-        };
-        let l1 = mk(0, None, SessionEvent::SessionInfo { name: "s".into() });
-        let l2 = mk(
-            5,
-            Some(0),
-            SessionEvent::UserPrompt {
-                content: "hi".into(),
-                source: PromptSource::Web,
-            },
-        );
-        std::fs::write(tmp.path(), format!("{l1}\n{l2}\n")).unwrap();
-
-        let (entries, next_seq) = load_log_from_file(tmp.path()).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].seq, 0);
-        assert_eq!(entries[1].seq, 5);
-        assert_eq!(entries[1].parent, Some(0));
-        assert_eq!(next_seq, 6);
-    }
-
-    /// A mixed file (legacy bare prefix, then new-format envelope lines)
-    /// assigns sequential seqs to the legacy prefix and preserves the
-    /// envelope seqs that follow — the normal transition state.
-    #[tokio::test]
-    async fn load_log_handles_mixed_legacy_and_envelope() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let bare = serde_json::to_string(&SessionEvent::SessionInfo { name: "s".into() }).unwrap();
-        std::fs::write(tmp.path(), format!("{bare}\n")).unwrap();
-
-        // Append a new-format entry; its seq continues past the legacy
-        // prefix (which the loader will assign 0).
-        let entry = LogEntry {
-            seq: 1,
-            parent: Some(0),
-            ts: Utc::now(),
-            event: SessionEvent::UserPrompt {
-                content: "hi".into(),
-                source: PromptSource::Web,
-            },
-        };
-        append_logentry_to_file(tmp.path(), &entry).await;
-
-        let (entries, next_seq) = load_log_from_file(tmp.path()).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].seq, 0); // legacy line, assigned
-        assert_eq!(entries[1].seq, 1); // envelope line, preserved
-        assert_eq!(next_seq, 2);
-    }
-
-    /// Pre-redesign sessions use removed variants (`FinalResponse`,
-    /// `Error`, `Cancelled`) and `ToolCall`/`ToolResult` without `id`.
-    /// These are migrated to the current model: turn-end variants become
-    /// `TurnEnded`, and tool calls/results get order-paired synthetic ids.
-    #[tokio::test]
-    async fn load_log_migrates_removed_variants_and_unids_tool_calls() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let lines = [
-            // bare UserPrompt (unchanged variant — parses directly)
-            serde_json::to_string(&SessionEvent::UserPrompt {
-                content: "run ls".into(),
-                source: PromptSource::Web,
-            })
-            .unwrap(),
-            // legacy ToolCall with no id
-            r#"{"type":"ToolCall","data":{"name":"shell","arguments":{"command":"ls"}}}"#
-                .to_string(),
-            // legacy ToolResult with no id (pairs with the call above)
-            r#"{"type":"ToolResult","data":{"content":"a.txt"}}"#.to_string(),
-            // legacy turn-end (unit FinalResponse)
-            r#"{"type":"FinalResponse"}"#.to_string(),
-        ];
-        std::fs::write(tmp.path(), format!("{}\n", lines.join("\n"))).unwrap();
-
-        let (entries, next_seq) = load_log_from_file(tmp.path()).unwrap();
-        assert_eq!(entries.len(), 4);
-        assert!(matches!(entries[0].event, SessionEvent::UserPrompt { .. }));
-        // ToolCall got a synthetic id; ToolResult got the matching one.
-        let call_id = match &entries[1].event {
-            SessionEvent::ToolCall { id, name, .. } => {
-                assert_eq!(name, "shell");
-                id.clone()
-            }
-            other => panic!("expected ToolCall, got {other:?}"),
-        };
-        match &entries[2].event {
-            SessionEvent::ToolResult { id, content } => {
-                assert_eq!(id, &call_id); // paired by order
-                assert_eq!(content, "a.txt");
-            }
-            other => panic!("expected ToolResult, got {other:?}"),
-        }
-        // FinalResponse → TurnEnded { Completed }
-        match &entries[3].event {
-            SessionEvent::TurnEnded {
-                reason: TurnEndReason::Completed,
-            } => {}
-            other => panic!("expected TurnEnded::Completed, got {other:?}"),
-        }
-        assert_eq!(next_seq, 4);
-    }
-
-    /// `LogEntry` round-trips through serde, including the nested tagged
-    /// `SessionEvent` payload.
-    #[test]
-    fn log_entry_serde_roundtrip() {
-        let entry = LogEntry {
-            seq: 42,
-            parent: Some(41),
-            ts: Utc::now(),
-            event: SessionEvent::TurnEnded {
-                reason: TurnEndReason::Cancelled {
-                    prompt: Some("hey".into()),
-                },
-            },
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        let back: LogEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.seq, 42);
-        assert_eq!(back.parent, Some(41));
-        match back.event {
-            SessionEvent::TurnEnded {
-                reason: TurnEndReason::Cancelled { prompt: Some(p) },
-            } => assert_eq!(p, "hey"),
-            other => panic!("unexpected event: {other:?}"),
-        }
     }
 }
