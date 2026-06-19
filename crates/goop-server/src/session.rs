@@ -14,8 +14,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::config::{self, Config, McpServerDef};
 use crate::events::{PromptSource, SessionEvent};
-use crate::memory::build_session_memory;
-use crate::memory::prompt_history_path;
+use crate::memory::{self, FileConversationMemory, build_session_memory, prompt_history_path};
 use crate::model;
 use crate::preamble::build_preamble;
 use crate::session_state::{PersistedSessionState, SessionState};
@@ -71,6 +70,17 @@ pub struct Session {
     agent: Arc<crate::model::AnyAgent>,
     tx: broadcast::Sender<SessionEvent>,
     history: Mutex<Vec<SessionEvent>>,
+
+    /// Clone of the file-backed memory, used to estimate token counts for
+    /// the context-usage progress bar.  Shares the same
+    /// `Arc<Mutex<Vec<Message>>>` as the agent's memory, so it always
+    /// reflects the latest conversation state.
+    memory: FileConversationMemory,
+
+    /// Context window limit (in tokens) for the progress bar.  Uses the
+    /// compaction budget when compaction is enabled, otherwise the model's
+    /// known context window.  `None` when neither is known.
+    context_limit: Option<usize>,
 
     /// Push a prompt here from any view; the background worker drains it.
     /// Each entry carries an optional completion signal for the submitter.
@@ -228,6 +238,26 @@ impl Session {
         mcp_tools.extend(shared_mcp_manager.build_tools());
         mcp_tools.extend(session_mcp_manager.build_tools());
 
+        // Clone the memory before it's moved into the agent.  The clone
+        // shares the same `Arc<Mutex<Vec<Message>>>`, so it always sees the
+        // latest conversation state — we use it to estimate token counts
+        // for the context-usage progress bar.
+        let memory_for_usage = mem.clone();
+
+        // Compute the context window limit for the progress bar.  Prefer the
+        // compaction budget (the practical limit at which old messages are
+        // evicted); fall back to the model's known context window; if
+        // neither is available, the bar is hidden.
+        let context_limit = {
+            let budget = mem.budget();
+            if budget != usize::MAX {
+                Some(budget)
+            } else {
+                memory::lookup_context_length(merged_config.provider(), merged_config.model_name())
+                    .map(|v| v as usize)
+            }
+        };
+
         let agent = model::build_agent(&merged_config, &preamble, mem, state.clone(), mcp_tools)?;
 
         let (tx, _) = broadcast::channel(capacity);
@@ -253,6 +283,8 @@ impl Session {
             agent,
             tx,
             history: Mutex::new(existing_events),
+            memory: memory_for_usage,
+            context_limit,
             submit_tx,
             cancel_tx: Mutex::new(None),
             is_running: AtomicBool::new(false),
@@ -453,6 +485,7 @@ impl Session {
 
                         self.is_running.store(false, Ordering::SeqCst);
                         self.emit(SessionEvent::Cancelled { prompt: None }).await;
+                        self.emit_context_usage().await;
                         self.notify_push("Cancelled").await;
                         return;
                     }
@@ -539,6 +572,7 @@ impl Session {
                             Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
                                 self.clear_cancel().await;
                                 self.emit(SessionEvent::FinalResponse).await;
+                                self.emit_context_usage().await;
                                 self.notify_push("FinalResponse").await;
                                 return;
                             }
@@ -582,6 +616,7 @@ impl Session {
                                         e.to_string()
                                     };
                                 self.emit(SessionEvent::Error(msg)).await;
+                                self.emit_context_usage().await;
                                 self.notify_push("Error").await;
                                 return;
                             }
@@ -590,6 +625,7 @@ impl Session {
                                 // Stream ended without FinalResponse.
                                 self.clear_cancel().await;
                                 self.emit(SessionEvent::FinalResponse).await;
+                                self.emit_context_usage().await;
                                 self.notify_push("FinalResponse").await;
                                 return;
                             }
@@ -647,6 +683,20 @@ impl Session {
         tokio::spawn(async move {
             notifier.notify(&name, &event).await;
         });
+    }
+
+    /// Estimate the current context window usage and emit a
+    /// [`SessionEvent::ContextUsage`] so connected clients can update their
+    /// progress bar.  Called after each turn completes (FinalResponse,
+    /// Error, or Cancelled with committed tool turns).
+    ///
+    /// No-op when `context_limit` is `None` (unknown model + no compaction).
+    async fn emit_context_usage(&self) {
+        let Some(limit) = self.context_limit else {
+            return;
+        };
+        let used = self.memory.estimated_tokens().await;
+        self.emit(SessionEvent::ContextUsage { used, limit }).await;
     }
 
     /// Send an event to live subscribers, append to history, and

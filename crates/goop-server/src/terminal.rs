@@ -589,6 +589,10 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 // Web-only sentinel marking end of history replay.
                 // The terminal doesn't batch-render, so ignore it.
             }
+
+            SessionEvent::ContextUsage { .. } => {
+                // Web-only progress bar — the terminal has no context bar.
+            }
         }
     }
 }

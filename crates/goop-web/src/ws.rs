@@ -25,6 +25,9 @@ pub fn connect(state: &AppState, session_name: String) {
     // the server sends HistoryComplete, then flushed in one batch.
     state.history_buffer.set(Vec::new());
     state.connection.set(ConnectionState::CatchingUp);
+    // Clear the context-usage bar so the previous session's value
+    // doesn't linger until history replay completes.
+    state.context_usage.set(None);
 
     let w = web_sys::window().expect("no global window");
     let host = w

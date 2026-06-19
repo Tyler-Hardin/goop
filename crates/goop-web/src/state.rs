@@ -182,6 +182,12 @@ pub struct AppState {
     /// a unique ID so `<For>` can track messages by key.
     pub next_message_id: RwSignal<usize>,
 
+    /// Estimated context window usage: `(used_tokens, limit_tokens)`.
+    /// `None` until the first `ContextUsage` event arrives (or when the
+    /// model's context window is unknown and compaction is disabled).
+    /// Drives the thin progress bar at the top of the input footer.
+    pub context_usage: RwSignal<Option<(usize, usize)>>,
+
     // ── history catch-up ──────────────────────────────────────────
     /// Raw `SessionEvent`s accumulated during history replay.  No signals
     /// are touched while `connection` is `CatchingUp` — every event lands
@@ -209,6 +215,16 @@ pub struct AppState {
     pub(crate) reconnect_attempt: RwSignal<u32>,
 }
 
+/// Result of pre-forming buffered history events into UI state.
+struct BuildResult {
+    messages: Vec<UiMessage>,
+    session_name: Option<String>,
+    running: bool,
+    turn_state: TurnState,
+    next_id: usize,
+    context_usage: Option<(usize, usize)>,
+}
+
 impl AppState {
     pub fn new() -> Self {
         let btn_state = RwSignal::new(BtnState::Disabled);
@@ -227,6 +243,7 @@ impl AppState {
             sidebar_open: RwSignal::new(false),
             input_text: RwSignal::new(String::new()),
             next_message_id: RwSignal::new(0),
+            context_usage: RwSignal::new(None),
             history_buffer: RwSignal::new(Vec::new()),
             connection_gen: RwSignal::new(0),
             input_focus_request: RwSignal::new(0),
@@ -412,22 +429,22 @@ impl AppState {
                     // Pre-form all messages from the buffered events
                     // without touching a single reactive signal.
                     let start_id = self.next_message_id.get_untracked();
-                    let (msgs, session_name, running, turn_state, next_id) =
-                        Self::build_messages(&buffer, start_id);
-                    self.next_message_id.set(next_id);
+                    let result = Self::build_messages(&buffer, start_id);
+                    self.next_message_id.set(result.next_id);
 
                     // Apply everything in one shot.
-                    if let Some(name) = session_name {
+                    if let Some(name) = result.session_name {
                         self.current_session.set(Some(name));
                     }
-                    self.btn_state.set(if running {
+                    self.btn_state.set(if result.running {
                         BtnState::Running
                     } else {
                         BtnState::Idle
                     });
-                    self.turn_state.set(turn_state);
+                    self.turn_state.set(result.turn_state);
                     self.streaming_text.set(String::new());
-                    self.messages.set(msgs);
+                    self.messages.set(result.messages);
+                    self.context_usage.set(result.context_usage);
 
                     // Session is now loaded — refresh the sidebar.
                     log::info!("HistoryComplete — refreshing session list");
@@ -456,16 +473,14 @@ impl AppState {
     /// whether the last message is a `Thinking` that was never followed
     /// by a content event — this lets the caller initialise the live FSM
     /// correctly.
-    fn build_messages(
-        events: &[SessionEvent],
-        start_id: usize,
-    ) -> (Vec<UiMessage>, Option<String>, bool, TurnState, usize) {
+    fn build_messages(events: &[SessionEvent], start_id: usize) -> BuildResult {
         let mut messages: Vec<UiMessage> = Vec::with_capacity(events.len());
         let mut session_name: Option<String> = None;
         let mut running = false;
         let mut streaming: String = String::new();
         let mut next_id = start_id;
         let mut turn = TurnState::Idle;
+        let mut context_usage: Option<(usize, usize)> = None;
 
         for event in events {
             match event {
@@ -553,6 +568,9 @@ impl AppState {
                 SessionEvent::SessionState { .. } => {
                     // running is derived from message content above.
                 }
+                SessionEvent::ContextUsage { used, limit } => {
+                    context_usage = Some((*used, *limit));
+                }
                 SessionEvent::HistoryComplete => {
                     // Should never appear in the buffer — the caller
                     // intercepts it before buffering.
@@ -563,7 +581,14 @@ impl AppState {
         // Trailing streaming text (shouldn't normally happen, but be safe).
         flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
 
-        (messages, session_name, running, turn, next_id)
+        BuildResult {
+            messages,
+            session_name,
+            running,
+            turn_state: turn,
+            next_id,
+            context_usage,
+        }
     }
 
     // ── Live event dispatch ───────────────────────────────────────
@@ -696,6 +721,9 @@ impl AppState {
             }
             SessionEvent::SessionState { .. } => {
                 // running is derived from message content.
+            }
+            SessionEvent::ContextUsage { used, limit } => {
+                self.context_usage.set(Some((used, limit)));
             }
             SessionEvent::HistoryComplete => {
                 // Handled in handle_event() — a no-op here.

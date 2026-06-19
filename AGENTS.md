@@ -86,8 +86,10 @@ The web UI shows a session sidebar for switching between sessions.
   configuration of which tool groups are active.
 - **`SessionEvent`** (`src/events.rs`) — enum of all events the session
   emits: `UserPrompt`, `Thinking`, `AssistantText`, `ToolCall`,
-  `ToolResult`, `FinalResponse`, `Error`, `Cancelled`.  Serialized as
-  tagged JSON over the WebSocket.
+  `ToolResult`, `FinalResponse`, `ContextUsage`, `Error`, `Cancelled`.
+  Serialized as tagged JSON over the WebSocket.  `ContextUsage`
+  (approximate `used`/`limit` token counts) is emitted after each turn
+  so the web UI can show a context-window progress bar.
 - **Server** (`src/server.rs`) — axum HTTP + WebSocket server bound to
   `127.0.0.1:8187`. Serves the Leptos frontend from disk (trunk dist)
   with an embedded `assets/fb.html` as fallback, a REST API for session

@@ -166,8 +166,29 @@ pub fn InputBar() -> impl IntoView {
 
     // ── render ──────────────────────────────────────────────────────
 
+    // Context-usage progress bar: green → yellow → red as the conversation
+    // approaches the context window limit.
+    let usage = state.context_usage;
+    let pct = Signal::derive(move || {
+        usage.get().map_or(0.0, |(used, limit)| {
+            if limit == 0 {
+                0.0
+            } else {
+                (used as f64 / limit as f64).min(1.0)
+            }
+        })
+    });
+    let bar_visible = Signal::derive(move || usage.get().is_some());
+
     view! {
         <footer>
+            <div class="context-bar" class:visible=bar_visible>
+                <div
+                    class="context-bar-fill"
+                    style:width=move || format!("{:.0}%", pct.get() * 100.0)
+                    style:background-color=move || context_color(pct.get())
+                ></div>
+            </div>
             <textarea
                 id="input"
                 node_ref=input_ref
@@ -290,4 +311,32 @@ fn send_or_cancel(state: &AppState, input_ref: &NodeRef<leptos::html::Textarea>)
         style.set_property("height", "auto").ok();
         let _ = el.focus();
     }
+}
+
+/// Interpolate a colour for the context-usage bar.
+///
+/// `pct` ranges from 0.0 to 1.0:
+/// - 0.0 → green (`#6be07c`)
+/// - 0.5 → yellow (`#e2b96f`)
+/// - 1.0 → red   (`#f2625a`)
+///
+/// Linear interpolation in each half so the transition is smooth.
+fn context_color(pct: f64) -> String {
+    let (r, g, b) = if pct <= 0.5 {
+        let t = pct / 0.5;
+        lerp_rgb((0x6b, 0xe0, 0x7c), (0xe2, 0xb9, 0x6f), t)
+    } else {
+        let t = (pct - 0.5) / 0.5;
+        lerp_rgb((0xe2, 0xb9, 0x6f), (0xf2, 0x62, 0x5a), t)
+    };
+    format!("rgb({r}, {g}, {b})")
+}
+
+/// Linear interpolation between two RGB triples.
+fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
+    let f = |x: u8, y: u8| -> u8 {
+        let v = x as f64 + (y as f64 - x as f64) * t;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    (f(a.0, b.0), f(a.1, b.1), f(a.2, b.2))
 }

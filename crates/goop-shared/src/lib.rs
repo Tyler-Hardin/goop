@@ -45,6 +45,12 @@ pub enum SessionEvent {
     /// The assistant finished its complete response.
     FinalResponse,
 
+    /// Estimated context window usage, emitted after each turn completes so
+    /// the UI can show a progress bar.  `used` is an approximate token count
+    /// of the conversation memory; `limit` is the context window (or
+    /// compaction budget) it's measured against.
+    ContextUsage { used: usize, limit: usize },
+
     /// A recoverable or informational error.
     Error(String),
 

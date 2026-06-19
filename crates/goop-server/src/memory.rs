@@ -3,7 +3,8 @@ use std::{io::BufRead, path::PathBuf, sync::Arc};
 use chrono::Local;
 use rig::{completion::Message, memory::ConversationMemory, memory::MemoryError};
 use rig_memory::{
-    Compactor, HeuristicTokenCounter, MemoryPolicy, TemplateCompactor, TokenWindowMemory,
+    Compactor, HeuristicTokenCounter, MemoryPolicy, TemplateCompactor, TokenCounter,
+    TokenWindowMemory,
 };
 use tokio::sync::Mutex;
 
@@ -65,6 +66,21 @@ impl FileConversationMemory {
     #[allow(dead_code)]
     pub async fn snapshot(&self) -> Vec<Message> {
         self.messages.lock().await.clone()
+    }
+
+    /// Approximate the total token count of all messages currently in the
+    /// store, using the same [`HeuristicTokenCounter`] that drives the
+    /// compaction policy.  This is a rough estimate (±30 %) but is
+    /// monotonic and sufficient for a progress bar.
+    pub async fn estimated_tokens(&self) -> usize {
+        let messages = self.messages.lock().await;
+        messages.iter().map(|m| self.counter.count(m)).sum()
+    }
+
+    /// The compaction token budget, or `usize::MAX` when compaction is
+    /// disabled.
+    pub fn budget(&self) -> usize {
+        self.budget
     }
 }
 
@@ -234,7 +250,7 @@ fn resolve_compaction_budget(config: &Config) -> usize {
 ///
 /// Keyed by (provider, model_name).  Values sourced from provider docs.
 /// This table is consulted when `compaction = "N%"` is set in config.
-fn lookup_context_length(provider: crate::config::Provider, model_name: &str) -> Option<u32> {
+pub fn lookup_context_length(provider: crate::config::Provider, model_name: &str) -> Option<u32> {
     use crate::config::Provider;
 
     match provider {
