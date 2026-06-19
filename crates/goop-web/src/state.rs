@@ -1,4 +1,4 @@
-use goop_shared::{ClientMessage, SessionEvent};
+use goop_shared::{ClientMessage, SessionEvent, TurnEndReason};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -51,11 +51,9 @@ impl ConnectionState {
 ///   ┌────┐  UserPrompt  ┌──────────┐  AssistantText  ┌──────────┐
 ///   │Idle│─────────────▶│ Thinking │────────────────▶│  Active  │
 ///   └──▲──┘              └────┬─────┘                 └────┬─────┘
-///      │     FinalResponse    │                            │
-///      │     Error            │ ToolCall                   │ ToolCall
-///      │     Cancelled        │ FinalResponse              │ FinalResponse
-///      │                      │ Error                      │ Error
-///      │                      │ Cancelled                  │ Cancelled
+///      │     TurnEnded       │                            │
+///      │     (any reason)    │ ToolCall                   │ ToolCall
+///      │                      │ TurnEnded                  │ TurnEnded
 ///      │                      ▼                            ▼
 ///      │                  ┌──────┐                    ┌──────┐
 ///      │                  │ Idle │◀───────────────────│ Idle │
@@ -167,7 +165,7 @@ pub struct AppState {
     /// Active `WebSocket` handle for sending messages.
     pub ws: RwSignal<Option<web_sys::WebSocket>>,
     /// Streaming text buffer — accumulated on each `AssistantText` event,
-    /// flushed to a `UiMessage::AssistantFinal` on `FinalResponse`.
+    /// flushed to a `UiMessage::AssistantFinal` on `TurnEnded`.
     pub streaming_text: RwSignal<String>,
     /// Turn-level state machine.  When `Thinking`, a `UiMessage::Thinking`
     /// is present at the end of `messages` and the animated dot is shown.
@@ -509,7 +507,9 @@ impl AppState {
                     leave_thinking(&mut messages, &mut turn);
                     streaming.push_str(chunk);
                 }
-                SessionEvent::ToolCall { name, arguments } => {
+                SessionEvent::ToolCall {
+                    name, arguments, ..
+                } => {
                     leave_thinking(&mut messages, &mut turn);
                     flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
                     let args = flatten_args(arguments);
@@ -524,7 +524,7 @@ impl AppState {
                     });
                     next_id += 1;
                 }
-                SessionEvent::ToolResult { content } => {
+                SessionEvent::ToolResult { content, .. } => {
                     // ToolResult can arrive while still in Thinking state
                     // (server emits Thinking after ToolResult).  But in
                     // the history buffer ToolResult always follows
@@ -538,31 +538,28 @@ impl AppState {
                         r.set(Some(content.clone()));
                     }
                 }
-                SessionEvent::FinalResponse => {
+                SessionEvent::TurnEnded { reason } => {
                     running = false;
                     leave_thinking(&mut messages, &mut turn);
-                    flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
-                    messages.push(UiMessage::FinalResponse { id: next_id });
-                    next_id += 1;
-                    turn = TurnState::Idle;
-                }
-                SessionEvent::Error(msg) => {
-                    running = false;
-                    leave_thinking(&mut messages, &mut turn);
-                    flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
-                    messages.push(UiMessage::Error {
-                        id: next_id,
-                        msg: msg.clone(),
-                    });
-                    next_id += 1;
-                    turn = TurnState::Idle;
-                }
-                SessionEvent::Cancelled { .. } => {
-                    running = false;
-                    leave_thinking(&mut messages, &mut turn);
-                    streaming.clear();
-                    messages.push(UiMessage::Cancelled { id: next_id });
-                    next_id += 1;
+                    match reason {
+                        TurnEndReason::Completed | TurnEndReason::StreamEnded => {
+                            flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
+                            messages.push(UiMessage::FinalResponse { id: next_id });
+                            next_id += 1;
+                        }
+                        TurnEndReason::Cancelled { .. } => {
+                            streaming.clear();
+                            messages.push(UiMessage::Cancelled { id: next_id });
+                            next_id += 1;
+                        }
+                        reason @ (TurnEndReason::MaxTurnsExceeded { .. }
+                        | TurnEndReason::Error { .. }) => {
+                            flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
+                            let msg = reason.error_message().unwrap_or_default();
+                            messages.push(UiMessage::Error { id: next_id, msg });
+                            next_id += 1;
+                        }
+                    }
                     turn = TurnState::Idle;
                 }
                 SessionEvent::SessionState { .. } => {
@@ -571,6 +568,14 @@ impl AppState {
                 SessionEvent::ContextUsage { used, limit } => {
                     context_usage = Some((*used, *limit));
                 }
+                // ── compaction / overlay / metadata events ──
+                // Not yet emitted by the server (later phases).  No UI yet.
+                SessionEvent::Compacted { .. }
+                | SessionEvent::ToolSummarized { .. }
+                | SessionEvent::ContextSnapshot { .. }
+                | SessionEvent::ModelChanged { .. }
+                | SessionEvent::Edited { .. }
+                | SessionEvent::Deleted { .. } => {}
                 SessionEvent::HistoryComplete => {
                     // Should never appear in the buffer — the caller
                     // intercepts it before buffering.
@@ -646,7 +651,9 @@ impl AppState {
                 leave_thinking_signal(self);
                 self.streaming_text.update(|s| s.push_str(&chunk));
             }
-            SessionEvent::ToolCall { name, arguments } => {
+            SessionEvent::ToolCall {
+                name, arguments, ..
+            } => {
                 leave_thinking_signal(self);
                 self.flush_streaming();
                 let args = flatten_args(&arguments);
@@ -663,7 +670,7 @@ impl AppState {
                     });
                 });
             }
-            SessionEvent::ToolResult { content } => {
+            SessionEvent::ToolResult { content, .. } => {
                 // ToolResult doesn't change the turn state — the server
                 // follows it with a Thinking event that will push a new
                 // placeholder.
@@ -686,37 +693,37 @@ impl AppState {
                     }
                 });
             }
-            SessionEvent::FinalResponse => {
+            SessionEvent::TurnEnded { reason } => {
                 self.btn_state.update(|s| *s = BtnState::on_llm_done(*s));
                 leave_thinking_signal(self);
-                let raw = self.streaming_text.get_untracked();
-                self.streaming_text.set(String::new());
-                if !raw.is_empty() {
-                    let id = next_id();
-                    self.messages
-                        .update(|ms| ms.push(UiMessage::AssistantFinal { id, raw }));
+                match reason {
+                    TurnEndReason::Completed | TurnEndReason::StreamEnded => {
+                        let raw = self.streaming_text.get_untracked();
+                        self.streaming_text.set(String::new());
+                        if !raw.is_empty() {
+                            let id = next_id();
+                            self.messages
+                                .update(|ms| ms.push(UiMessage::AssistantFinal { id, raw }));
+                        }
+                        let id = next_id();
+                        self.messages
+                            .update(|ms| ms.push(UiMessage::FinalResponse { id }));
+                    }
+                    TurnEndReason::Cancelled { .. } => {
+                        self.streaming_text.set(String::new());
+                        let id = next_id();
+                        self.messages
+                            .update(|ms| ms.push(UiMessage::Cancelled { id }));
+                    }
+                    reason @ (TurnEndReason::MaxTurnsExceeded { .. }
+                    | TurnEndReason::Error { .. }) => {
+                        self.flush_streaming();
+                        let msg = reason.error_message().unwrap_or_default();
+                        let id = next_id();
+                        self.messages
+                            .update(|ms| ms.push(UiMessage::Error { id, msg }));
+                    }
                 }
-                let id = next_id();
-                self.messages
-                    .update(|ms| ms.push(UiMessage::FinalResponse { id }));
-                self.turn_state.set(TurnState::Idle);
-            }
-            SessionEvent::Error(msg) => {
-                self.btn_state.update(|s| *s = BtnState::on_llm_done(*s));
-                leave_thinking_signal(self);
-                self.flush_streaming();
-                let id = next_id();
-                self.messages
-                    .update(|ms| ms.push(UiMessage::Error { id, msg }));
-                self.turn_state.set(TurnState::Idle);
-            }
-            SessionEvent::Cancelled { .. } => {
-                self.btn_state.update(|s| *s = BtnState::on_llm_done(*s));
-                leave_thinking_signal(self);
-                self.streaming_text.set(String::new());
-                let id = next_id();
-                self.messages
-                    .update(|ms| ms.push(UiMessage::Cancelled { id }));
                 self.turn_state.set(TurnState::Idle);
             }
             SessionEvent::SessionState { .. } => {
@@ -725,6 +732,14 @@ impl AppState {
             SessionEvent::ContextUsage { used, limit } => {
                 self.context_usage.set(Some((used, limit)));
             }
+            // ── compaction / overlay / metadata events ──
+            // Not yet emitted by the server (later phases).  No UI yet.
+            SessionEvent::Compacted { .. }
+            | SessionEvent::ToolSummarized { .. }
+            | SessionEvent::ContextSnapshot { .. }
+            | SessionEvent::ModelChanged { .. }
+            | SessionEvent::Edited { .. }
+            | SessionEvent::Deleted { .. } => {}
             SessionEvent::HistoryComplete => {
                 // Handled in handle_event() — a no-op here.
             }

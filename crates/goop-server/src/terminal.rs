@@ -344,9 +344,10 @@ impl TerminalClient {
 // events from an mpsc receiver, drives a streamdown Parser +
 // Renderer, and prints every line through the external printer.
 //
-// When the LLM finishes a turn (FinalResponse / Error) it sends
-// `()` on `done_tx` so the main loop knows the output is fully
-// visible and it's safe to show the next readline prompt.
+// When the LLM finishes a turn (TurnEnded) it sends
+// `Option<String>` on `done_tx` so the main loop knows the output is fully
+// visible and it's safe to show the next readline prompt.  A `Some(prompt)`
+// (cancel-with-no-work) repopulates the readline input for editing.
 
 /// Owns all mutable rendering state so the event loop can call
 /// methods instead of macros.
@@ -429,7 +430,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
     done_tx: mpsc::UnboundedSender<Option<String>>,
     term_width: usize,
 ) {
-    use crate::events::PromptSource;
+    use crate::events::{PromptSource, TurnEndReason};
 
     let mut state = RenderState::new(printer, term_width);
 
@@ -491,6 +492,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             SessionEvent::ToolCall {
                 ref name,
                 ref arguments,
+                ..
             } => {
                 state.flush_markdown();
                 state.reset_renderer();
@@ -533,7 +535,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 }
             }
 
-            SessionEvent::ToolResult { ref content } => {
+            SessionEvent::ToolResult { ref content, .. } => {
                 if !content.is_empty() {
                     let displayed = ellipsize(content, MAX_RESULT_LEN);
                     state
@@ -545,45 +547,60 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
 
             SessionEvent::Thinking => { /* implicit */ }
 
-            SessionEvent::FinalResponse => {
-                state.flush_markdown();
-                state.reset_renderer();
-                state.parser = Parser::new();
-                state.line_buf.clear();
-                state.in_turn = false;
-                done_tx.send(None).ok();
-            }
-
-            SessionEvent::Cancelled { prompt } => {
-                // Flush any partial markdown, then signal done.
-                state.flush_markdown();
-                state.reset_renderer();
-                state.parser = Parser::new();
-                state.line_buf.clear();
-                if prompt.is_some() {
-                    state
-                        .lock_printer()
-                        .print(format!("{DIM}cancelled — ↑ to edit{RST}\n"))
-                        .ok();
-                } else {
-                    state
-                        .lock_printer()
-                        .print(format!("{DIM}cancelled.{RST}\n"))
-                        .ok();
+            SessionEvent::TurnEnded { reason } => {
+                match reason {
+                    TurnEndReason::Completed | TurnEndReason::StreamEnded => {
+                        state.flush_markdown();
+                        state.reset_renderer();
+                        state.parser = Parser::new();
+                        state.line_buf.clear();
+                        state.in_turn = false;
+                        done_tx.send(None).ok();
+                    }
+                    TurnEndReason::Cancelled { prompt } => {
+                        // Flush any partial markdown, then signal done.
+                        state.flush_markdown();
+                        state.reset_renderer();
+                        state.parser = Parser::new();
+                        state.line_buf.clear();
+                        if prompt.is_some() {
+                            state
+                                .lock_printer()
+                                .print(format!("{DIM}cancelled — ↑ to edit{RST}\n"))
+                                .ok();
+                        } else {
+                            state
+                                .lock_printer()
+                                .print(format!("{DIM}cancelled.{RST}\n"))
+                                .ok();
+                        }
+                        state.in_turn = false;
+                        done_tx.send(prompt).ok();
+                    }
+                    reason @ (TurnEndReason::MaxTurnsExceeded { .. }
+                    | TurnEndReason::Error { .. }) => {
+                        state.line_buf.clear();
+                        let msg = reason.error_message().unwrap_or_default();
+                        state
+                            .lock_printer()
+                            .print(format!("\x1b[1;31merror:\x1b[0m {msg}\n"))
+                            .ok();
+                        state.in_turn = false;
+                        done_tx.send(None).ok();
+                    }
                 }
-                state.in_turn = false;
-                done_tx.send(prompt).ok();
             }
 
-            SessionEvent::Error(e) => {
-                state.line_buf.clear();
-                state
-                    .lock_printer()
-                    .print(format!("\x1b[1;31merror:\x1b[0m {e}\n"))
-                    .ok();
-                state.in_turn = false;
-                done_tx.send(None).ok();
-            }
+            // ── compaction / overlay / metadata events ──
+            // Not yet emitted by the server (later phases).  The terminal
+            // is a linear REPL and renders them as nothing for now; later
+            // phases may show inline notices.
+            SessionEvent::Compacted { .. }
+            | SessionEvent::ToolSummarized { .. }
+            | SessionEvent::ContextSnapshot { .. }
+            | SessionEvent::ModelChanged { .. }
+            | SessionEvent::Edited { .. }
+            | SessionEvent::Deleted { .. } => {}
 
             SessionEvent::HistoryComplete => {
                 // Web-only sentinel marking end of history replay.

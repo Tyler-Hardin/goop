@@ -216,6 +216,19 @@ The web UI shows a session sidebar for switching between sessions.
   When not set, the budget is `usize::MAX` (nothing evicted).
   Env var: `GOOP_COMPACTION`.
 
+  **Redesign in progress** (see `docs/compaction-redesign.md`): the
+  conversation model is being replaced by an append-only transaction
+  log (`LogEntry { seq, parent, ts, event }` per JSONL line).  The
+  separate `<name>.messages.jsonl` is eliminated; agent memory becomes
+  log-replay.  `FinalResponse`/`Error`/`Cancelled` are replaced by
+  `TurnEnded { reason: TurnEndReason }`.  New variants: `Compacted`,
+  `ToolSummarized`, `ContextSnapshot`, `Edited`, `Deleted`,
+  `ModelChanged`.  `ToolCall`/`ToolResult` gain an `id` field.  Token
+  counting for the compaction threshold / context bar should use the
+  [`tokenizers`](https://crates.io/crates/tokenizers) crate (HuggingFace
+  BPE/WordPiece/SentencePiece), not `tiktoken-rs` — it's more flexible
+  across providers.
+
 ## Startup modes
 
 ```

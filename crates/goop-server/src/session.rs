@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use chrono::Local;
+use chrono::{Local, Utc};
 use futures::StreamExt;
 use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
@@ -13,7 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::config::{self, Config, McpServerDef};
-use crate::events::{PromptSource, SessionEvent};
+use crate::events::{LogEntry, PromptSource, SessionEvent, TurnEndReason};
 use crate::memory::{self, FileConversationMemory, build_session_memory, prompt_history_path};
 use crate::model;
 use crate::preamble::build_preamble;
@@ -25,7 +25,7 @@ use crate::transport::{PersistedTransport, Transport};
 /// Returned by [`Session::subscribe_all`]. Replays every prior event
 /// before yielding live events.
 pub struct SessionSubscriber {
-    history: Vec<SessionEvent>,
+    history: Vec<LogEntry>,
     history_cursor: usize,
     history_done: bool,
     rx: broadcast::Receiver<SessionEvent>,
@@ -39,7 +39,7 @@ impl SessionSubscriber {
     /// live events.
     pub async fn recv(&mut self) -> Result<SessionEvent, broadcast::error::RecvError> {
         if self.history_cursor < self.history.len() {
-            let event = self.history[self.history_cursor].clone();
+            let event = self.history[self.history_cursor].event.clone();
             self.history_cursor += 1;
             return Ok(event);
         }
@@ -69,7 +69,12 @@ pub struct Session {
     pub(crate) state: Arc<SessionState>,
     agent: Arc<crate::model::AnyAgent>,
     tx: broadcast::Sender<SessionEvent>,
-    history: Mutex<Vec<SessionEvent>>,
+    history: Mutex<Vec<LogEntry>>,
+
+    /// Monotonic sequence counter for [`LogEntry`]s, assigned at append
+    /// time in [`emit`](Self::emit).  Initialised from the loaded log so
+    /// new entries continue past the last persisted seq.
+    next_seq: AtomicU64,
 
     /// Clone of the file-backed memory, used to estimate token counts for
     /// the context-usage progress bar.  Shares the same
@@ -147,8 +152,10 @@ impl Session {
         let events_path = dir.join(format!("{name}.jsonl"));
         let messages_path = dir.join(format!("{name}.messages.jsonl"));
         let state_path = crate::session_state::state_path(&name);
-        // Load pre-existing events for history replay.
-        let existing_events = load_events_from_file(&events_path).unwrap_or_default();
+        // Load pre-existing log entries for history replay.  Returns the
+        // entries plus the next free seq number.
+        let (mut existing_entries, mut next_seq) =
+            load_log_from_file(&events_path).unwrap_or((Vec::new(), 0));
 
         // ── load persisted state (config overrides + CWD + transport) ──
         let persisted = PersistedSessionState::load(&name).unwrap_or_default();
@@ -265,14 +272,30 @@ impl Session {
 
         let session_info = SessionEvent::SessionInfo { name: name.clone() };
         // Ensure SessionInfo is first in history for replay to new clients.
-        let mut existing_events = existing_events;
-        if existing_events.is_empty()
+        // It's metadata (skipped during agent-memory replay), so its seq
+        // need only be unique — for a fresh session it's seq 0; for a
+        // resumed session lacking it (legacy), it gets the next free seq.
+        let need_inject = existing_entries.is_empty()
             || !matches!(
-                existing_events.first(),
-                Some(SessionEvent::SessionInfo { .. })
-            )
-        {
-            existing_events.insert(0, session_info.clone());
+                existing_entries.first().map(|e| &e.event),
+                Some(SessionEvent::SessionInfo { .. }),
+            );
+        if need_inject {
+            let seq = next_seq;
+            next_seq += 1;
+            let entry = LogEntry {
+                seq,
+                parent: None,
+                ts: Utc::now(),
+                event: session_info.clone(),
+            };
+            // Persist only for a brand-new session; for resumed legacy
+            // sessions the entry lives in memory only (it's re-injected
+            // each load until the file is rewritten).
+            if existing_entries.is_empty() {
+                append_logentry_to_file(&events_path, &entry).await;
+            }
+            existing_entries.insert(0, entry);
         }
         // Broadcast immediately so live subscribers see it.
         let _ = tx.send(session_info);
@@ -282,7 +305,8 @@ impl Session {
             state: state.clone(),
             agent,
             tx,
-            history: Mutex::new(existing_events),
+            history: Mutex::new(existing_entries),
+            next_seq: AtomicU64::new(next_seq),
             memory: memory_for_usage,
             context_limit,
             submit_tx,
@@ -307,7 +331,8 @@ impl Session {
     /// is queued and processed when earlier submissions finish.
     ///
     /// Returns a receiver that fires when this prompt completes
-    /// (i.e. FinalResponse or Error has been emitted).
+    /// (i.e. a [`TurnEnded`](SessionEvent::TurnEnded) event has been
+    /// emitted).
     pub fn submit(&self, prompt: impl Into<String>, source: PromptSource) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         // Unbounded send never fails.
@@ -327,17 +352,21 @@ impl Session {
     ///
     /// The WAV-encoded audio is transcribed using the server's local
     /// Whisper model.  On success the resulting text is submitted as a
-    /// normal prompt via [`submit`](Self::submit).  On failure an
-    /// [`Error`](SessionEvent::Error) is emitted.
+    /// normal prompt via [`submit`](Self::submit).  On failure a
+    /// [`TurnEnded`](SessionEvent::TurnEnded) event with an
+    /// [`Error`](TurnEndReason::Error) reason is emitted.
     ///
     /// Returns immediately if STT is not configured.
     pub async fn submit_audio(&self, wav_bytes: Vec<u8>, source: PromptSource) {
         let stt = match self.stt.as_ref() {
             Some(s) => s,
             None => {
-                self.emit(SessionEvent::Error(
-                    "STT is not enabled — set [stt] enabled = true in config.toml".into(),
-                ))
+                self.emit(SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Error {
+                        message: "STT is not enabled — set [stt] enabled = true in config.toml"
+                            .into(),
+                    },
+                })
                 .await;
                 return;
             }
@@ -350,7 +379,12 @@ impl Session {
             }
             Err(e) => {
                 tracing::warn!("STT failed: {e}");
-                self.emit(SessionEvent::Error(format!("STT: {e}"))).await;
+                self.emit(SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Error {
+                        message: format!("STT: {e}"),
+                    },
+                })
+                .await;
             }
         }
 
@@ -441,7 +475,7 @@ impl Session {
 
         // Track tool calls and results so we can preserve completed
         // work when the user cancels mid-stream.  rig only saves to
-        // memory on FinalResponse, so a cancelled prompt loses the
+        // memory on a clean completion, so a cancelled prompt loses the
         // user message and every completed tool turn.
         //
         // Each tool turn produces two messages:
@@ -472,8 +506,10 @@ impl Session {
                         if committed_messages.is_empty() {
                             // Nothing to save — return prompt for editing.
                             self.is_running.store(false, Ordering::SeqCst);
-                            self.emit(SessionEvent::Cancelled {
-                                prompt: Some(prompt.to_string()),
+                            self.emit(SessionEvent::TurnEnded {
+                                reason: TurnEndReason::Cancelled {
+                                    prompt: Some(prompt.to_string()),
+                                },
                             })
                             .await;
                             self.notify_push("Cancelled").await;
@@ -484,7 +520,10 @@ impl Session {
                             .await;
 
                         self.is_running.store(false, Ordering::SeqCst);
-                        self.emit(SessionEvent::Cancelled { prompt: None }).await;
+                        self.emit(SessionEvent::TurnEnded {
+                            reason: TurnEndReason::Cancelled { prompt: None },
+                        })
+                        .await;
                         self.emit_context_usage().await;
                         self.notify_push("Cancelled").await;
                         return;
@@ -511,10 +550,12 @@ impl Session {
                                         )
                                     }
                                 };
+                                let id = tool_call.id.clone();
                                 let name = tool_call.function.name.clone();
                                 // Track for cancellation recovery.
                                 pending_tool_calls.push(tool_call);
                                 self.emit(SessionEvent::ToolCall {
+                                    id,
                                     name,
                                     arguments: args,
                                 })
@@ -527,6 +568,7 @@ impl Session {
                                     ..
                                 },
                             ))) => {
+                                let id = tool_result.id.clone();
                                 let text: String = tool_result
                                     .content
                                     .iter()
@@ -543,7 +585,7 @@ impl Session {
                                 // and commit the pair as a completed turn.
                                 if let Some(pos) = pending_tool_calls
                                     .iter()
-                                    .position(|tc| tc.id == tool_result.id)
+                                    .position(|tc| tc.id == id)
                                 {
                                     let tc = pending_tool_calls.remove(pos);
 
@@ -565,15 +607,19 @@ impl Session {
                                     committed_messages.push(user_msg);
                                 }
 
-                                self.emit(SessionEvent::ToolResult { content: text }).await;
+                                self.emit(SessionEvent::ToolResult { id, content: text })
+                                    .await;
                                 self.emit(SessionEvent::Thinking).await;
                             }
 
                             Some(Ok(MultiTurnStreamItem::FinalResponse(_response))) => {
                                 self.clear_cancel().await;
-                                self.emit(SessionEvent::FinalResponse).await;
+                                self.emit(SessionEvent::TurnEnded {
+                                    reason: TurnEndReason::Completed,
+                                })
+                                .await;
                                 self.emit_context_usage().await;
-                                self.notify_push("FinalResponse").await;
+                                self.notify_push("Completed").await;
                                 return;
                             }
 
@@ -583,7 +629,7 @@ impl Session {
                                 // ── error recovery ─────────────────────────
                                 // Preserve completed tool turns just like
                                 // cancellation recovery. rig only writes to
-                                // memory on a clean FinalResponse, so without
+                                // memory on a clean completion, so without
                                 // this a stream error — most notably
                                 // `MaxTurnsError`, which fires only *after*
                                 // many tool turns have already completed —
@@ -596,37 +642,43 @@ impl Session {
                                 .await;
                                 self.clear_cancel().await;
 
-                                // Give the max-turns limit an actionable
-                                // message noting that work was saved; surface
-                                // other errors verbatim.
-                                let msg =
+                                // Give the max-turns limit a structured
+                                // reason (actionable message derived by the
+                                // views); surface other errors verbatim.
+                                let reason =
                                     if let rig::agent::StreamingError::Prompt(b) = &e
                                         && let rig::completion::PromptError::MaxTurnsError {
                                             max_turns,
                                             ..
                                         } = b.as_ref()
                                     {
-                                        format!(
-                                            "Reached the maximum number of \
-                                             tool-calling turns ({max_turns}). The \
-                                             work completed so far has been saved — \
-                                             send another message to continue."
-                                        )
+                                    TurnEndReason::MaxTurnsExceeded {
+                                        max_turns: *max_turns,
+                                    }
                                     } else {
-                                        e.to_string()
+                                        TurnEndReason::Error {
+                                            message: e.to_string(),
+                                        }
                                     };
-                                self.emit(SessionEvent::Error(msg)).await;
+                                let label = reason.push_label();
+                                self.emit(SessionEvent::TurnEnded { reason }).await;
                                 self.emit_context_usage().await;
-                                self.notify_push("Error").await;
+                                self.notify_push(label).await;
                                 return;
                             }
 
                             None => {
                                 // Stream ended without FinalResponse.
+                                // Previously misrecorded as a clean
+                                // FinalResponse — StreamEnded distinguishes
+                                // the two.
                                 self.clear_cancel().await;
-                                self.emit(SessionEvent::FinalResponse).await;
+                                self.emit(SessionEvent::TurnEnded {
+                                    reason: TurnEndReason::StreamEnded,
+                                })
+                                .await;
                                 self.emit_context_usage().await;
-                                self.notify_push("FinalResponse").await;
+                                self.notify_push("Completed").await;
                                 return;
                             }
                         }
@@ -687,8 +739,9 @@ impl Session {
 
     /// Estimate the current context window usage and emit a
     /// [`SessionEvent::ContextUsage`] so connected clients can update their
-    /// progress bar.  Called after each turn completes (FinalResponse,
-    /// Error, or Cancelled with committed tool turns).
+    /// progress bar.  Called after each turn completes (a
+    /// [`TurnEnded`](SessionEvent::TurnEnded) event other than a
+    /// cancel-with-no-work).
     ///
     /// No-op when `context_limit` is `None` (unknown model + no compaction).
     async fn emit_context_usage(&self) {
@@ -701,14 +754,31 @@ impl Session {
 
     /// Send an event to live subscribers, append to history, and
     /// persist to the events file (if one is configured).
+    ///
+    /// The event is wrapped in a [`LogEntry`] envelope (assigning the next
+    /// monotonic `seq`, a `parent` pointing at the previous entry, and a
+    /// UTC `ts`) before being persisted and stored.  Live subscribers
+    /// receive the bare event over the WebSocket — the envelope lives in
+    /// the on-disk log and the in-memory history (the sources for replay).
     async fn emit(&self, event: SessionEvent) {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let mut hist = self.history.lock().await;
+        let parent = hist.last().map(|e| e.seq);
+        let entry = LogEntry {
+            seq,
+            parent,
+            ts: Utc::now(),
+            event: event.clone(),
+        };
         // Persist to file before broadcasting so the file is always
-        // ahead of any subscriber that might race a crash.
+        // ahead of any subscriber that might race a crash.  Held under
+        // the history lock so parent pointers stay consistent; emits are
+        // nearly serial (single drain task) so this is uncontended.
         if let Some(ref path) = self.events_file {
-            append_event_to_file(path, &event).await;
+            append_logentry_to_file(path, &entry).await;
         }
-        let _ = self.tx.send(event.clone());
-        self.history.lock().await.push(event);
+        let _ = self.tx.send(event);
+        hist.push(entry);
     }
 }
 
@@ -1009,30 +1079,63 @@ pub(crate) fn next_session_name() -> String {
     format!("{today}_{:03}", max_seq + 1)
 }
 
-/// Load session events from a JSONL file.
-fn load_events_from_file(path: &std::path::Path) -> Result<Vec<SessionEvent>, anyhow::Error> {
+/// Load the transaction log from a JSONL file.
+///
+/// Each line is a [`LogEntry`] envelope.  Lines that fail to parse as a
+/// `LogEntry` are retried as a bare [`SessionEvent`] (the legacy
+/// pre-redesign format) and wrapped in a synthesised envelope — the `seq`
+/// is the next free number, `parent` the previous entry's seq, and `ts`
+/// the current time (legacy files carried no timestamps).
+///
+/// Returns the entries in file order plus the next free `seq` (for
+/// initialising the session's counter so new entries continue past the
+/// last persisted one).
+fn load_log_from_file(path: &std::path::Path) -> Result<(Vec<LogEntry>, u64), anyhow::Error> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let file = std::fs::File::open(path)?;
-    let mut events = Vec::new();
+    let mut entries = Vec::new();
+    let mut next_seq: u64 = 0;
+    let mut prev_seq: Option<u64> = None;
     for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let event: SessionEvent = serde_json::from_str(&line)?;
-        events.push(event);
+        let entry = match serde_json::from_str::<LogEntry>(&line) {
+            Ok(le) => {
+                // Preserve the persisted seq; advance the counter past it.
+                if le.seq >= next_seq {
+                    next_seq = le.seq + 1;
+                }
+                le
+            }
+            Err(_) => {
+                // Legacy bare-event line — synthesise an envelope.
+                let event: SessionEvent = serde_json::from_str(&line)?;
+                let seq = next_seq;
+                next_seq += 1;
+                LogEntry {
+                    seq,
+                    parent: prev_seq,
+                    ts: Utc::now(),
+                    event,
+                }
+            }
+        };
+        prev_seq = Some(entry.seq);
+        entries.push(entry);
     }
-    Ok(events)
+    Ok((entries, next_seq))
 }
 
-/// Append a single event as a JSON line to the events file.
-async fn append_event_to_file(path: &std::path::Path, event: &SessionEvent) {
-    let json = match serde_json::to_string(event) {
+/// Append a single [`LogEntry`] as a JSON line to the events file.
+async fn append_logentry_to_file(path: &std::path::Path, entry: &LogEntry) {
+    let json = match serde_json::to_string(entry) {
         Ok(j) => j,
         Err(e) => {
-            tracing::error!("failed to serialize event: {e}");
+            tracing::error!("failed to serialize log entry: {e}");
             return;
         }
     };
@@ -1050,7 +1153,7 @@ async fn append_event_to_file(path: &std::path::Path, event: &SessionEvent) {
         }
     };
     if let Err(e) = file.write_all(format!("{json}\n").as_bytes()).await {
-        tracing::error!("failed to write event to {path:?}: {e}");
+        tracing::error!("failed to write entry to {path:?}: {e}");
     }
 }
 
@@ -1081,5 +1184,122 @@ async fn append_prompt_to_history(prompt: &str) {
     };
     if let Err(e) = file.write_all(format!("{json}\n").as_bytes()).await {
         tracing::error!("failed to write to history file {path:?}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Legacy bare-event lines (the pre-redesign on-disk format) are
+    /// migrated into `LogEntry` envelopes with sequential seqs, parent
+    /// pointers chaining to the previous entry, and synthetic timestamps.
+    #[test]
+    fn load_log_migrates_legacy_bare_events() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let line1 = serde_json::to_string(&SessionEvent::SessionInfo { name: "s".into() }).unwrap();
+        let line2 = serde_json::to_string(&SessionEvent::UserPrompt {
+            content: "hi".into(),
+            source: PromptSource::Terminal,
+        })
+        .unwrap();
+        std::fs::write(tmp.path(), format!("{line1}\n{line2}\n")).unwrap();
+
+        let (entries, next_seq) = load_log_from_file(tmp.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[0].parent, None);
+        assert_eq!(entries[1].seq, 1);
+        assert_eq!(entries[1].parent, Some(0));
+        assert_eq!(next_seq, 2);
+    }
+
+    /// New-format `LogEntry` lines preserve their persisted seqs (even with
+    /// gaps) so seq references in later phases (Compacted.covers, etc.)
+    /// stay stable across reloads.
+    #[test]
+    fn load_log_preserves_envelope_seqs() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mk = |seq, parent, event| {
+            serde_json::to_string(&LogEntry {
+                seq,
+                parent,
+                ts: Utc::now(),
+                event,
+            })
+            .unwrap()
+        };
+        let l1 = mk(0, None, SessionEvent::SessionInfo { name: "s".into() });
+        let l2 = mk(
+            5,
+            Some(0),
+            SessionEvent::UserPrompt {
+                content: "hi".into(),
+                source: PromptSource::Web,
+            },
+        );
+        std::fs::write(tmp.path(), format!("{l1}\n{l2}\n")).unwrap();
+
+        let (entries, next_seq) = load_log_from_file(tmp.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[1].seq, 5);
+        assert_eq!(entries[1].parent, Some(0));
+        assert_eq!(next_seq, 6);
+    }
+
+    /// A mixed file (legacy bare prefix, then new-format envelope lines)
+    /// assigns sequential seqs to the legacy prefix and preserves the
+    /// envelope seqs that follow — the normal transition state.
+    #[tokio::test]
+    async fn load_log_handles_mixed_legacy_and_envelope() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let bare = serde_json::to_string(&SessionEvent::SessionInfo { name: "s".into() }).unwrap();
+        std::fs::write(tmp.path(), format!("{bare}\n")).unwrap();
+
+        // Append a new-format entry; its seq continues past the legacy
+        // prefix (which the loader will assign 0).
+        let entry = LogEntry {
+            seq: 1,
+            parent: Some(0),
+            ts: Utc::now(),
+            event: SessionEvent::UserPrompt {
+                content: "hi".into(),
+                source: PromptSource::Web,
+            },
+        };
+        append_logentry_to_file(tmp.path(), &entry).await;
+
+        let (entries, next_seq) = load_log_from_file(tmp.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 0); // legacy line, assigned
+        assert_eq!(entries[1].seq, 1); // envelope line, preserved
+        assert_eq!(next_seq, 2);
+    }
+
+    /// `LogEntry` round-trips through serde, including the nested tagged
+    /// `SessionEvent` payload.
+    #[test]
+    fn log_entry_serde_roundtrip() {
+        let entry = LogEntry {
+            seq: 42,
+            parent: Some(41),
+            ts: Utc::now(),
+            event: SessionEvent::TurnEnded {
+                reason: TurnEndReason::Cancelled {
+                    prompt: Some("hey".into()),
+                },
+            },
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: LogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.seq, 42);
+        assert_eq!(back.parent, Some(41));
+        match back.event {
+            SessionEvent::TurnEnded {
+                reason: TurnEndReason::Cancelled { prompt: Some(p) },
+            } => assert_eq!(p, "hey"),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
