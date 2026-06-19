@@ -201,33 +201,40 @@ The web UI shows a session sidebar for switching between sessions.
   snapshot).  `Transport::to_persisted()` converts a live transport into
   its persistable form.  File and shell tools route through the transport
   so they work transparently on local or remote hosts.
-- **FileConversationMemory** (`src/memory.rs`) — implements rig's
-  `ConversationMemory` trait backed by a JSONL file on disk. One
-  per session at `~/.config/goop/sessions/<name>.messages.jsonl`.
-- **Compaction** (`src/memory.rs`) — `SessionMemory` type alias wraps
-  `FileConversationMemory` in `rig_memory::CompactingMemory` with a
-  `TokenWindowMemory` policy and `TemplateCompactor`.  When the token
-  budget is exceeded, older messages are evicted from the active window
-  and replaced with a rolling text summary (no extra LLM call — the
-  `TemplateCompactor` produces a textual rollup).  The summary cap is
-  4 KiB.  Budget is configured via `compaction` in config.toml (an
-  integer for absolute tokens, or a string like `"80%"` for a percentage
-  of the model's context window, resolved from a built-in lookup table).
-  When not set, the budget is `usize::MAX` (nothing evicted).
-  Env var: `GOOP_COMPACTION`.
-
-  **Redesign in progress** (see `docs/compaction-redesign.md`): the
-  conversation model is being replaced by an append-only transaction
-  log (`LogEntry { seq, parent, ts, event }` per JSONL line).  The
-  separate `<name>.messages.jsonl` is eliminated; agent memory becomes
-  log-replay.  `FinalResponse`/`Error`/`Cancelled` are replaced by
-  `TurnEnded { reason: TurnEndReason }`.  New variants: `Compacted`,
-  `ToolSummarized`, `ContextSnapshot`, `Edited`, `Deleted`,
-  `ModelChanged`.  `ToolCall`/`ToolResult` gain an `id` field.  Token
-  counting for the compaction threshold / context bar should use the
-  [`tokenizers`](https://crates.io/crates/tokenizers) crate (HuggingFace
-  BPE/WordPiece/SentencePiece), not `tiktoken-rs` — it's more flexible
-  across providers.
+- **LogReplayMemory** (`src/memory.rs`) — implements rig's
+  `ConversationMemory` trait by **replaying the session's append-only
+  transaction log** into `Vec<Message>` (the agent view). The events log
+  (`~/.config/goop/sessions/<name>.jsonl`) is the single source of
+  truth — the old separate `<name>.messages.jsonl` is eliminated.
+  `load()` replays; `append()`/`clear()` are no-ops (the session writes
+  every event to the log during streaming). The log is shared
+  (`Arc<Mutex<Vec<LogEntry>>>`) between the session and the memory. See
+  `docs/compaction-redesign.md`.
+- **Log replay** (`replay_visible` in `src/memory.rs`) — turns are
+  buffered and committed only at a `TurnEnded` event;
+  `TurnEnded::Cancelled { prompt: Some(_) }` drops the turn (no work
+  committed), every other reason commits it. A trailing in-progress turn
+  is dropped (rig appends the current prompt itself, so replay omits it).
+  An orphan-tool-pair net drops any `ToolCall` whose `ToolResult` is
+  absent. Legacy pre-redesign events (removed
+  `FinalResponse`/`Error`/`Cancelled`; `ToolCall`/`ToolResult` with no
+  `id`) are migrated on load — turn-end variants map to `TurnEnded` and
+  tool calls/results get order-paired synthetic ids.
+- **Compaction** (`src/memory.rs` + `src/session.rs`) — when the
+  agent-visible conversation exceeds a token threshold, the whole prefix
+  is summarized into a rolling `Compacted { summary, model, covers,
+  manual }` event before the next turn. Replay applies it: the covered
+  items (by seq) are dropped and the summary inserted. Summaries are
+  themselves agent-visible, so later compactions summarize the prior
+  summary (a rolling summary). The threshold comes from `compaction` in
+  config.toml (`CompactionMode::Tokens(n)` or `Percent(pct)` of the
+  model's context window); `None` disables it — **opt-in (default off)**.
+  Env: `GOOP_COMPACTION`. Summarization is a one-shot, tool-less,
+  memory-less completion (`AnyAgent::summarize`) with an embedded system
+  prompt. A failed summarization is logged and skipped (full history kept).
+- **Context snapshots** (`src/session.rs`) — before each turn the session
+  emits `ContextSnapshot { seqs, model }`, recording which events formed
+  the LLM's context. Replay skips it (audit-only metadata).
 
 ## Startup modes
 
@@ -348,9 +355,10 @@ directly to pass the configurable `ollama_base_url` (from `Config` or
   extracts session names, and calls `get_or_create` for each **except**
   those listed in `~/.config/goop/closed_sessions.json`.  Existing sessions
   become immediately available.
-- **Persistence:** Each session stores three files:
-  - `<name>.jsonl` — event stream (JSONL)
-  - `<name>.messages.jsonl` — LLM conversation memory (JSONL)
+- **Persistence:** Each session stores two files:
+  - `<name>.jsonl` — append-only transaction log (`LogEntry` envelopes,
+    JSONL): both the UI history and the agent's memory (derived by
+    replay). Loaded into the session's `history` Vec on startup.
   - `<name>.state.toml` — config overrides + CWD + transport state (TOML)
 - **Closing (sidebar ×):** `DELETE /api/sessions/{name}` removes the session
   from the in-memory map and adds its name to `closed_sessions.json`.  Disk
@@ -516,19 +524,16 @@ Two independent history systems:
 - Always active.  If `--session <name>` is given the session is stored
   under that name; otherwise a name is auto-generated as `YYYYMMDD_NNN`
   (e.g. `20260128_001`), picking the next free sequence number for today.
-- Two files under `~/.config/goop/sessions/`:
-  - `<name>.jsonl` — `SessionEvent` stream (JSONL). Loaded into the
-    session's `history` Vec on startup so late-joining clients see past
-    events via `subscribe_all()`. Appended to on every `emit()`.
-  - `<name>.messages.jsonl` — LLM `Message` objects (JSONL). Managed by
-    `FileConversationMemory` which implements rig's `ConversationMemory`
-    trait. The agent's internal memory loads from this file before each
-    prompt and appends after each successful turn.  Cancelled prompts
-    and errored prompts (e.g. `MaxTurnsError`) also persist the user
-    message and any completed tool turns
-    (see Cancellation / error recovery above).
+- One file under `~/.config/goop/sessions/`:
+  - `<name>.jsonl` — the append-only transaction log (`LogEntry` envelopes,
+    JSONL). Loaded into the session's `history` Vec on startup so
+    late-joining clients see past events via `subscribe_all()`, and
+    **replayed by `LogReplayMemory`** to derive the agent's conversation
+    memory. Appended to on every `emit()`. (The old separate
+    `<name>.messages.jsonl` is gone — memory is log-replay.)
 - When a session file exists, the agent picks up the conversation where
-  it left off.
+  it left off (turn-end reasons control replay visibility; cancelled-
+  no-work turns are dropped, committed work is kept).
 
 ## Key design decisions
 
