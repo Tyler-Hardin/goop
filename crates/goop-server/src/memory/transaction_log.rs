@@ -47,11 +47,23 @@ pub(crate) struct TransactionLog {
 impl TransactionLog {
     /// Open the transaction log for a session.
     ///
-    /// Loads existing entries from disk (with legacy bare-event migration),
-    /// injects a `SessionInfo` root if the log is empty or lacks one, and
-    /// persists that root for brand-new sessions.  This is the sole
-    /// constructor — all initialization happens here (RAII).
-    pub(crate) async fn open(path: PathBuf, session_name: &str) -> anyhow::Result<Self> {
+    /// The log path is derived from the session name
+    /// (`~/.config/goop/sessions/<name>.jsonl`) — there is a 1:1 mapping, so
+    /// the caller provides only the name.  Loads existing entries from disk
+    /// (with legacy bare-event migration), injects a `SessionInfo` root if
+    /// the log is empty or lacks one, and persists that root for brand-new
+    /// sessions.  This is the sole constructor — all initialization happens
+    /// here (RAII).
+    pub(crate) async fn open(session_name: &str) -> anyhow::Result<Self> {
+        let path = crate::session::sessions_dir().join(format!("{session_name}.jsonl"));
+        std::fs::create_dir_all(path.parent().expect("sessions path has a parent"))?;
+        Self::open_at(path, session_name).await
+    }
+
+    /// Internal constructor that opens a log at an explicit path.  Used by
+    /// [`open`](Self::open) (which derives the path from the session name) and
+    /// by tests (which need temp-dir control).
+    async fn open_at(path: PathBuf, session_name: &str) -> anyhow::Result<Self> {
         let (entries, next_seq) = load_from_file(&path)?;
         let mut log = Self {
             entries,
@@ -333,7 +345,7 @@ mod tests {
     async fn open_new_session_injects_session_info() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.jsonl");
-        let log = TransactionLog::open(path.clone(), "my-session")
+        let log = TransactionLog::open_at(path.clone(), "my-session")
             .await
             .unwrap();
 
@@ -367,7 +379,7 @@ mod tests {
         .unwrap();
         std::fs::write(&path, format!("{line}\n")).unwrap();
 
-        let log = TransactionLog::open(path, "s").await.unwrap();
+        let log = TransactionLog::open_at(path, "s").await.unwrap();
         assert_eq!(log.entries().len(), 1); // no injection
     }
 
@@ -376,7 +388,7 @@ mod tests {
     async fn append_assigns_seq_and_parent() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.jsonl");
-        let mut log = TransactionLog::open(path, "s").await.unwrap();
+        let mut log = TransactionLog::open_at(path, "s").await.unwrap();
 
         let e0 = log.append(SessionEvent::Thinking);
         assert_eq!(e0.seq, 1); // seq 0 is SessionInfo

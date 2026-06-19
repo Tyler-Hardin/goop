@@ -150,9 +150,6 @@ impl Session {
     ) -> anyhow::Result<Arc<Self>> {
         // ── persistence paths ──────────────────────────────────
         let name = session_name.unwrap_or_else(next_session_name);
-        let dir = sessions_dir();
-        std::fs::create_dir_all(&dir)?;
-        let events_path = dir.join(format!("{name}.jsonl"));
         let state_path = crate::session_state::state_path(&name);
 
         // ── load persisted state (config overrides + CWD + transport) ──
@@ -245,7 +242,7 @@ impl Session {
 
         // ── open the transaction log (RAII: loads, migrates, injects
         //    SessionInfo, persists if new) ──────────────────────────
-        let log = TransactionLog::open(events_path, &name).await?;
+        let log = TransactionLog::open(&name).await?;
         // Broadcast SessionInfo immediately so live subscribers see it.
         // (The log already has it; this is the delivery mechanism.)
         let _ = tx.send(SessionEvent::SessionInfo { name: name.clone() });
