@@ -448,9 +448,8 @@ impl Session {
                             return;
                         }
 
-                        let mut saved = vec![completion::Message::user(prompt)];
-                        saved.append(&mut committed_messages);
-                        self.agent.append_to_memory(saved).await;
+                        self.preserve_committed_turns(prompt, &mut committed_messages)
+                            .await;
 
                         self.is_running.store(false, Ordering::SeqCst);
                         self.emit(SessionEvent::Cancelled { prompt: None }).await;
@@ -547,8 +546,42 @@ impl Session {
                             Some(Ok(_)) => {}
 
                             Some(Err(e)) => {
+                                // ── error recovery ─────────────────────────
+                                // Preserve completed tool turns just like
+                                // cancellation recovery. rig only writes to
+                                // memory on a clean FinalResponse, so without
+                                // this a stream error — most notably
+                                // `MaxTurnsError`, which fires only *after*
+                                // many tool turns have already completed —
+                                // would discard the user prompt and every
+                                // completed tool turn.
+                                self.preserve_committed_turns(
+                                    prompt,
+                                    &mut committed_messages,
+                                )
+                                .await;
                                 self.clear_cancel().await;
-                                self.emit(SessionEvent::Error(e.to_string())).await;
+
+                                // Give the max-turns limit an actionable
+                                // message noting that work was saved; surface
+                                // other errors verbatim.
+                                let msg =
+                                    if let rig::agent::StreamingError::Prompt(b) = &e
+                                        && let rig::completion::PromptError::MaxTurnsError {
+                                            max_turns,
+                                            ..
+                                        } = b.as_ref()
+                                    {
+                                        format!(
+                                            "Reached the maximum number of \
+                                             tool-calling turns ({max_turns}). The \
+                                             work completed so far has been saved — \
+                                             send another message to continue."
+                                        )
+                                    } else {
+                                        e.to_string()
+                                    };
+                                self.emit(SessionEvent::Error(msg)).await;
                                 self.notify_push("Error").await;
                                 return;
                             }
@@ -565,6 +598,37 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Persist the user prompt plus every completed tool turn to
+    /// conversation memory.
+    ///
+    /// rig only writes to [`ConversationMemory`] on a clean
+    /// [`FinalResponse`](MultiTurnStreamItem::FinalResponse), so any path
+    /// that exits [`run_one`](Self::run_one) early — cancellation *or* a
+    /// stream error — would otherwise discard the user prompt and all
+    /// completed tool turns.
+    ///
+    /// `committed` holds fully-finished `ToolCall` + `ToolResult` pairs;
+    /// an in-flight tool call (emitted but no result yet) is intentionally
+    /// not included, so what we save is always valid, complete conversation
+    /// history.
+    ///
+    /// Does nothing when `committed` is empty: saving a lone user text
+    /// message would leave memory ending on a user turn, so the next prompt
+    /// would produce two consecutive user text messages, which some provider
+    /// APIs reject.
+    async fn preserve_committed_turns(
+        &self,
+        prompt: &str,
+        committed: &mut Vec<completion::Message>,
+    ) {
+        if committed.is_empty() {
+            return;
+        }
+        let mut saved = vec![completion::Message::user(prompt)];
+        saved.append(committed);
+        self.agent.append_to_memory(saved).await;
     }
 
     /// Remove the cancel sender for the current turn (turn ending normally).

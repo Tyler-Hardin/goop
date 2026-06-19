@@ -497,8 +497,9 @@ Two independent history systems:
     `FileConversationMemory` which implements rig's `ConversationMemory`
     trait. The agent's internal memory loads from this file before each
     prompt and appends after each successful turn.  Cancelled prompts
-    also persist the user message and any completed tool turns
-    (see Cancellation recovery above).
+    and errored prompts (e.g. `MaxTurnsError`) also persist the user
+    message and any completed tool turns
+    (see Cancellation / error recovery above).
 - When a session file exists, the agent picks up the conversation where
   it left off.
 
@@ -529,6 +530,17 @@ Two independent history systems:
   Instead the `Cancelled` event carries the prompt text and the terminal
   repopulates the input line via `readline_with_initial` so the user can
   edit and resubmit immediately.
+- **Error recovery (shared with cancellation).** The same preservation
+  logic runs on the **stream-error** path (`Some(Err(e))`), not just
+  cancellation.  rig yields errors — most notably
+  `PromptError::MaxTurnsError` — only *after* many tool turns have
+  already completed, so without this an error would discard the user
+  prompt and every completed tool turn.  Both early-exit paths now call
+  the shared `preserve_committed_turns()` helper, which saves the user
+  prompt + all completed `ToolCall`/`ToolResult` pairs to memory (and is
+  a no-op when nothing completed).  The `MaxTurnsError` is surfaced with
+  an actionable message noting that work was saved; other errors are
+  shown verbatim.
 - **Prompt queue.** `Session::submit()` sends into an unbounded mpsc;
   a background `drain_queue()` task processes them serially.
 - **History replay.** `subscribe_all()` returns a `SessionSubscriber`
