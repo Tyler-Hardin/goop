@@ -1,5 +1,6 @@
 use goop_shared::{ClientMessage, SessionEvent};
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::components::input_button::BtnState;
 use crate::ws;
@@ -193,6 +194,12 @@ pub struct AppState {
     /// new session).  The `InputBar` component watches this and calls
     /// `.focus()` whenever it changes.
     pub(crate) input_focus_request: RwSignal<usize>,
+
+    /// Auto-reconnect backoff counter.  Incremented each time the
+    /// WebSocket closes unexpectedly; reset to 0 on manual reconnect
+    /// or successful open.  Used by [`schedule_reconnect`] for
+    /// exponential backoff (1s, 2s, 4s, …, 64s cap).
+    pub(crate) reconnect_attempt: RwSignal<u32>,
 }
 
 impl AppState {
@@ -216,6 +223,7 @@ impl AppState {
             history_buffer: RwSignal::new(Vec::new()),
             connection_gen: RwSignal::new(0),
             input_focus_request: RwSignal::new(0),
+            reconnect_attempt: RwSignal::new(0),
         }
     }
 
@@ -228,7 +236,49 @@ impl AppState {
             let _ = w.location().set_hash(&format!("#session={name}"));
         }
         self.input_focus_request.update(|n| *n += 1);
+        self.reconnect_attempt.set(0); // reset backoff on manual reconnect
         ws::connect(self, name);
+    }
+
+    /// Schedule an automatic reconnection attempt with exponential
+    /// backoff.  Called from the WebSocket `on_close` handler when the
+    /// connection drops unexpectedly (server restart, network loss).
+    ///
+    /// `conn_gen` is the generation at the time of the disconnect; if the
+    /// generation has changed by the time the timer fires (e.g. a manual
+    /// reconnect beat us to it), the attempt is silently skipped.
+    pub(crate) fn schedule_reconnect(&self, conn_gen: u64) {
+        let attempt = self.reconnect_attempt.get_untracked();
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, cap at 64s.
+        let delay_ms = (1u64 << attempt.min(6)) * 1000;
+
+        let state = self.clone();
+        if let Some(window) = web_sys::window() {
+            let cb = wasm_bindgen::prelude::Closure::once(move || {
+                if state.connection_gen.get_untracked() != conn_gen {
+                    // A manual reconnect (or a newer auto-reconnect) already
+                    // changed the generation — nothing to do.
+                    return;
+                }
+                let session = match state.current_session.get_untracked() {
+                    Some(s) => s,
+                    None => return,
+                };
+                log::info!("auto-reconnect attempt {attempt} to {session} (delay {delay_ms}ms)");
+                // Use ws::connect directly — connect_session resets
+                // reconnect_attempt, but we want the counter to keep
+                // growing across auto-reconnect attempts until one
+                // succeeds (at which point on_open resets it).
+                ws::connect(&state, session);
+                // If this connect fails, the new on_close will bump
+                // reconnect_attempt and call schedule_reconnect again.
+            });
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                delay_ms as i32,
+            );
+            cb.forget();
+        }
     }
 
     /// Send a text prompt to the server.

@@ -44,6 +44,9 @@ pub fn connect(state: &AppState, session_name: String) {
     let state_on_open = state.clone();
     let on_open = Closure::<dyn Fn()>::new(move || {
         log::info!("WS connected");
+        // Connection opened successfully — reset the auto-reconnect
+        // backoff so the next unexpected disconnect starts fresh.
+        state_on_open.reconnect_attempt.set(0);
         // Connection state stays at CatchingUp — HistoryComplete promotes
         // it to Connected in handle_event().  The dot turns green via
         // is_ws_open() which already covers CatchingUp.
@@ -93,6 +96,14 @@ pub fn connect(state: &AppState, session_name: String) {
                     state.ws.set(None);
                     state.history_buffer.set(Vec::new());
                     state.btn_state.set(BtnState::Disabled);
+
+                    // Auto-reconnect on unexpected disconnect (server
+                    // restart, network loss).  Bump the backoff
+                    // counter first, then schedule reconnection.
+                    // schedule_reconnect checks connection_gen before
+                    // attempting, so a manual reconnect will preempt.
+                    state.reconnect_attempt.update(|n| *n += 1);
+                    state.schedule_reconnect(conn_gen);
                 }
             });
             let _ = window.set_timeout_with_callback(cb.as_ref().unchecked_ref());
