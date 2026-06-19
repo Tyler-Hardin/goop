@@ -130,6 +130,13 @@ pub enum UiMessage {
     Cancelled {
         id: usize,
     },
+    /// A rolling LLM summary replaced some earlier messages.  Shown as a
+    /// one-line notice so compaction is visible in the web UI.
+    Compacted {
+        id: usize,
+        count: usize,
+        model: String,
+    },
 }
 
 impl UiMessage {
@@ -143,6 +150,7 @@ impl UiMessage {
             UiMessage::FinalResponse { id } => *id,
             UiMessage::Error { id, .. } => *id,
             UiMessage::Cancelled { id } => *id,
+            UiMessage::Compacted { id, .. } => *id,
         }
     }
 }
@@ -568,10 +576,18 @@ impl AppState {
                 SessionEvent::ContextUsage { used, limit } => {
                     context_usage = Some((*used, *limit));
                 }
-                // ── compaction / overlay / metadata events ──
-                // Not yet emitted by the server (later phases).  No UI yet.
-                SessionEvent::Compacted { .. }
-                | SessionEvent::ToolSummarized { .. }
+                // ── compaction ──
+                // A rolling LLM summary replaced some earlier messages.
+                SessionEvent::Compacted { covers, model, .. } => {
+                    messages.push(UiMessage::Compacted {
+                        id: next_id,
+                        count: covers.len(),
+                        model: model.clone(),
+                    });
+                    next_id += 1;
+                }
+                // ── overlay / metadata events (no UI yet) ──
+                SessionEvent::ToolSummarized { .. }
                 | SessionEvent::ContextSnapshot { .. }
                 | SessionEvent::ModelChanged { .. }
                 | SessionEvent::Edited { .. }
@@ -732,10 +748,20 @@ impl AppState {
             SessionEvent::ContextUsage { used, limit } => {
                 self.context_usage.set(Some((used, limit)));
             }
-            // ── compaction / overlay / metadata events ──
-            // Not yet emitted by the server (later phases).  No UI yet.
-            SessionEvent::Compacted { .. }
-            | SessionEvent::ToolSummarized { .. }
+            // ── compaction ──
+            // A rolling LLM summary replaced some earlier messages.
+            SessionEvent::Compacted { covers, model, .. } => {
+                let id = next_id();
+                self.messages.update(|ms| {
+                    ms.push(UiMessage::Compacted {
+                        id,
+                        count: covers.len(),
+                        model,
+                    })
+                });
+            }
+            // ── overlay / metadata events (no UI yet) ──
+            SessionEvent::ToolSummarized { .. }
             | SessionEvent::ContextSnapshot { .. }
             | SessionEvent::ModelChanged { .. }
             | SessionEvent::Edited { .. }

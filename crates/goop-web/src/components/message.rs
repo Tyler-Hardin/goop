@@ -72,6 +72,13 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             <div class="msg final">"cancelled"</div>
         }
         .into_any(),
+
+        UiMessage::Compacted { count, model, .. } => view! {
+            <div class="msg compacted">
+                {format!("✦ compacted {count} messages into a summary · {model}")}
+            </div>
+        }
+        .into_any(),
     }
 }
 

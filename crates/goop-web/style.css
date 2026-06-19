@@ -445,6 +445,17 @@ main {
   letter-spacing: 0.4px;
 }
 
+/* compaction notice — a rolling summary replaced earlier messages */
+.msg.compacted {
+  align-self: center;
+  color: var(--dim2);
+  font-size: 11px;
+  background: none;
+  padding: 2px 0;
+  font-style: italic;
+  letter-spacing: 0.2px;
+}
+
 /* ── rendered markdown ────────────────────────── */
 
 .msg.assistant.rendered {

@@ -591,12 +591,23 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 }
             }
 
-            // ── compaction / overlay / metadata events ──
-            // Not yet emitted by the server (later phases).  The terminal
-            // is a linear REPL and renders them as nothing for now; later
-            // phases may show inline notices.
-            SessionEvent::Compacted { .. }
-            | SessionEvent::ToolSummarized { .. }
+            // ── compaction ──────────────────────────────────────────
+            // A rolling LLM summary replaced some earlier messages.
+            // Shown as a one-line notice so compaction is observable in
+            // the terminal; the summary itself lives in the log.
+            SessionEvent::Compacted { covers, model, .. } => {
+                let n = covers.len();
+                state
+                    .lock_printer()
+                    .print(format!(
+                        "{DIM}  ✦ compacted {n} message{} into a summary · {model}{RST}\n",
+                        if n == 1 { "" } else { "s" }
+                    ))
+                    .ok();
+            }
+
+            // ── overlay / metadata events (not yet emitted / UI-irrelevant) ──
+            SessionEvent::ToolSummarized { .. }
             | SessionEvent::ContextSnapshot { .. }
             | SessionEvent::ModelChanged { .. }
             | SessionEvent::Edited { .. }
