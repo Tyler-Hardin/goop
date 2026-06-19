@@ -725,28 +725,25 @@ impl Session {
         self.emit(SessionEvent::ContextUsage { used, limit }).await;
     }
 
-    /// Send an event to live subscribers, append to history, and
-    /// persist to the on-disk log.
+    /// Send an event to live subscribers and append it to the transaction log
+    /// (which persists to disk atomically).
     ///
     /// `TransactionLog::append` assigns the next monotonic `seq`, computes
-    /// `parent` from the last entry, and stamps `ts` — all under the history
-    /// lock, so seq order, parent-pointer order, and file-append order can
-    /// never diverge.  `persist` writes the JSONL line (best-effort).  Live
+    /// `parent` from the last entry, stamps `ts`, pushes to memory, and writes
+    /// the JSONL line to disk — all under the history lock, so seq order,
+    /// parent-pointer order, and file-append order can never diverge.  Live
     /// subscribers receive the bare event over the WebSocket; the envelope
     /// lives in the on-disk log and the in-memory history (the sources for
     /// replay).
     ///
-    /// The file write and broadcast stay under the lock deliberately:
+    /// The append and broadcast stay under the lock deliberately:
     /// `subscribe_all` does `lock → snapshot entries → subscribe to tx`,
-    /// so keeping `append + persist + send` atomic with respect to that
-    /// ensures every subscriber sees each event exactly once (history XOR
-    /// live — never both, never neither).
+    /// so keeping `append + send` atomic with respect to that ensures every
+    /// subscriber sees each event exactly once (history XOR live — never
+    /// both, never neither).
     async fn emit(&self, event: SessionEvent) {
         let mut log = self.history.lock().await;
-        let entry = log.append(event.clone());
-        // Persist to file before broadcasting so the file is always
-        // ahead of any subscriber that might race a crash.
-        log.persist(&entry).await;
+        log.append(event.clone()).await;
         let _ = self.tx.send(event);
     }
 }

@@ -107,19 +107,20 @@ impl TransactionLog {
             },
         };
         if was_empty {
-            self.persist(&entry).await;
+            append_to_file_opt(&self.path, &entry).await;
         }
         self.entries.insert(0, entry);
     }
 
     /// Append an event as a new [`LogEntry`]: assign the next monotonic `seq`,
-    /// compute `parent` from the current last entry, stamp `ts: now`, and push.
-    /// Returns the entry so the caller can persist it (via [`persist`](Self::persist))
-    /// and broadcast it.
+    /// compute `parent` from the current last entry, stamp `ts: now`, push,
+    /// and persist to disk — all in one call.
     ///
-    /// This is the **sole** mutation path.  No external code can assign seqs,
-    /// push entries directly, or observe `next_seq`.
-    pub(crate) fn append(&mut self, event: SessionEvent) -> LogEntry {
+    /// This is the **sole mutation path**.  No external code can assign seqs,
+    /// push entries directly, or observe `next_seq`.  Persistence is not
+    /// separable: an entry is either in memory *and* on disk, or it doesn't
+    /// exist.
+    pub(crate) async fn append(&mut self, event: SessionEvent) {
         let seq = self.next_seq;
         self.next_seq += 1;
         let parent = self.entries.last().map(|e| e.seq);
@@ -127,20 +128,12 @@ impl TransactionLog {
             seq,
             parent,
             ts: Utc::now(),
-            event,
+            event: event.clone(),
         };
-        self.entries.push(entry.clone());
-        entry
-    }
-
-    /// Persist a single entry to the on-disk log file (best-effort — errors
-    /// are logged but not returned, matching the existing behaviour where a
-    /// disk failure doesn't crash the session).
-    pub(crate) async fn persist(&self, entry: &LogEntry) {
-        let Some(ref path) = self.path else {
-            return;
-        };
-        append_to_file(path, entry).await;
+        // Persist before pushing so the file is always ahead of any
+        // subscriber that might race a crash.
+        append_to_file_opt(&self.path, &entry).await;
+        self.entries.push(entry);
     }
 
     /// Read-only access to the full entry list.  Used by replay (agent-memory
@@ -315,7 +308,11 @@ fn migrate_legacy_bare_event(
 }
 
 /// Append a single [`LogEntry`] as a JSON line to the events file (best-effort).
-async fn append_to_file(path: &Path, entry: &LogEntry) {
+/// No-op when `path` is `None` (in-memory log).
+async fn append_to_file_opt(path: &Option<PathBuf>, entry: &LogEntry) {
+    let Some(path) = path else {
+        return;
+    };
     let json = match serde_json::to_string(entry) {
         Ok(j) => j,
         Err(e) => {
@@ -339,8 +336,7 @@ async fn append_to_file(path: &Path, entry: &LogEntry) {
     if let Err(e) = file.write_all(format!("{json}\n").as_bytes()).await {
         tracing::error!("failed to write entry to {path:?}: {e}");
     }
-    // Sync to ensure the data is on disk before we read it back (tests
-    // do this immediately after open()).
+    // Sync to ensure the data is on disk before we read it back.
     let _ = file.sync_all().await;
 }
 
@@ -399,15 +395,16 @@ mod tests {
         let path = tmp.path().join("test.jsonl");
         let mut log = TransactionLog::open_at(path, "s").await.unwrap();
 
-        let e0 = log.append(SessionEvent::Thinking);
-        assert_eq!(e0.seq, 1); // seq 0 is SessionInfo
-        assert_eq!(e0.parent, Some(0));
+        log.append(SessionEvent::Thinking).await;
+        log.append(SessionEvent::AssistantText("hi".into())).await;
 
-        let e1 = log.append(SessionEvent::AssistantText("hi".into()));
+        assert_eq!(log.entries().len(), 3); // SessionInfo + 2 appends
+        let e0 = &log.entries()[1]; // seq 0 is SessionInfo
+        assert_eq!(e0.seq, 1);
+        assert_eq!(e0.parent, Some(0));
+        let e1 = &log.entries()[2];
         assert_eq!(e1.seq, 2);
         assert_eq!(e1.parent, Some(1));
-
-        assert_eq!(log.entries().len(), 3);
     }
 
     /// Legacy bare-event lines are migrated into `LogEntry` envelopes with
@@ -487,7 +484,8 @@ mod tests {
                 source: PromptSource::Web,
             },
         };
-        append_to_file(tmp.path(), &entry).await;
+        let path = Some(tmp.path().to_path_buf());
+        append_to_file_opt(&path, &entry).await;
 
         let (entries, next_seq) = load_from_file(tmp.path()).unwrap();
         assert_eq!(entries.len(), 2);
