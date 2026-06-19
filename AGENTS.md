@@ -136,10 +136,22 @@ The web UI shows a session sidebar for switching between sessions.
   fragile: `build_messages` didn't set it, so after history replay or
   session switches it could point to a wrong or nonexistent message).
   Instead it scans the `messages` vec backwards for the most-recent
-  `ToolCall` whose `result` is `None`.  The server serialises tool
+  `ToolCall` whose `result` signal holds `None`.  The server serialises tool
   execution, so the first `None`-result `ToolCall` from the end is always
   the right target.  The scan is O(n) but stops at the first match,
   effectively O(1) in practice.
+
+  **ToolCall fields must be signals** (`state.rs`, `components/message.rs`)
+  — the `UiMessage::ToolCall` variant carries `result` and `expanded` as
+  `RwSignal`s, not plain values.  This is intentional, not over-engineering:
+  `<For>` in `message_log.rs` keys items by `id` and never re-runs the
+  child view for an unchanged key.  The `ToolResult` event arrives *after*
+  the `Message` component for that `ToolCall` has already been rendered, so
+  a by-value `result: Option<String>` would never update in the DOM (the
+  expanded bubble would always be empty).  Using a signal lets the view
+  update reactively regardless of `<For>` reconciliation.  Any new field on
+  `ToolCall` that is populated by a later event must follow the same
+  pattern.
 
   **TurnState FSM** (`state.rs`) — `TurnState { Idle, Thinking, Active }`.
   Replaces the former `thinking: bool` + `remove_last_thinking()` pattern.

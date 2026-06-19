@@ -51,7 +51,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                         </div>
                     </div>
                     <div class="tool-body">
-                        {result.as_ref().map(|s| truncate(s, 500)).unwrap_or_default()}
+                        {move || result.get().map(|s| truncate(&s, 500)).unwrap_or_default()}
                     </div>
                 </div>
             }

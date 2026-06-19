@@ -112,7 +112,14 @@ pub enum UiMessage {
         name: String,
         args: Vec<(String, String)>,
         /// Populated when the corresponding `ToolResult` arrives.
-        result: Option<String>,
+        ///
+        /// This is a signal (not a plain `Option<String>`) because the
+        /// `ToolResult` event arrives *after* the `Message` component has
+        /// already been rendered by `<For>`.  `<For>` keys items by `id`
+        /// and does not re-run the child view for an unchanged key, so a
+        /// by-value `result` field would never update in the DOM.  A signal
+        /// updates the view reactively regardless of `<For>` reconciliation.
+        result: RwSignal<Option<String>>,
         expanded: RwSignal<bool>,
     },
     FinalResponse {
@@ -492,11 +499,12 @@ impl AppState {
                     flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
                     let args = flatten_args(arguments);
                     let expanded = RwSignal::new(false);
+                    let result = RwSignal::new(None);
                     messages.push(UiMessage::ToolCall {
                         id: next_id,
                         name: name.clone(),
                         args,
-                        result: None,
+                        result,
                         expanded,
                     });
                     next_id += 1;
@@ -510,9 +518,9 @@ impl AppState {
                     // Attach result to the most-recent ToolCall without a
                     // result (same logic as the live dispatch path).
                     if let Some(UiMessage::ToolCall { result: r, .. }) = messages.last_mut()
-                        && r.is_none()
+                        && r.get_untracked().is_none()
                     {
-                        *r = Some(content.clone());
+                        r.set(Some(content.clone()));
                     }
                 }
                 SessionEvent::FinalResponse => {
@@ -618,13 +626,14 @@ impl AppState {
                 self.flush_streaming();
                 let args = flatten_args(&arguments);
                 let expanded = RwSignal::new(false);
+                let result = RwSignal::new(None);
                 let id = next_id();
                 self.messages.update(|ms| {
                     ms.push(UiMessage::ToolCall {
                         id,
                         name,
                         args,
-                        result: None,
+                        result,
                         expanded,
                     });
                 });
@@ -644,9 +653,9 @@ impl AppState {
                 self.messages.update(|ms| {
                     for msg in ms.iter_mut().rev() {
                         if let UiMessage::ToolCall { result: r, .. } = msg
-                            && r.is_none()
+                            && r.get_untracked().is_none()
                         {
-                            *r = Some(content);
+                            r.set(Some(content));
                             return;
                         }
                     }
