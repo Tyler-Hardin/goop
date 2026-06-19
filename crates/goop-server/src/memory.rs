@@ -1,14 +1,34 @@
-use std::{io::BufRead, path::PathBuf, sync::Arc};
+//! Conversation memory via append-only transaction-log replay.
+//!
+//! The session's on-disk event log (`<name>.jsonl`) is the single source
+//! of truth for the conversation.  [`LogReplayMemory`] implements
+//! [`ConversationMemory`] by replaying that log into
+//! `Vec<rig::completion::Message>` — the agent's view of the conversation.
+//!
+//! [`ConversationMemory::append`] is a **no-op**: the session already writes
+//! every event to the log during streaming (via [`Session::emit`](crate::Session::emit)),
+//! so the log is always complete.  A [`TurnEnded`](SessionEvent::TurnEnded)
+//! event's reason controls whether the preceding turn's content is
+//! agent-visible on replay (e.g. a cancel-with-no-work drops the turn).
+//!
+//! See `docs/compaction-redesign.md` §2.4–2.5 for the full design.
 
-use chrono::Local;
-use rig::{completion::Message, memory::ConversationMemory, memory::MemoryError};
-use rig_memory::{
-    Compactor, HeuristicTokenCounter, MemoryPolicy, TemplateCompactor, TokenCounter,
-    TokenWindowMemory,
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use rig::OneOrMany;
+use rig::completion::{AssistantContent, Message};
+use rig::memory::{ConversationMemory, MemoryError};
+use rig::message::{
+    Text as MessageText, ToolCall as RigToolCall, ToolFunction, ToolResult as RigToolResult,
+    ToolResultContent, UserContent,
 };
+use rig_memory::{HeuristicTokenCounter, TokenCounter};
 use tokio::sync::Mutex;
 
-use crate::config::{self, CompactionMode, Config};
+use crate::config;
+use crate::events::{LogEntry, SessionEvent, TurnEndReason};
 
 /// Path to the global prompt history file: `~/.config/goop/history.jsonl`
 ///
@@ -19,125 +39,42 @@ pub(crate) fn prompt_history_path() -> PathBuf {
     config::config_dir().join("history.jsonl")
 }
 
-/// A file-backed [`ConversationMemory`] with optional token-budget compaction.
+// ── the memory type ───────────────────────────────────────────────
+
+/// Conversation memory that derives the agent-visible message list by
+/// replaying the shared transaction log.
 ///
-/// Compaction runs on **write** (in [`append`]), not on read, so the file on
-/// disk is always `[summary, ...recent_window]`.  Restarting a session reads
-/// the file as-is — no re-compaction, no context shift.
-///
-/// Each line is a `Message` serialized with `serde_json`.
+/// Holds an `Arc<Mutex<Vec<LogEntry>>>` that is **the same allocation** the
+/// [`Session`](crate::Session) appends to on every `emit()`, so `load()`
+/// always sees the latest log.  A cheap heuristic token counter is kept for
+/// the context-usage progress bar.
 #[derive(Clone)]
-pub struct FileConversationMemory {
-    path: PathBuf,
-    /// In-memory cache kept in sync with the file.
-    messages: Arc<Mutex<Vec<Message>>>,
-    /// Token budget for compaction.  `usize::MAX` disables.
-    budget: usize,
-    /// Produces a rolling text summary from evicted messages.
-    compactor: TemplateCompactor,
-    /// Approximates token counts for the budget policy.
+pub struct LogReplayMemory {
+    history: Arc<Mutex<Vec<LogEntry>>>,
     counter: HeuristicTokenCounter,
 }
 
-impl FileConversationMemory {
-    /// Create a new file-backed memory.
-    ///
-    /// If `path` already exists, its messages are loaded into the cache
-    /// immediately.  Compaction parameters are resolved from `config`.
-    pub fn new(path: PathBuf, config: &Config) -> Result<Self, MemoryError> {
-        let messages = if path.exists() {
-            load_messages_from_file(&path)?
-        } else {
-            Vec::new()
-        };
-        let budget = resolve_compaction_budget(config);
-        Ok(Self {
-            path,
-            messages: Arc::new(Mutex::new(messages)),
-            budget,
-            compactor: TemplateCompactor::new()
-                // Cap the rolling summary at 4 KiB so it doesn't grow unboundedly.
-                .with_max_bytes(4 * 1024),
+impl LogReplayMemory {
+    /// Wrap a shared log.  The caller (the session) must hold (or share) the
+    /// same `Arc` so that emitted events are visible here.
+    pub fn new(history: Arc<Mutex<Vec<LogEntry>>>) -> Self {
+        Self {
+            history,
             counter: HeuristicTokenCounter::default(),
-        })
+        }
     }
 
-    /// Return a snapshot of all messages currently in the store.
-    #[allow(dead_code)]
-    pub async fn snapshot(&self) -> Vec<Message> {
-        self.messages.lock().await.clone()
-    }
-
-    /// Approximate the total token count of all messages currently in the
-    /// store, using the same [`HeuristicTokenCounter`] that drives the
-    /// compaction policy.  This is a rough estimate (±30 %) but is
-    /// monotonic and sufficient for a progress bar.
+    /// Approximate token count of the current agent-visible messages
+    /// (post-replay), using the same [`HeuristicTokenCounter`] the old
+    /// file-backed memory used for the progress bar.
     pub async fn estimated_tokens(&self) -> usize {
-        let messages = self.messages.lock().await;
+        let log = self.history.lock().await;
+        let messages = replay_log(&log);
         messages.iter().map(|m| self.counter.count(m)).sum()
     }
-
-    /// The compaction token budget, or `usize::MAX` when compaction is
-    /// disabled.
-    pub fn budget(&self) -> usize {
-        self.budget
-    }
 }
 
-// ── file I/O helpers ───────────────────────────────────────────────
-
-fn load_messages_from_file(path: &std::path::Path) -> Result<Vec<Message>, MemoryError> {
-    let file = std::fs::File::open(path).map_err(|e| MemoryError::Backend(Box::new(e)))?;
-    let mut messages = Vec::new();
-    for line in std::io::BufReader::new(file).lines() {
-        let line = line.map_err(|e| MemoryError::Backend(Box::new(e)))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let msg: Message =
-            serde_json::from_str(&line).map_err(|e| MemoryError::Backend(Box::new(e)))?;
-        messages.push(msg);
-    }
-    Ok(messages)
-}
-
-/// Write messages to file as JSONL.  Does **not** hold the mutex —
-/// callers clone the message vec first and drop their lock.
-async fn write_messages_to_file(
-    path: &std::path::Path,
-    messages: &[Message],
-) -> Result<(), MemoryError> {
-    let mut content = String::new();
-    for msg in messages {
-        let json = serde_json::to_string(msg).map_err(|e| MemoryError::Backend(Box::new(e)))?;
-        content.push_str(&json);
-        content.push('\n');
-    }
-    tokio::fs::write(path, content)
-        .await
-        .map_err(|e| MemoryError::Backend(Box::new(e)))?;
-    Ok(())
-}
-
-/// Copy `path` to `<stem>.<timestamp>.<ext>` before compaction overwrites it.
-///
-/// Produces files like `20260128_001.messages.20260128-143022.jsonl`.
-async fn rotate_messages_file(path: &std::path::Path) -> Result<(), std::io::Error> {
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    let archive = path.with_file_name(format!("{stem}.{timestamp}{ext}"));
-    tokio::fs::copy(path, &archive).await?;
-    tracing::debug!("archived pre-compaction messages to {}", archive.display());
-    Ok(())
-}
-
-// ── ConversationMemory impl ────────────────────────────────────────
-
-impl ConversationMemory for FileConversationMemory {
+impl ConversationMemory for LogReplayMemory {
     fn load<'a>(
         &'a self,
         _conversation_id: &'a str,
@@ -145,59 +82,21 @@ impl ConversationMemory for FileConversationMemory {
         Box<dyn std::future::Future<Output = Result<Vec<Message>, MemoryError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let guard = self.messages.lock().await;
-            Ok(guard.clone())
+            let log = self.history.lock().await;
+            Ok(replay_log(&log))
         })
     }
 
     fn append<'a>(
         &'a self,
         _conversation_id: &'a str,
-        messages: Vec<Message>,
+        _messages: Vec<Message>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MemoryError>> + Send + 'a>>
     {
-        Box::pin(async move {
-            let (snapshot, did_compact) = {
-                let mut guard = self.messages.lock().await;
-                guard.extend(messages);
-
-                let mut did_compact = false;
-
-                // ── compaction (on write, so the file is always compacted) ──
-                if self.budget != usize::MAX {
-                    let policy = TokenWindowMemory::new(self.budget, self.counter);
-                    if let Ok((kept, evicted)) = policy.apply_with_demoted(guard.clone()) {
-                        if !evicted.is_empty() {
-                            match self.compactor.compact("default", &evicted, None).await {
-                                Ok(artifact) => {
-                                    let summary_msg: Message = artifact.into();
-                                    let mut compacted = vec![summary_msg];
-                                    compacted.extend(kept);
-                                    *guard = compacted;
-                                    did_compact = true;
-                                }
-                                Err(e) => {
-                                    tracing::warn!("compaction failed, keeping full history: {e}");
-                                }
-                            }
-                        } else {
-                            *guard = kept;
-                        }
-                    }
-                }
-
-                (guard.clone(), did_compact)
-            }; // lock dropped — I/O outside the critical section.
-
-            // Archive the pre-compaction file before overwriting.
-            if did_compact {
-                let _ = rotate_messages_file(&self.path).await.inspect_err(|e| {
-                    tracing::warn!("failed to archive pre-compaction messages: {e}");
-                });
-            }
-
-            write_messages_to_file(&self.path, &snapshot).await
-        })
+        // No-op: the session already persists every event to the log via
+        // `emit()`.  rig calls this on a clean `FinalResponse`, but the
+        // messages are already in the log.
+        Box::pin(async { Ok(()) })
     }
 
     fn clear<'a>(
@@ -205,45 +104,282 @@ impl ConversationMemory for FileConversationMemory {
         _conversation_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MemoryError>> + Send + 'a>>
     {
-        Box::pin(async move {
-            {
-                let mut guard = self.messages.lock().await;
-                guard.clear();
-            }
-            write_messages_to_file(&self.path, &[]).await
-        })
+        // No-op: clearing the conversation log would destroy the append-only
+        // history.  (Not invoked on the agent streaming path.)
+        Box::pin(async { Ok(()) })
     }
 }
-
-// ── compaction budget resolution ───────────────────────────────────
 
 /// The concrete memory type used by sessions.
-pub(crate) type SessionMemory = FileConversationMemory;
+pub(crate) type SessionMemory = LogReplayMemory;
 
-/// Build the session memory.
-pub(crate) fn build_session_memory(
-    path: PathBuf,
-    config: &Config,
-) -> Result<SessionMemory, MemoryError> {
-    FileConversationMemory::new(path, config)
+/// Build the session memory sharing the given log.
+pub(crate) fn build_session_memory(history: Arc<Mutex<Vec<LogEntry>>>) -> SessionMemory {
+    LogReplayMemory::new(history)
 }
 
-/// Resolve the compaction token budget from config.
-fn resolve_compaction_budget(config: &Config) -> usize {
-    match &config.compaction {
-        Some(CompactionMode::Tokens(n)) => *n,
-        Some(CompactionMode::Percent(pct)) => {
-            let pct = (*pct).min(100);
-            if let Some(ctx_len) = lookup_context_length(config.provider(), config.model_name()) {
-                let budget = (ctx_len as usize) * (pct as usize) / 100;
-                if budget > 0 {
-                    return budget;
+// ── log replay → agent-visible messages ───────────────────────────
+
+/// One item in the agent-visible set, tagged with the `seq` of the event
+/// that produced it.  The seq is used by later phases for overlay
+/// (`Edited`/`Deleted`) and compaction (`Compacted.covers`) targeting.
+struct VisibleItem {
+    seq: u64,
+    msg: Message,
+}
+
+/// Replay the transaction log into the agent-visible message list.
+///
+/// **Turn buffering:** content events (`UserPrompt`, `AssistantText`,
+/// `ToolCall`, `ToolResult`) are buffered into the current turn and only
+/// committed to the visible set when a [`TurnEnded`](SessionEvent::TurnEnded)
+/// is seen.  This gives [`TurnEndReason`] its functional role:
+/// - [`Cancelled { prompt: Some(_) }`](TurnEndReason::Cancelled) drops the
+///   whole buffered turn (no work was committed).
+/// - every other reason commits the turn.
+///
+/// **Trailing turn is dropped.**  The loop does *not* flush a turn left
+/// open at the end of the log (an in-progress turn with no `TurnEnded`).
+/// That is exactly what [`ConversationMemory::load`] must return, because
+/// rig appends the current prompt itself — including the open turn would
+/// duplicate the prompt.
+///
+/// **Orphan safety net:** a `ToolCall` with no matching `ToolResult`
+/// (e.g. an in-flight tool call at the moment a turn was cancelled with
+/// work committed) is dropped by [`drop_orphaned_tool_pairs`], since some
+/// provider APIs reject an unpaired call or result.
+fn replay_log(log: &[LogEntry]) -> Vec<Message> {
+    let mut visible: Vec<VisibleItem> = Vec::new();
+    let mut replay = Replay::new();
+
+    for entry in log {
+        if let SessionEvent::TurnEnded { reason } = &entry.event {
+            // Finalise any pending assistant text/calls and tool results
+            // into the buffered turn before deciding its fate.
+            replay.flush_assistant();
+            replay.flush_results();
+            match reason {
+                TurnEndReason::Cancelled { prompt: Some(_) } => {
+                    // No work committed — discard the whole turn.  The
+                    // prompt is handed back to the terminal for editing.
+                    replay.out.clear();
+                }
+                // Completed / StreamEnded / Cancelled { None } /
+                // MaxTurnsExceeded / Error — the turn's committed work is
+                // agent-visible.
+                _ => visible.append(&mut replay.out),
+            }
+            continue;
+        }
+        replay.feed(entry);
+    }
+
+    // NOTE: deliberately do NOT commit a trailing un-terminated turn — see
+    // the doc comment above.
+
+    drop_orphaned_tool_pairs(&mut visible);
+
+    visible.into_iter().map(|item| item.msg).collect()
+}
+
+/// Streams log events into `out`, accumulating consecutive assistant
+/// content (text + tool calls) into a single assistant message and
+/// consecutive tool results into a single user message — mirroring rig's
+/// own message history so the replayed conversation is provider-valid.
+struct Replay {
+    /// Messages built for the current (open) turn.
+    out: Vec<VisibleItem>,
+    /// Accumulated assistant text chunks (consecutive → one message).
+    a_text: Vec<String>,
+    /// Accumulated assistant tool calls (consecutive → one message).
+    a_calls: Vec<RigToolCall>,
+    /// Seq of the first chunk contributing to the pending assistant message.
+    a_seq: Option<u64>,
+    /// Accumulated tool results (consecutive → one user message).
+    u_results: Vec<(u64, RigToolResult)>,
+}
+
+impl Replay {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            a_text: Vec::new(),
+            a_calls: Vec::new(),
+            a_seq: None,
+            u_results: Vec::new(),
+        }
+    }
+
+    /// Flush the pending assistant accumulator (text + calls) into a single
+    /// assistant message.  No-op when nothing is pending.
+    fn flush_assistant(&mut self) {
+        if self.a_text.is_empty() && self.a_calls.is_empty() {
+            self.a_seq = None;
+            return;
+        }
+        let mut items: Vec<AssistantContent> = self
+            .a_text
+            .drain(..)
+            .map(|t| AssistantContent::Text(MessageText::new(t)))
+            .collect();
+        items.extend(self.a_calls.drain(..).map(AssistantContent::ToolCall));
+        // Non-empty by the guard above.
+        let content = OneOrMany::many(items).expect("replay: non-empty assistant content");
+        self.out.push(VisibleItem {
+            seq: self.a_seq.unwrap_or(0),
+            msg: Message::Assistant { id: None, content },
+        });
+        self.a_seq = None;
+    }
+
+    /// Flush the pending tool-result accumulator into a single user message.
+    fn flush_results(&mut self) {
+        if self.u_results.is_empty() {
+            return;
+        }
+        let first_seq = self.u_results[0].0;
+        let items: Vec<UserContent> = self
+            .u_results
+            .drain(..)
+            .map(|(_, tr)| UserContent::ToolResult(tr))
+            .collect();
+        let content = OneOrMany::many(items).expect("replay: non-empty tool results");
+        self.out.push(VisibleItem {
+            seq: first_seq,
+            msg: Message::User { content },
+        });
+    }
+
+    /// Fold one log event into the current turn.
+    fn feed(&mut self, entry: &LogEntry) {
+        match &entry.event {
+            SessionEvent::UserPrompt { content, .. } => {
+                self.out.push(VisibleItem {
+                    seq: entry.seq,
+                    msg: Message::user(content.clone()),
+                });
+            }
+            SessionEvent::AssistantText(text) => {
+                // Assistant content cannot share a message with prior tool
+                // results — flush them first (a new assistant turn starts).
+                self.flush_results();
+                if self.a_seq.is_none() {
+                    self.a_seq = Some(entry.seq);
+                }
+                self.a_text.push(text.clone());
+            }
+            SessionEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                self.flush_results();
+                if self.a_seq.is_none() {
+                    self.a_seq = Some(entry.seq);
+                }
+                self.a_calls.push(RigToolCall::new(
+                    id.clone(),
+                    ToolFunction::new(name.clone(), arguments.clone()),
+                ));
+            }
+            SessionEvent::ToolResult { id, content } => {
+                // Tool results are user-side: the pending assistant message
+                // (the call(s)) must be flushed first.
+                self.flush_assistant();
+                let tr = RigToolResult {
+                    id: id.clone(),
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::Text(MessageText::new(
+                        content.clone(),
+                    ))),
+                };
+                self.u_results.push((entry.seq, tr));
+            }
+            // Metadata / control events do not contribute messages.
+            _ => {}
+        }
+    }
+}
+
+/// Defence in depth: drop a `ToolCall` whose `ToolResult` is absent (or
+/// vice-versa).  This catches an in-flight tool call from a cancelled-with-
+/// work turn, and would catch imperfect `Deleted` overlays in later phases.
+/// Operates at content granularity so a merged assistant message that has
+/// both text and an orphaned call keeps its text.
+fn drop_orphaned_tool_pairs(visible: &mut Vec<VisibleItem>) {
+    let mut call_ids: HashSet<String> = HashSet::new();
+    let mut result_ids: HashSet<String> = HashSet::new();
+    for item in visible.iter() {
+        match &item.msg {
+            Message::Assistant { content, .. } => {
+                for c in content.iter() {
+                    if let AssistantContent::ToolCall(tc) = c {
+                        call_ids.insert(tc.id.clone());
+                    }
                 }
             }
-            usize::MAX
+            Message::User { content } => {
+                for c in content.iter() {
+                    if let UserContent::ToolResult(tr) = c {
+                        result_ids.insert(tr.id.clone());
+                    }
+                }
+            }
+            _ => {}
         }
-        None => usize::MAX,
     }
+
+    let orphan_calls: HashSet<&str> = call_ids
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|id| !result_ids.contains(*id))
+        .collect();
+    let orphan_results: HashSet<&str> = result_ids
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|id| !call_ids.contains(*id))
+        .collect();
+    if orphan_calls.is_empty() && orphan_results.is_empty() {
+        return;
+    }
+
+    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len());
+    for item in visible.drain(..) {
+        match item.msg {
+            Message::Assistant { id, content } => {
+                let mut items: Vec<AssistantContent> = content.into_iter().collect();
+                items.retain(|c| match c {
+                    AssistantContent::ToolCall(tc) => !orphan_calls.contains(tc.id.as_str()),
+                    _ => true,
+                });
+                if let Ok(oom) = OneOrMany::many(items) {
+                    rebuilt.push(VisibleItem {
+                        seq: item.seq,
+                        msg: Message::Assistant { id, content: oom },
+                    });
+                }
+                // else: every content item was an orphaned tool call → drop.
+            }
+            Message::User { content } => {
+                let mut items: Vec<UserContent> = content.into_iter().collect();
+                items.retain(|c| match c {
+                    UserContent::ToolResult(tr) => !orphan_results.contains(tr.id.as_str()),
+                    _ => true,
+                });
+                if let Ok(oom) = OneOrMany::many(items) {
+                    rebuilt.push(VisibleItem {
+                        seq: item.seq,
+                        msg: Message::User { content: oom },
+                    });
+                }
+            }
+            other => rebuilt.push(VisibleItem {
+                seq: item.seq,
+                msg: other,
+            }),
+        }
+    }
+    *visible = rebuilt;
 }
 
 /// Known context window lengths (tokens) for popular models.
@@ -332,7 +468,7 @@ pub fn lookup_context_length(provider: crate::config::Provider, model_name: &str
             // Legacy / still-supported 200k models
             "claude-3-5-sonnet-latest" | "claude-3-5-sonnet-20241022" => Some(200_000),
             "claude-3-5-haiku-latest" | "claude-3-5-haiku-20241022" => Some(200_000),
-            "claude-3-opus-latest" | "claude-3-opus-20240229" => Some(200_000),
+            "claude-3-opus-latest" | "claude-3-opus-20240429" => Some(200_000),
             "claude-haiku-4-5" => Some(200_000),
 
             _ => None,
@@ -343,5 +479,216 @@ pub fn lookup_context_length(provider: crate::config::Provider, model_name: &str
             "glm-5.2" => Some(1_000_000),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(seq: u64, event: SessionEvent) -> LogEntry {
+        LogEntry {
+            seq,
+            parent: if seq == 0 { None } else { Some(seq - 1) },
+            ts: chrono::Utc::now(),
+            event,
+        }
+    }
+
+    /// Extract the assistant text of a `Message::Assistant`, concatenated.
+    fn assistant_text(m: &Message) -> Option<String> {
+        match m {
+            Message::Assistant { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        }
+    }
+
+    /// A normal completed turn (prompt → text) replays to one user + one
+    /// assistant message, and a trailing open turn is excluded.
+    #[test]
+    fn replay_completed_turn() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "hi".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(1, SessionEvent::Thinking),
+            entry(2, SessionEvent::AssistantText("Hello ".into())),
+            entry(3, SessionEvent::AssistantText("there".into())),
+            entry(
+                4,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ];
+        let msgs = replay_log(&log);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[0], Message::User { .. }));
+        assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("Hello there"));
+    }
+
+    /// A turn still in progress at the end of the log is NOT visible —
+    /// rig appends the prompt itself, so replay must omit it.
+    #[test]
+    fn replay_drops_trailing_open_turn() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "first".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // second turn — never terminated:
+            entry(
+                2,
+                SessionEvent::UserPrompt {
+                    content: "second".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(3, SessionEvent::AssistantText("partial".into())),
+        ];
+        let msgs = replay_log(&log);
+        // Only the first turn (1 user, 0 assistant since no text) survives.
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0], Message::User { .. }));
+    }
+
+    /// Cancel with no committed work drops the whole turn (incl. partial text).
+    #[test]
+    fn replay_cancel_no_work_drops_turn() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "do thing".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(1, SessionEvent::AssistantText("let me".into())),
+            entry(
+                2,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Cancelled {
+                        prompt: Some("do thing".into()),
+                    },
+                },
+            ),
+        ];
+        assert!(replay_log(&log).is_empty());
+    }
+
+    /// Cancel after work was committed keeps the committed work; the
+    /// in-flight tool call (no result) is dropped by the orphan net.
+    #[test]
+    fn replay_cancel_with_work_keeps_committed_drops_inflight() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "do".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "done".into(),
+                },
+            ),
+            // in-flight call, no result:
+            entry(
+                3,
+                SessionEvent::ToolCall {
+                    id: "b".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                4,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Cancelled { prompt: None },
+                },
+            ),
+        ];
+        let msgs = replay_log(&log);
+        // user prompt + (assistant call "a" + user result "a"); call "b" dropped.
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(msgs[0], Message::User { .. })); // prompt
+        assert!(matches!(msgs[1], Message::Assistant { .. })); // call a
+        assert!(matches!(msgs[2], Message::User { .. })); // result a
+    }
+
+    /// A multi-step tool turn replays into the canonical
+    /// user / assistant(call) / user(result) / assistant(text) shape.
+    #[test]
+    fn replay_tool_turn_pairs_calls_and_results() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "read it".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "x".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"f"}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolResult {
+                    id: "x".into(),
+                    content: "body".into(),
+                },
+            ),
+            entry(3, SessionEvent::AssistantText("done".into())),
+            entry(
+                4,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ];
+        let msgs = replay_log(&log);
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(msgs[0], Message::User { .. })); // prompt
+        assert!(matches!(msgs[1], Message::Assistant { .. })); // call x
+        assert!(matches!(msgs[2], Message::User { .. })); // result x
+        assert_eq!(assistant_text(&msgs[3]).as_deref(), Some("done"));
     }
 }

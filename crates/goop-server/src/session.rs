@@ -4,9 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::{Local, Utc};
 use futures::StreamExt;
-use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
-use rig::completion;
 use rig::message;
 use rig::streaming::StreamedAssistantContent;
 use tokio::io::AsyncWriteExt;
@@ -14,7 +12,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::config::{self, Config, McpServerDef};
 use crate::events::{LogEntry, PromptSource, SessionEvent, TurnEndReason};
-use crate::memory::{self, FileConversationMemory, build_session_memory, prompt_history_path};
+use crate::memory::{self, LogReplayMemory, build_session_memory, prompt_history_path};
 use crate::model;
 use crate::preamble::build_preamble;
 use crate::session_state::{PersistedSessionState, SessionState};
@@ -69,18 +67,18 @@ pub struct Session {
     pub(crate) state: Arc<SessionState>,
     agent: Arc<crate::model::AnyAgent>,
     tx: broadcast::Sender<SessionEvent>,
-    history: Mutex<Vec<LogEntry>>,
+    history: Arc<Mutex<Vec<LogEntry>>>,
 
     /// Monotonic sequence counter for [`LogEntry`]s, assigned at append
     /// time in [`emit`](Self::emit).  Initialised from the loaded log so
     /// new entries continue past the last persisted seq.
     next_seq: AtomicU64,
 
-    /// Clone of the file-backed memory, used to estimate token counts for
-    /// the context-usage progress bar.  Shares the same
-    /// `Arc<Mutex<Vec<Message>>>` as the agent's memory, so it always
+    /// Clone of the log-replay memory, used to estimate token counts for
+    /// the context-usage progress bar.  Shares the same transaction-log
+    /// `Arc<Mutex<Vec<LogEntry>>>` as the agent's memory, so it always
     /// reflects the latest conversation state.
-    memory: FileConversationMemory,
+    memory: LogReplayMemory,
 
     /// Context window limit (in tokens) for the progress bar.  Uses the
     /// compaction budget when compaction is enabled, otherwise the model's
@@ -126,10 +124,11 @@ impl Session {
     /// can buffer between the slowest and fastest subscriber.
     ///
     /// Session data is persisted to
-    /// `~/.config/goop/sessions/<name>.jsonl` (events),
-    /// `~/.config/goop/sessions/<name>.messages.jsonl` (agent memory),
-    /// and `~/.config/goop/sessions/<name>.state.toml` (config + CWD + transport).
-    /// Existing files are loaded so named sessions can be resumed.
+    /// `~/.config/goop/sessions/<name>.jsonl` (the append-only transaction
+    /// log — the single source of truth for both UI history and agent
+    /// memory) and `~/.config/goop/sessions/<name>.state.toml`
+    /// (config + CWD + transport).  Existing files are loaded so named
+    /// sessions can be resumed.
     ///
     /// If the session was previously SSH'd, the SSH connection is
     /// re-established synchronously (awaited) before the session is
@@ -150,7 +149,6 @@ impl Session {
         let dir = sessions_dir();
         std::fs::create_dir_all(&dir)?;
         let events_path = dir.join(format!("{name}.jsonl"));
-        let messages_path = dir.join(format!("{name}.messages.jsonl"));
         let state_path = crate::session_state::state_path(&name);
         // Load pre-existing log entries for history replay.  Returns the
         // entries plus the next free seq number.
@@ -162,9 +160,6 @@ impl Session {
 
         // Merge session config overrides into the global config.
         let merged_config = persisted.config.merge(config);
-
-        // ── memory (file-backed, with optional compaction) ────────
-        let mem = build_session_memory(messages_path, &merged_config)?;
 
         let initial_local_cwd = persisted.local_cwd.clone();
 
@@ -245,28 +240,6 @@ impl Session {
         mcp_tools.extend(shared_mcp_manager.build_tools());
         mcp_tools.extend(session_mcp_manager.build_tools());
 
-        // Clone the memory before it's moved into the agent.  The clone
-        // shares the same `Arc<Mutex<Vec<Message>>>`, so it always sees the
-        // latest conversation state — we use it to estimate token counts
-        // for the context-usage progress bar.
-        let memory_for_usage = mem.clone();
-
-        // Compute the context window limit for the progress bar.  Prefer the
-        // compaction budget (the practical limit at which old messages are
-        // evicted); fall back to the model's known context window; if
-        // neither is available, the bar is hidden.
-        let context_limit = {
-            let budget = mem.budget();
-            if budget != usize::MAX {
-                Some(budget)
-            } else {
-                memory::lookup_context_length(merged_config.provider(), merged_config.model_name())
-                    .map(|v| v as usize)
-            }
-        };
-
-        let agent = model::build_agent(&merged_config, &preamble, mem, state.clone(), mcp_tools)?;
-
         let (tx, _) = broadcast::channel(capacity);
         let (submit_tx, submit_rx) = mpsc::unbounded_channel();
 
@@ -300,12 +273,31 @@ impl Session {
         // Broadcast immediately so live subscribers see it.
         let _ = tx.send(session_info);
 
+        // ── shared transaction log: the source of truth for agent memory ──
+        // The same `Arc` is handed to the `LogReplayMemory` below, so every
+        // event emitted via `emit()` is visible to `ConversationMemory::load`.
+        let history = Arc::new(Mutex::new(existing_entries));
+
+        let mem = build_session_memory(history.clone());
+        // Clone for the context-usage progress bar (shares the log `Arc`).
+        let memory_for_usage = mem.clone();
+
+        // Context window limit for the progress bar — the model's known
+        // window.  Compaction will reintroduce a tighter budget in a later
+        // phase; until then the bar measures against the full window.
+        // `None` hides the bar when the window is unknown.
+        let context_limit =
+            memory::lookup_context_length(merged_config.provider(), merged_config.model_name())
+                .map(|v| v as usize);
+
+        let agent = model::build_agent(&merged_config, &preamble, mem, state.clone(), mcp_tools)?;
+
         let this = Arc::new(Self {
             name: name.clone(),
             state: state.clone(),
             agent,
             tx,
-            history: Mutex::new(existing_entries),
+            history,
             next_seq: AtomicU64::new(next_seq),
             memory: memory_for_usage,
             context_limit,
@@ -473,16 +465,17 @@ impl Session {
         self.is_running.store(true, Ordering::SeqCst);
         self.emit(SessionEvent::Thinking).await;
 
-        // Track tool calls and results so we can preserve completed
-        // work when the user cancels mid-stream.  rig only saves to
-        // memory on a clean completion, so a cancelled prompt loses the
-        // user message and every completed tool turn.
-        //
-        // Each tool turn produces two messages:
-        //   Assistant { content: [ToolCall] }
-        //   User      { content: [ToolResult] }
-        let mut pending_tool_calls: Vec<message::ToolCall> = Vec::new();
-        let mut committed_messages: Vec<completion::Message> = Vec::new();
+        // Whether any tool call has *completed* (ToolCall + matching
+        // ToolResult) this turn.  This drives the cancel-recovery
+        // decision: a cancel with committed work is recorded as
+        // `TurnEnded::Cancelled { prompt: None }` (the turn stays
+        // agent-visible on replay); a cancel with no work is recorded
+        // with `prompt: Some(_)` (the whole turn is dropped on replay,
+        // and the prompt is handed back to the terminal for editing).
+        // No explicit memory-preservation is needed — the events log is
+        // the source of truth and `TurnEnded`'s reason controls
+        // visibility during replay.
+        let mut committed_work = false;
 
         {
             let mut stream = self.agent.stream_prompt(prompt).await;
@@ -494,17 +487,14 @@ impl Session {
                     biased;
 
                     _ = &mut cancel_rx => {
-                        // ── cancellation recovery ──────────────────────────
-                        // If tool calls completed, save the user prompt +
-                        // every completed turn to memory so the LLM still
-                        // knows what was asked and what tools already ran.
-                        //
-                        // If nothing completed, don't save — two consecutive
-                        // User text messages would violate some provider APIs.
-                        // Instead, hand the prompt back so the terminal can
-                        // repopulate the input for editing.
-                        if committed_messages.is_empty() {
-                            // Nothing to save — return prompt for editing.
+                        // ── cancellation ──────────────────────────────────
+                        // The events for whatever streamed so far are already
+                        // in the log; the `TurnEnded` reason is all replay
+                        // needs to decide visibility.  An in-flight tool
+                        // call (emitted, no result) is dropped by the
+                        // replay's orphan safety net.
+                        if !committed_work {
+                            // Nothing completed — return the prompt for editing.
                             self.is_running.store(false, Ordering::SeqCst);
                             self.emit(SessionEvent::TurnEnded {
                                 reason: TurnEndReason::Cancelled {
@@ -515,9 +505,6 @@ impl Session {
                             self.notify_push("Cancelled").await;
                             return;
                         }
-
-                        self.preserve_committed_turns(prompt, &mut committed_messages)
-                            .await;
 
                         self.is_running.store(false, Ordering::SeqCst);
                         self.emit(SessionEvent::TurnEnded {
@@ -552,8 +539,6 @@ impl Session {
                                 };
                                 let id = tool_call.id.clone();
                                 let name = tool_call.function.name.clone();
-                                // Track for cancellation recovery.
-                                pending_tool_calls.push(tool_call);
                                 self.emit(SessionEvent::ToolCall {
                                     id,
                                     name,
@@ -581,31 +566,10 @@ impl Session {
                                     .collect::<Vec<_>>()
                                     .join("");
 
-                                // Match tool result with its pending tool call
-                                // and commit the pair as a completed turn.
-                                if let Some(pos) = pending_tool_calls
-                                    .iter()
-                                    .position(|tc| tc.id == id)
-                                {
-                                    let tc = pending_tool_calls.remove(pos);
-
-                                    // Assistant message with the tool call.
-                                    let assistant_msg = completion::Message::Assistant {
-                                        id: None,
-                                        content: OneOrMany::one(
-                                            completion::AssistantContent::ToolCall(tc),
-                                        ),
-                                    };
-                                    committed_messages.push(assistant_msg);
-
-                                    // User message with the tool result.
-                                    let user_msg = completion::Message::User {
-                                        content: OneOrMany::one(
-                                            message::UserContent::ToolResult(tool_result),
-                                        ),
-                                    };
-                                    committed_messages.push(user_msg);
-                                }
+                                // A result arrived for a tool call this turn —
+                                // the turn has committed work, so a later cancel
+                                // keeps it agent-visible on replay.
+                                committed_work = true;
 
                                 self.emit(SessionEvent::ToolResult { id, content: text })
                                     .await;
@@ -626,20 +590,11 @@ impl Session {
                             Some(Ok(_)) => {}
 
                             Some(Err(e)) => {
-                                // ── error recovery ─────────────────────────
-                                // Preserve completed tool turns just like
-                                // cancellation recovery. rig only writes to
-                                // memory on a clean completion, so without
-                                // this a stream error — most notably
-                                // `MaxTurnsError`, which fires only *after*
-                                // many tool turns have already completed —
-                                // would discard the user prompt and every
-                                // completed tool turn.
-                                self.preserve_committed_turns(
-                                    prompt,
-                                    &mut committed_messages,
-                                )
-                                .await;
+                                // ── error ──────────────────────────────────
+                                // The events for whatever streamed so far are
+                                // already in the log; committed work stays
+                                // agent-visible on replay via the `TurnEnded`
+                                // reason.  No explicit memory save is needed.
                                 self.clear_cancel().await;
 
                                 // Give the max-turns limit a structured
@@ -686,37 +641,6 @@ impl Session {
                 }
             }
         }
-    }
-
-    /// Persist the user prompt plus every completed tool turn to
-    /// conversation memory.
-    ///
-    /// rig only writes to [`ConversationMemory`] on a clean
-    /// [`FinalResponse`](MultiTurnStreamItem::FinalResponse), so any path
-    /// that exits [`run_one`](Self::run_one) early — cancellation *or* a
-    /// stream error — would otherwise discard the user prompt and all
-    /// completed tool turns.
-    ///
-    /// `committed` holds fully-finished `ToolCall` + `ToolResult` pairs;
-    /// an in-flight tool call (emitted but no result yet) is intentionally
-    /// not included, so what we save is always valid, complete conversation
-    /// history.
-    ///
-    /// Does nothing when `committed` is empty: saving a lone user text
-    /// message would leave memory ending on a user turn, so the next prompt
-    /// would produce two consecutive user text messages, which some provider
-    /// APIs reject.
-    async fn preserve_committed_turns(
-        &self,
-        prompt: &str,
-        committed: &mut Vec<completion::Message>,
-    ) {
-        if committed.is_empty() {
-            return;
-        }
-        let mut saved = vec![completion::Message::user(prompt)];
-        saved.append(committed);
-        self.agent.append_to_memory(saved).await;
     }
 
     /// Remove the cancel sender for the current turn (turn ending normally).
@@ -963,9 +887,8 @@ impl SessionManager {
             let fname = entry.file_name();
             let fname = fname.to_string_lossy();
             // Session event files look like "<name>.jsonl".
-            // Memory files look like "<name>.messages.jsonl".
-            // State files look like "<name>.state.json".
-            // Strip suffixes to get the raw session name.
+            // Legacy files ("<name>.messages.jsonl", "<name>.cwd") are
+            // ignored — the events log is the single source of truth now.
             if let Some(stripped) = fname.strip_suffix(".jsonl")
                 && !stripped.ends_with(".messages")
             {
@@ -1098,6 +1021,12 @@ fn load_log_from_file(path: &std::path::Path) -> Result<(Vec<LogEntry>, u64), an
     let mut entries = Vec::new();
     let mut next_seq: u64 = 0;
     let mut prev_seq: Option<u64> = None;
+    // Counters for synthesising tool-call IDs on legacy bare events:
+    // pre-redesign `ToolCall`/`ToolResult` had no `id`, so we pair them by
+    // document order (the i-th call matches the i-th result).
+    let mut legacy_call_n: u64 = 0;
+    let mut legacy_result_n: u64 = 0;
+
     for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
         let line = line?;
         if line.trim().is_empty() {
@@ -1111,23 +1040,124 @@ fn load_log_from_file(path: &std::path::Path) -> Result<(Vec<LogEntry>, u64), an
                 }
                 le
             }
-            Err(_) => {
-                // Legacy bare-event line — synthesise an envelope.
-                let event: SessionEvent = serde_json::from_str(&line)?;
-                let seq = next_seq;
-                next_seq += 1;
-                LogEntry {
-                    seq,
-                    parent: prev_seq,
-                    ts: Utc::now(),
-                    event,
+            Err(_) => match migrate_legacy_bare_event(
+                &line,
+                &mut next_seq,
+                prev_seq,
+                &mut legacy_call_n,
+                &mut legacy_result_n,
+            ) {
+                Some(e) => e,
+                None => {
+                    // Truly unparseable line — skip rather than abort the
+                    // whole session.  Better to lose one event than all.
+                    tracing::warn!("skipping unparseable log line in {path:?}");
+                    continue;
                 }
-            }
+            },
         };
         prev_seq = Some(entry.seq);
         entries.push(entry);
     }
     Ok((entries, next_seq))
+}
+
+/// Build a [`LogEntry`] envelope for a migrated legacy line.
+fn log_envelope(seq: u64, parent: Option<u64>, event: SessionEvent) -> LogEntry {
+    LogEntry {
+        seq,
+        parent,
+        ts: Utc::now(),
+        event,
+    }
+}
+
+/// Migrate a legacy bare-event line (the pre-redesign on-disk format) into a
+/// [`LogEntry`] envelope.
+///
+/// Handles three categories of legacy lines:
+/// 1. **Unchanged variants** (`UserPrompt`, `Thinking`, `AssistantText`,
+///    `ContextUsage`, …) — parsed directly as the current `SessionEvent`.
+/// 2. **Removed turn-end variants** — mapped to `TurnEnded`:
+///    `FinalResponse` → `Completed`, `Error(String)` → `Error`, and
+///    `Cancelled` (unit, or `{ prompt }`) → `Cancelled { prompt }`.
+///    Without this, legacy sessions would have no turn-end markers and
+///    replay would commit nothing.
+/// 3. **`ToolCall`/`ToolResult` without `id`** — synthesise `legacy_{n}`
+///    ids, paired by document order so each call matches its result.
+///
+/// Returns `None` for lines that can't be interpreted at all (the caller
+/// skips them).
+fn migrate_legacy_bare_event(
+    line: &str,
+    next_seq: &mut u64,
+    parent: Option<u64>,
+    call_n: &mut u64,
+    result_n: &mut u64,
+) -> Option<LogEntry> {
+    // 1. Current SessionEvent format (unchanged bare variants).
+    if let Ok(event) = serde_json::from_str::<SessionEvent>(line) {
+        let seq = *next_seq;
+        *next_seq += 1;
+        return Some(log_envelope(seq, parent, event));
+    }
+
+    // 2. Inspect as generic JSON for removed/changed variants.
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ty = v.get("type").and_then(|t| t.as_str())?;
+    let data = v.get("data");
+    let event = match ty {
+        "FinalResponse" => SessionEvent::TurnEnded {
+            reason: TurnEndReason::Completed,
+        },
+        "Error" => SessionEvent::TurnEnded {
+            reason: TurnEndReason::Error {
+                message: data
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("(unknown error)")
+                    .to_string(),
+            },
+        },
+        "Cancelled" => SessionEvent::TurnEnded {
+            reason: TurnEndReason::Cancelled {
+                // Legacy unit `Cancelled` (no data) → `None` (committed).
+                prompt: data
+                    .and_then(|d| d.get("prompt"))
+                    .and_then(|p| p.as_str())
+                    .map(String::from),
+            },
+        },
+        "ToolCall" => {
+            let d = data?;
+            let id = format!("legacy_{call_n}");
+            *call_n += 1;
+            let name = d.get("name").and_then(|n| n.as_str())?.to_string();
+            let arguments = d
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            SessionEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            }
+        }
+        "ToolResult" => {
+            let d = data?;
+            let id = format!("legacy_{result_n}");
+            *result_n += 1;
+            let content = d
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            SessionEvent::ToolResult { id, content }
+        }
+        _ => return None,
+    };
+    let seq = *next_seq;
+    *next_seq += 1;
+    Some(log_envelope(seq, parent, event))
 }
 
 /// Append a single [`LogEntry`] as a JSON line to the events file.
@@ -1275,6 +1305,58 @@ mod tests {
         assert_eq!(entries[0].seq, 0); // legacy line, assigned
         assert_eq!(entries[1].seq, 1); // envelope line, preserved
         assert_eq!(next_seq, 2);
+    }
+
+    /// Pre-redesign sessions use removed variants (`FinalResponse`,
+    /// `Error`, `Cancelled`) and `ToolCall`/`ToolResult` without `id`.
+    /// These are migrated to the current model: turn-end variants become
+    /// `TurnEnded`, and tool calls/results get order-paired synthetic ids.
+    #[tokio::test]
+    async fn load_log_migrates_removed_variants_and_unids_tool_calls() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let lines = [
+            // bare UserPrompt (unchanged variant — parses directly)
+            serde_json::to_string(&SessionEvent::UserPrompt {
+                content: "run ls".into(),
+                source: PromptSource::Web,
+            })
+            .unwrap(),
+            // legacy ToolCall with no id
+            r#"{"type":"ToolCall","data":{"name":"shell","arguments":{"command":"ls"}}}"#
+                .to_string(),
+            // legacy ToolResult with no id (pairs with the call above)
+            r#"{"type":"ToolResult","data":{"content":"a.txt"}}"#.to_string(),
+            // legacy turn-end (unit FinalResponse)
+            r#"{"type":"FinalResponse"}"#.to_string(),
+        ];
+        std::fs::write(tmp.path(), format!("{}\n", lines.join("\n"))).unwrap();
+
+        let (entries, next_seq) = load_log_from_file(tmp.path()).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(entries[0].event, SessionEvent::UserPrompt { .. }));
+        // ToolCall got a synthetic id; ToolResult got the matching one.
+        let call_id = match &entries[1].event {
+            SessionEvent::ToolCall { id, name, .. } => {
+                assert_eq!(name, "shell");
+                id.clone()
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        };
+        match &entries[2].event {
+            SessionEvent::ToolResult { id, content } => {
+                assert_eq!(id, &call_id); // paired by order
+                assert_eq!(content, "a.txt");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        // FinalResponse → TurnEnded { Completed }
+        match &entries[3].event {
+            SessionEvent::TurnEnded {
+                reason: TurnEndReason::Completed,
+            } => {}
+            other => panic!("expected TurnEnded::Completed, got {other:?}"),
+        }
+        assert_eq!(next_seq, 4);
     }
 
     /// `LogEntry` round-trips through serde, including the nested tagged
