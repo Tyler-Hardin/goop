@@ -120,11 +120,12 @@ define_tool!(pub(crate) struct Screenshot, args = ScreenshotArgs,
 // CursorPosition
 // ═══════════════════════════════════════════════════════════════════
 
-define_tool!(pub(crate) struct CursorPosition,
+define_tool!(pub(crate) struct CursorPosition, args = CursorPositionArgs,
     tool_name: "cursor_position",
     desc: "Get current mouse cursor position. Returns 'x y' coordinates (origin top-left).",
     params: serde_json::json!({ "type": "object", "properties": {} }),
-    |this| {
+    args {},
+    |this, _args| {
         tool_blocking("xdotool", || {
             let out = run_tool_cmd("xdotool", &["getmouselocation", "--shell"])?;
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -257,11 +258,12 @@ define_tool!(pub(crate) struct KeyPress, args = KeyPressArgs,
 // WindowList
 // ═══════════════════════════════════════════════════════════════════
 
-define_tool!(pub(crate) struct WindowList,
+define_tool!(pub(crate) struct WindowList, args = WindowListArgs,
     tool_name: "window_list",
     desc: "List all open windows with their IDs, WM_CLASS (stable identifier like 'Navigator.firefox'), and titles. Use with window_focus to switch to a specific window.",
     params: serde_json::json!({ "type": "object", "properties": {} }),
-    |this| {
+    args {},
+    |this, _args| {
         tool_blocking("wmctrl", || {
             let out = run_tool_cmd("wmctrl", &["-lx"])?;
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -312,11 +314,12 @@ define_tool!(pub(crate) struct WindowFocus, args = WindowFocusArgs,
 // WindowGetActive
 // ═══════════════════════════════════════════════════════════════════
 
-define_tool!(pub(crate) struct WindowGetActive,
+define_tool!(pub(crate) struct WindowGetActive, args = WindowGetActiveArgs,
     tool_name: "window_get_active",
     desc: "Get the currently active (focused) window: its ID, title, and geometry (position and size).",
     params: serde_json::json!({ "type": "object", "properties": {} }),
-    |this| {
+    args {},
+    |this, _args| {
         tool_blocking("xdotool", || {
             let id_out = run_tool_cmd("xdotool", &["getactivewindow"])?;
             let id = String::from_utf8_lossy(&id_out.stdout).trim().to_string();

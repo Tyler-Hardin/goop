@@ -23,9 +23,10 @@ define_tool!(pub(crate) struct Ssh, args = SshArgs,
     |this, args| this.state.ssh_connect(args.destination, args.password).await.map_err(tool_err)
 );
 
-define_tool!(pub(crate) struct Disconnect,
+define_tool!(pub(crate) struct Disconnect, args = DisconnectArgs,
     tool_name: "disconnect",
     desc: "Close the SSH connection and return to local operation. File operations and shell commands will run on the local machine again.",
     params: serde_json::json!({ "type": "object", "properties": {} }),
-    |this| this.state.ssh_disconnect().await.map_err(tool_err)
+    args {},
+    |this, _args| this.state.ssh_disconnect().await.map_err(tool_err)
 );

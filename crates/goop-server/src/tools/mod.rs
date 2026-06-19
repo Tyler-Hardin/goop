@@ -30,7 +30,6 @@ pub(crate) fn tool_err(e: impl std::fmt::Display) -> ToolError {
 
 /// Define a tool struct with args struct, [`Tool`] impl, and constructor.
 ///
-/// **With args:**
 /// ```ignore
 /// define_tool!(pub(crate) struct Read, args = ReadArgs,
 ///     tool_name: "read",
@@ -41,13 +40,15 @@ pub(crate) fn tool_err(e: impl std::fmt::Display) -> ToolError {
 /// );
 /// ```
 ///
-/// **Without args:**
+/// For tools that take no arguments, use an empty `args {}`:
+///
 /// ```ignore
-/// define_tool!(pub(crate) struct Disconnect,
+/// define_tool!(pub(crate) struct Disconnect, args = DisconnectArgs,
 ///     tool_name: "disconnect",
 ///     desc: "Close SSH connection…",
 ///     params: json!({ "type": "object", "properties": {} }),
-///     |this| { … }
+///     args {},
+///     |this, _args| { … }
 /// );
 /// ```
 ///
@@ -102,47 +103,6 @@ macro_rules! define_tool {
         }
     };
 
-    // ── without args (unit) ────────────────────────────────────
-    (
-        $vis:vis struct $name:ident,
-        tool_name: $tool_name:literal,
-        desc: $desc:literal,
-        params: $params:expr,
-        |$this:ident| $body:expr
-    ) => {
-        $vis struct $name {
-            #[allow(dead_code)]
-            state: Arc<SessionState>,
-        }
-
-        impl $name {
-            pub fn new(state: Arc<SessionState>) -> Self {
-                Self { state }
-            }
-        }
-
-        impl rig::tool::Tool for $name {
-            const NAME: &'static str = $tool_name;
-
-            type Error = rig::tool::ToolError;
-            type Args = ();
-            type Output = String;
-
-            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
-                rig::completion::ToolDefinition {
-                    name: $tool_name.into(),
-                    description: $desc.into(),
-                    parameters: $params,
-                }
-            }
-
-             #[allow(unused_variables)]
-            async fn call(&self, _args: ()) -> Result<String, rig::tool::ToolError> {
-                let $this = self;
-                $body
-            }
-        }
-    };
 }
 
 // Re-export so sub-modules can use `define_tool!` without importing it.
