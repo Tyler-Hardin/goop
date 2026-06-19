@@ -52,18 +52,24 @@ impl TransactionLog {
     /// the caller provides only the name.  Loads existing entries from disk
     /// (with legacy bare-event migration), injects a `SessionInfo` root if
     /// the log is empty or lacks one, and persists that root for brand-new
-    /// sessions.  This is the sole constructor — all initialization happens
-    /// here (RAII).
+    /// sessions.  This is the sole production constructor — all
+    /// initialization happens here (RAII).
     pub(crate) async fn open(session_name: &str) -> anyhow::Result<Self> {
         let path = crate::session::sessions_dir().join(format!("{session_name}.jsonl"));
         std::fs::create_dir_all(path.parent().expect("sessions path has a parent"))?;
-        Self::open_at(path, session_name).await
+        Self::open_inner(path, session_name).await
     }
 
-    /// Internal constructor that opens a log at an explicit path.  Used by
-    /// [`open`](Self::open) (which derives the path from the session name) and
-    /// by tests (which need temp-dir control).
-    async fn open_at(path: PathBuf, session_name: &str) -> anyhow::Result<Self> {
+    /// Test-only constructor that opens a log at an explicit path (for
+    /// temp-directory control).  Production code uses [`open`](Self::open),
+    /// which derives the path from the session name.
+    #[cfg(test)]
+    pub(crate) async fn open_at(path: PathBuf, session_name: &str) -> anyhow::Result<Self> {
+        Self::open_inner(path, session_name).await
+    }
+
+    /// Shared implementation: load from disk, inject `SessionInfo`, return.
+    async fn open_inner(path: PathBuf, session_name: &str) -> anyhow::Result<Self> {
         let (entries, next_seq) = load_from_file(&path)?;
         let mut log = Self {
             entries,
@@ -333,6 +339,9 @@ async fn append_to_file(path: &Path, entry: &LogEntry) {
     if let Err(e) = file.write_all(format!("{json}\n").as_bytes()).await {
         tracing::error!("failed to write entry to {path:?}: {e}");
     }
+    // Sync to ensure the data is on disk before we read it back (tests
+    // do this immediately after open()).
+    let _ = file.sync_all().await;
 }
 
 #[cfg(test)]
