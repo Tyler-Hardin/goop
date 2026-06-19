@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use chrono::{Local, Utc};
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
+use rig::completion::Message;
 use rig::message;
 use rig::streaming::StreamedAssistantContent;
 use tokio::io::AsyncWriteExt;
@@ -84,6 +85,15 @@ pub struct Session {
     /// compaction budget when compaction is enabled, otherwise the model's
     /// known context window.  `None` when neither is known.
     context_limit: Option<usize>,
+
+    /// Token budget at which the agent-visible conversation is compacted into a
+    /// rolling LLM summary (see [`maybe_compact`](Self::maybe_compact)).
+    /// `None` disables compaction (unlimited context).
+    compaction_threshold: Option<usize>,
+
+    /// The session's model string (e.g. `deepseek/deepseek-v4-pro`), recorded
+    /// in `Compacted` events for "which model produced this summary".
+    model_label: String,
 
     /// Push a prompt here from any view; the background worker drains it.
     /// Each entry carries an optional completion signal for the submitter.
@@ -283,12 +293,17 @@ impl Session {
         let memory_for_usage = mem.clone();
 
         // Context window limit for the progress bar — the model's known
-        // window.  Compaction will reintroduce a tighter budget in a later
-        // phase; until then the bar measures against the full window.
-        // `None` hides the bar when the window is unknown.
+        // window.  `None` hides the bar when the window is unknown.
         let context_limit =
             memory::lookup_context_length(merged_config.provider(), merged_config.model_name())
                 .map(|v| v as usize);
+
+        // Token budget at which the agent-visible conversation is compacted
+        // into a rolling LLM summary.  An absolute token count, or a
+        // percentage of the model's context window.
+        let compaction_threshold = resolve_compaction_threshold(&merged_config);
+
+        let model_label = merged_config.model.to_string();
 
         let agent = model::build_agent(&merged_config, &preamble, mem, state.clone(), mcp_tools)?;
 
@@ -301,6 +316,8 @@ impl Session {
             next_seq: AtomicU64::new(next_seq),
             memory: memory_for_usage,
             context_limit,
+            compaction_threshold,
+            model_label,
             submit_tx,
             cancel_tx: Mutex::new(None),
             is_running: AtomicBool::new(false),
@@ -435,6 +452,10 @@ impl Session {
             // Write every prompt to the global history file (all sources).
             append_prompt_to_history(&prompt).await;
 
+            // Compact the agent-visible conversation if it has grown past the
+            // configured budget, so the next turn stays within context.
+            self.maybe_compact().await;
+
             self.emit(SessionEvent::UserPrompt {
                 content: prompt.clone(),
                 source,
@@ -452,6 +473,59 @@ impl Session {
             if crate::server::is_restart_requested() {
                 crate::server::notify_shutdown();
                 break;
+            }
+        }
+    }
+
+    /// If the agent-visible conversation has grown past the compaction
+    /// threshold, summarize it into a rolling `Compacted` event so the next
+    /// turn stays within the context budget.  The entire agent-visible prefix
+    /// is covered; the in-progress prompt (handled by rig) is preserved, as is
+    /// goose's "keep the most-recent user message" behaviour.  Summaries are
+    /// themselves agent-visible, so later compactions summarize the prior
+    /// summary — a rolling summary.
+    ///
+    /// No-op when compaction is disabled (`threshold == None`) or the
+    /// conversation is still small.
+    async fn maybe_compact(&self) {
+        let Some(threshold) = self.compaction_threshold else {
+            return;
+        };
+        let items = self.memory.agent_visible_items().await;
+        if items.len() < 2 {
+            return;
+        }
+        let messages: Vec<Message> = items.iter().map(|i| i.msg.clone()).collect();
+        let tokens = self.memory.count_tokens(&messages);
+        if tokens < threshold {
+            return;
+        }
+
+        // Cover every agent-visible item; the current (in-progress) prompt is
+        // not among them and is preserved by rig appending it itself.
+        let covers: Vec<u64> = items.iter().map(|i| i.seq).collect();
+        tracing::info!(
+            "compacting {} agent-visible items (~{} tokens >= threshold {threshold})",
+            items.len(),
+            tokens
+        );
+        match self
+            .agent
+            .summarize(messages, COMPACTION_SYSTEM_PROMPT)
+            .await
+        {
+            Ok(summary) => {
+                self.emit(SessionEvent::Compacted {
+                    summary,
+                    model: self.model_label.clone(),
+                    covers,
+                    manual: false,
+                })
+                .await;
+            }
+            Err(e) => {
+                // Keep the full history this turn; it'll be retried next prompt.
+                tracing::warn!("compaction summarization failed; keeping full history: {e:#}");
             }
         }
     }
@@ -1000,6 +1074,57 @@ pub(crate) fn next_session_name() -> String {
     }
 
     format!("{today}_{:03}", max_seq + 1)
+}
+
+/// System prompt for compaction summarization (embedded at compile time).
+///
+/// Instructs the model to preserve the technical substance of the
+/// conversation — decisions, code, file paths, errors, pending work —
+/// while dropping narration and redundant tool output, so the summary can
+/// stand in for the earlier conversation.
+const COMPACTION_SYSTEM_PROMPT: &str = "\
+You are summarizing an earlier portion of a conversation between a user and \
+an AI coding assistant (goop). The conversation has grown too long and must be \
+compressed so work can continue within a limited context window. Produce a \
+concise but complete summary that preserves everything needed to keep working.
+
+Preserve in detail:
+- The user's goals, requests, requirements, and any stated constraints or \
+preferences.
+- Key decisions made and the reasoning behind them.
+- Technical specifics: file paths, code snippets, shell commands, APIs, \
+library/framework names and versions, and configuration.
+- Errors, stack traces, and how they were resolved (or remain unresolved).
+- The current state of every task: what is done, what is in progress, what \
+is pending, and the concrete next step.
+- Any open questions, TODOs, or follow-ups.
+
+Drop:
+- Pleasantries, narration of the assistant's thought process, and redundant \
+back-and-forth.
+- Verbatim tool output that is no longer needed — but keep the facts it \
+established (file listings, counts, the relevant excerpts).
+
+Format the result as prose with short sections or bullet points as needed. \
+The summary replaces the earlier conversation, so it must stand alone; do not \
+omit technical details, and when unsure whether something matters, keep it.";
+
+/// Resolve the compaction token threshold from the merged config.
+///
+/// An absolute token count (`CompactionMode::Tokens`) is used as-is.  A
+/// percentage (`CompactionMode::Percent`) is applied to the model's known
+/// context window (falling back to `None` — disabled — when the window is
+/// unknown).  `None` (no `compaction` set in config) disables compaction.
+fn resolve_compaction_threshold(config: &Config) -> Option<usize> {
+    use crate::config::CompactionMode;
+    match &config.compaction {
+        Some(CompactionMode::Tokens(n)) => Some(*n),
+        Some(CompactionMode::Percent(pct)) => {
+            memory::lookup_context_length(config.provider(), config.model_name())
+                .map(|ctx| (ctx as usize) * (*pct as usize) / 100)
+        }
+        None => None,
+    }
 }
 
 /// Load the transaction log from a JSONL file.

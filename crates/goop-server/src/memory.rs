@@ -72,6 +72,20 @@ impl LogReplayMemory {
         let messages = replay_log(&log);
         messages.iter().map(|m| self.counter.count(m)).sum()
     }
+
+    /// The agent-visible items (post-replay), each tagged with its source
+    /// `seq`.  Used by compaction to decide what to summarize and to build
+    /// the `Compacted.covers` list.
+    pub(crate) async fn agent_visible_items(&self) -> Vec<VisibleItem> {
+        let log = self.history.lock().await;
+        replay_visible(&log)
+    }
+
+    /// Approximate token count of an arbitrary message list, using the same
+    /// heuristic counter as [`estimated_tokens`](Self::estimated_tokens).
+    pub(crate) fn count_tokens(&self, messages: &[Message]) -> usize {
+        messages.iter().map(|m| self.counter.count(m)).sum()
+    }
 }
 
 impl ConversationMemory for LogReplayMemory {
@@ -123,9 +137,9 @@ pub(crate) fn build_session_memory(history: Arc<Mutex<Vec<LogEntry>>>) -> Sessio
 /// One item in the agent-visible set, tagged with the `seq` of the event
 /// that produced it.  The seq is used by later phases for overlay
 /// (`Edited`/`Deleted`) and compaction (`Compacted.covers`) targeting.
-struct VisibleItem {
-    seq: u64,
-    msg: Message,
+pub(crate) struct VisibleItem {
+    pub(crate) seq: u64,
+    pub(crate) msg: Message,
 }
 
 /// Replay the transaction log into the agent-visible message list.
@@ -148,30 +162,47 @@ struct VisibleItem {
 /// (e.g. an in-flight tool call at the moment a turn was cancelled with
 /// work committed) is dropped by [`drop_orphaned_tool_pairs`], since some
 /// provider APIs reject an unpaired call or result.
-fn replay_log(log: &[LogEntry]) -> Vec<Message> {
+fn replay_visible(log: &[LogEntry]) -> Vec<VisibleItem> {
     let mut visible: Vec<VisibleItem> = Vec::new();
     let mut replay = Replay::new();
 
     for entry in log {
-        if let SessionEvent::TurnEnded { reason } = &entry.event {
-            // Finalise any pending assistant text/calls and tool results
-            // into the buffered turn before deciding its fate.
-            replay.flush_assistant();
-            replay.flush_results();
-            match reason {
-                TurnEndReason::Cancelled { prompt: Some(_) } => {
-                    // No work committed — discard the whole turn.  The
-                    // prompt is handed back to the terminal for editing.
-                    replay.out.clear();
+        match &entry.event {
+            SessionEvent::TurnEnded { reason } => {
+                // Finalise any pending assistant text/calls and tool results
+                // into the buffered turn before deciding its fate.
+                replay.flush_assistant();
+                replay.flush_results();
+                match reason {
+                    TurnEndReason::Cancelled { prompt: Some(_) } => {
+                        // No work committed — discard the whole turn.  The
+                        // prompt is handed back to the terminal for editing.
+                        replay.out.clear();
+                    }
+                    // Completed / StreamEnded / Cancelled { None } /
+                    // MaxTurnsExceeded / Error — the turn's committed work is
+                    // agent-visible.
+                    _ => visible.append(&mut replay.out),
                 }
-                // Completed / StreamEnded / Cancelled { None } /
-                // MaxTurnsExceeded / Error — the turn's committed work is
-                // agent-visible.
-                _ => visible.append(&mut replay.out),
             }
-            continue;
+
+            // A compaction replaces a range of agent-visible items with a
+            // rolling summary.  `covers` references the seqs of the
+            // *current* visible items (including prior summaries), so a
+            // simple `retain` is correct even for nested compactions.
+            SessionEvent::Compacted {
+                summary, covers, ..
+            } => {
+                let cover_set: HashSet<u64> = covers.iter().copied().collect();
+                visible.retain(|i| !cover_set.contains(&i.seq));
+                visible.push(VisibleItem {
+                    seq: entry.seq,
+                    msg: Message::user(summary.clone()),
+                });
+            }
+
+            _ => replay.feed(entry),
         }
-        replay.feed(entry);
     }
 
     // NOTE: deliberately do NOT commit a trailing un-terminated turn — see
@@ -179,7 +210,16 @@ fn replay_log(log: &[LogEntry]) -> Vec<Message> {
 
     drop_orphaned_tool_pairs(&mut visible);
 
-    visible.into_iter().map(|item| item.msg).collect()
+    visible
+}
+
+/// Replay the log into the agent-visible [`Message`] list (the shape rig
+/// consumes).  Thin wrapper over [`replay_visible`].
+pub(crate) fn replay_log(log: &[LogEntry]) -> Vec<Message> {
+    replay_visible(log)
+        .into_iter()
+        .map(|item| item.msg)
+        .collect()
 }
 
 /// Streams log events into `out`, accumulating consecutive assistant
@@ -690,5 +730,59 @@ mod tests {
         assert!(matches!(msgs[1], Message::Assistant { .. })); // call x
         assert!(matches!(msgs[2], Message::User { .. })); // result x
         assert_eq!(assistant_text(&msgs[3]).as_deref(), Some("done"));
+    }
+
+    /// A `Compacted` event replaces its covered agent-visible items with the
+    /// rolling summary.  Subsequent turns remain visible, and the summary
+    /// itself carries the compaction's seq.
+    #[test]
+    fn replay_compacted_replaces_covered_items() {
+        // turn 0: user "q" + assistant "a"
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "q".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(1, SessionEvent::AssistantText("a".into())),
+            entry(
+                2,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // compaction covers the two items produced by that turn (seqs 0,1)
+            entry(
+                3,
+                SessionEvent::Compacted {
+                    summary: "SUMMARY".into(),
+                    model: "m".into(),
+                    covers: vec![0, 1],
+                    manual: false,
+                },
+            ),
+            // a later turn stays visible
+            entry(
+                4,
+                SessionEvent::UserPrompt {
+                    content: "next".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                5,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ];
+        let items = replay_visible(&log);
+        // summary (seq 3) + the later prompt (seq 4)
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].seq, 3);
+        assert_eq!(items[1].seq, 4);
+        assert!(matches!(items[1].msg, Message::User { .. }));
     }
 }

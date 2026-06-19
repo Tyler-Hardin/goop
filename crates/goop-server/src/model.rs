@@ -12,6 +12,7 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use rig::agent::Agent;
 use rig::client::CompletionClient;
+use rig::completion::{AssistantContent, CompletionModel, Message};
 use rig::providers::{anthropic, deepseek, groq, ollama, openai, openrouter, zai};
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 
@@ -65,6 +66,52 @@ impl AnyAgent {
             AnyAgent::Ollama(a) => AnyStream::Ollama(a.stream_prompt(prompt).await),
             AnyAgent::Anthropic(a) => AnyStream::Anthropic(a.stream_prompt(prompt).await),
             AnyAgent::Zai(a) => AnyStream::Zai(a.stream_prompt(prompt).await),
+        }
+    }
+
+    /// One-shot, non-streaming completion used for **compaction summarization**
+    /// (no agent memory, no tools — just the model + a system prompt).  Used to
+    /// roll up the agent-visible conversation into a single summary message.
+    ///
+    /// `messages` is the conversation to summarize; `system_prompt` is the
+    /// compaction instruction.  Returns the concatenated assistant text.
+    pub(crate) async fn summarize(
+        &self,
+        messages: Vec<Message>,
+        system_prompt: &str,
+    ) -> anyhow::Result<String> {
+        macro_rules! do_summarize {
+            ($agent:expr) => {{
+                let model = &$agent.model;
+                let resp = model
+                    .completion_request(Message::user(
+                        "Summarize the conversation above, following the system instructions.",
+                    ))
+                    .preamble(system_prompt.to_string())
+                    .messages(messages.clone())
+                    .send()
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                let text: String = resp
+                    .choice
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                Ok(text)
+            }};
+        }
+        match self {
+            AnyAgent::DeepSeek(a) => do_summarize!(a),
+            AnyAgent::OpenAI(a) => do_summarize!(a),
+            AnyAgent::OpenRouter(a) => do_summarize!(a),
+            AnyAgent::Groq(a) => do_summarize!(a),
+            AnyAgent::Ollama(a) => do_summarize!(a),
+            AnyAgent::Anthropic(a) => do_summarize!(a),
+            AnyAgent::Zai(a) => do_summarize!(a),
         }
     }
 }
