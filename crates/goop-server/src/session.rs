@@ -539,6 +539,19 @@ impl Session {
         self.is_running.store(true, Ordering::SeqCst);
         self.emit(SessionEvent::Thinking).await;
 
+        // Audit trail: record the agent-visible context (post-compaction,
+        // post-overlay) the LLM is about to see, plus the model.  One per
+        // user→agent transition.  The in-progress prompt is appended by rig
+        // itself, so the snapshot captures the committed memory context.
+        {
+            let items = self.memory.agent_visible_items().await;
+            self.emit(SessionEvent::ContextSnapshot {
+                seqs: items.iter().map(|i| i.seq).collect(),
+                model: self.model_label.clone(),
+            })
+            .await;
+        }
+
         // Whether any tool call has *completed* (ToolCall + matching
         // ToolResult) this turn.  This drives the cancel-recovery
         // decision: a cancel with committed work is recorded as

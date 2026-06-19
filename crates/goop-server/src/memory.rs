@@ -785,4 +785,47 @@ mod tests {
         assert_eq!(items[1].seq, 4);
         assert!(matches!(items[1].msg, Message::User { .. }));
     }
+
+    /// Metadata/control events (`ContextSnapshot`, `Thinking`) are never
+    /// agent-visible — they must not leak into the replayed message list.
+    #[test]
+    fn replay_skips_metadata_events() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "hi".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            // metadata interspersed
+            entry(
+                1,
+                SessionEvent::ContextSnapshot {
+                    seqs: vec![],
+                    model: "m".into(),
+                },
+            ),
+            entry(2, SessionEvent::Thinking),
+            entry(3, SessionEvent::AssistantText("hello".into())),
+            entry(
+                4,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // a trailing snapshot (e.g. emitted then turn never ran) is also ignored
+            entry(
+                5,
+                SessionEvent::ContextSnapshot {
+                    seqs: vec![0],
+                    model: "m".into(),
+                },
+            ),
+        ];
+        let msgs = replay_log(&log);
+        assert_eq!(msgs.len(), 2); // user prompt + assistant text only
+        assert!(matches!(msgs[0], Message::User { .. }));
+        assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("hello"));
+    }
 }
