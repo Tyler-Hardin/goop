@@ -311,12 +311,17 @@ pub struct AppState {
     /// exponential backoff (1s, 2s, 4s, …, 64s cap).
     pub(crate) reconnect_attempt: RwSignal<u32>,
 
-    /// Multi-select mode for manual range compaction.  When `true`,
-    /// agent-visible messages show a selection checkbox and the input bar
-    /// is replaced by a selection bar.  See §2.11 of the redesign doc.
+    /// Range-select mode for manual range compaction.  When `true`,
+    /// clicking a message sets the start/end of a contiguous range to
+    /// compact.  The input bar is replaced by a selection bar.  See §2.11
+    /// of the redesign doc.
     pub select_mode: RwSignal<bool>,
-    /// Seqs of messages selected for manual compaction (in select mode).
-    pub selected_seqs: RwSignal<HashSet<u64>>,
+    /// Index into `messages` of the range start (first click).
+    pub selection_start: RwSignal<Option<usize>>,
+    /// Index into `messages` of the range end (second click).  `None`
+    /// means only the start is set (single message — not enough to
+    /// compact).
+    pub selection_end: RwSignal<Option<usize>>,
 
     /// "LLM view" — when `true`, the message log shows exactly what the
     /// agent sees: compaction summaries as plain messages (no tree nodes),
@@ -360,7 +365,8 @@ impl AppState {
             input_focus_request: RwSignal::new(0),
             reconnect_attempt: RwSignal::new(0),
             select_mode: RwSignal::new(false),
-            selected_seqs: RwSignal::new(HashSet::new()),
+            selection_start: RwSignal::new(None),
+            selection_end: RwSignal::new(None),
             llm_view: RwSignal::new(false),
         }
     }
@@ -501,27 +507,81 @@ impl AppState {
     /// Exit select mode and clear the selection.
     pub fn exit_select_mode(&self) {
         self.select_mode.set(false);
-        self.selected_seqs.write().clear();
+        self.selection_start.set(None);
+        self.selection_end.set(None);
     }
 
-    /// Toggle a message's selection (only meaningful in select mode).
-    pub fn toggle_select(&self, seq: u64) {
-        self.selected_seqs.update(|s| {
-            if s.contains(&seq) {
-                s.remove(&seq);
-            } else {
-                s.insert(seq);
+    /// Click a message in select mode.  First click sets the range start;
+    /// second click sets the end (everything between is selected).  A third
+    /// click resets to a new start.  Clicking the same message twice
+    /// deselects.
+    pub fn select_click(&self, idx: usize) {
+        let start = self.selection_start.get_untracked();
+        let end = self.selection_end.get_untracked();
+        match (start, end) {
+            (None, _) => {
+                // First click — set start.
+                self.selection_start.set(Some(idx));
+                self.selection_end.set(None);
             }
-        });
+            (Some(s), None) if s == idx => {
+                // Clicked the start again — deselect.
+                self.selection_start.set(None);
+            }
+            (Some(s), None) => {
+                // Second click — set end.  Ensure start <= end.
+                self.selection_start.set(Some(s.min(idx)));
+                self.selection_end.set(Some(s.max(idx)));
+            }
+            _ => {
+                // Both already set — start a new selection.
+                self.selection_start.set(Some(idx));
+                self.selection_end.set(None);
+            }
+        }
     }
 
-    /// Send a manual compaction request for the selected messages, then
-    /// exit select mode.  The server collects the covered messages, calls
-    /// LLM summarization, and appends a `Compacted { manual: true }` event
-    /// which comes back as a live event and is applied by the existing
-    /// `apply_compaction` path.  See §2.11 of the redesign doc.
+    /// Whether message at `idx` is inside the current selection range.
+    pub fn is_in_selection(&self, idx: usize) -> bool {
+        let start = self.selection_start.get_untracked();
+        let end = self.selection_end.get_untracked();
+        match (start, end) {
+            (Some(s), Some(e)) => idx >= s && idx <= e,
+            (Some(s), None) => idx == s,
+            _ => false,
+        }
+    }
+
+    /// Number of messages in the selection range (0 if no selection).
+    pub fn selection_count(&self) -> usize {
+        let start = self.selection_start.get_untracked();
+        let end = self.selection_end.get_untracked();
+        match (start, end) {
+            (Some(s), Some(e)) => e - s + 1,
+            (Some(_), None) => 1,
+            _ => 0,
+        }
+    }
+
+    /// Send a manual compaction request for the selected range, then exit
+    /// select mode.  Collects the seqs of agent-visible messages in the
+    /// range and sends them as `covers`.  The server summarizes them and
+    /// appends a `Compacted { manual: true }` event.  See §2.11.
     pub fn compact_selected(&self) {
-        let covers: Vec<u64> = self.selected_seqs.get_untracked().iter().copied().collect();
+        let start = self.selection_start.get_untracked();
+        let end = self.selection_end.get_untracked();
+        let Some((s, e)) = start.zip(end) else {
+            return;
+        };
+        // Collect seqs of agent-visible messages in the range.
+        let covers: Vec<u64> = self
+            .messages
+            .get_untracked()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= s && *i <= e)
+            .filter_map(|(_, m)| m.agent_seq())
+            .collect();
         if covers.len() < 2 {
             return;
         }
@@ -1237,13 +1297,18 @@ fn message_in_covers(msg: &UiMessage, covers: &HashSet<u64>) -> bool {
 /// Group messages covered by a `Compacted` event into a collapsible
 /// [`UiMessage::CompactedGroup`].
 ///
-/// Finds the first top-level message whose seq is in `covers` and groups
-/// from there to the end of the list.  For auto-compaction (the only kind
-/// today) `covers` spans the entire agent-visible prefix, so this groups
-/// everything — including trailing UI-only markers (Thinking,
+/// **Auto-compaction** (`manual = false`): `covers` spans the entire
+/// agent-visible prefix, so we group from the first covered message to the
+/// end of the list — including trailing UI-only markers (Thinking,
 /// FinalResponse) that belong to the compacted turns.  Existing groups
 /// (from earlier compactions or tool summaries) become children, giving
 /// nested/recursive trees naturally.
+///
+/// **Manual compaction** (`manual = true`): `covers` is a contiguous range.
+/// We group from the first to the last covered message — including any
+/// non-agent-visible messages (Thinking, etc.) between them, which belong
+/// to the compacted turns.  Messages before and after the range stay in
+/// place.
 fn apply_compaction(
     messages: &mut Vec<UiMessage>,
     id: usize,
@@ -1262,16 +1327,31 @@ fn apply_compaction(
         // only emits Compacted when there are ≥ 2 agent-visible items).
         return;
     };
-    let children: Vec<UiMessage> = messages.drain(start..).collect();
-    messages.push(UiMessage::CompactedGroup {
-        id,
-        seq,
-        summary: summary.to_string(),
-        model: model.to_string(),
-        manual,
-        children,
-        expanded: RwSignal::new(false),
-    });
+
+    let end = if manual {
+        // Contiguous range: from first to last covered message.
+        messages
+            .iter()
+            .rposition(|m| message_in_covers(m, &cover_set))
+            .unwrap_or(start)
+    } else {
+        // Auto: everything from the first covered message to the end.
+        messages.len() - 1
+    };
+
+    let children: Vec<UiMessage> = messages.drain(start..=end).collect();
+    messages.insert(
+        start,
+        UiMessage::CompactedGroup {
+            id,
+            seq,
+            summary: summary.to_string(),
+            model: model.to_string(),
+            manual,
+            children,
+            expanded: RwSignal::new(false),
+        },
+    );
 }
 
 /// Wrap the `ToolCall` whose logical id matches `tool_id` in a

@@ -274,13 +274,6 @@ main {
     var(--bg);
 }
 
-/* Extra left padding in select mode so checkboxes (positioned at
-   `left: -28px` relative to each message) are visible and not clipped
-   by `main`'s `overflow: auto`. */
-main.select-mode {
-  padding-left: 44px;
-}
-
 .msg {
   max-width: 78%;
   padding: 11px 16px;
@@ -671,64 +664,37 @@ main.select-mode {
 /* ── select mode (manual range compaction) ───────────────────── */
 
 /*
-   When select mode is active, each agent-visible message gets a checkbox
-   on its left and a highlighted background when selected.  The checkbox
-   is a small square that shows ✓ when the message is selected.
+   In select mode, clicking a message sets the start/end of a contiguous
+   range.  An invisible overlay div sits on top of each message to capture
+   clicks; selected messages get a blue border highlight.
 
    `.msg-select-wrap` is a flex column so `.msg-wrap`'s `align-self`
    (flex-end for user, flex-start for assistant) still works — the wrapper
    replaced `.msg-wrap` as the direct child of `main`'s flex column.
-
-   `main.select-mode` adds left padding so the absolutely-positioned
-   checkbox (`left: -28px`) is not clipped by `main`'s `overflow: auto`
-   (which clips anything outside the padding box).
 */
 .msg-select-wrap {
   display: flex;
   flex-direction: column;
   position: relative;
 }
-.msg-select-wrap.select-mode {
-  cursor: default;
-}
-.msg-select-wrap.select-mode .msg-wrap {
-  pointer-events: none;
-}
-/* Let interactive elements inside messages still work (expand/collapse). */
-.msg-select-wrap.select-mode .msg-wrap > .msg {
-  pointer-events: auto;
-}
 
-.msg-check {
-  position: absolute;
-  left: -28px;
-  top: 4px;
-  width: 20px;
-  height: 20px;
-  border: 2px solid var(--dim2);
-  border-radius: 4px;
+/* Invisible click overlay — only active in select mode.  Sits above the
+   message content to intercept clicks for range selection. */
+.msg-select-overlay {
   display: none;
-  align-items: center;
-  justify-content: center;
+  position: absolute;
+  inset: 0;
   cursor: pointer;
-  font-size: 13px;
-  color: var(--bg);
-  background: var(--surface);
-  transition:
-    background 0.15s,
-    border-color 0.15s;
   z-index: 10;
 }
-.msg-select-wrap.select-mode .msg-check {
-  display: flex;
+.msg-select-overlay.hidden {
+  display: none;
 }
-.msg-check:hover {
-  border-color: var(--blue);
+main.select-mode .msg-select-overlay {
+  display: block;
 }
-.msg-select-wrap.selected .msg-check {
-  background: var(--blue);
-  border-color: var(--blue);
-}
+
+/* Selected messages get a blue border highlight. */
 .msg-select-wrap.selected .msg-wrap > .msg {
   border-color: var(--blue);
   box-shadow: 0 0 0 1px var(--blue);

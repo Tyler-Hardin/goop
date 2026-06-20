@@ -4,18 +4,20 @@ use crate::state::AppState;
 
 /// Footer bar shown in select mode (replaces the input bar).
 ///
-/// Displays the number of selected messages and provides a "✦ Compact"
-/// button that sends a `CompactRange` request to the server, plus a "✕ Done"
-/// button that exits select mode without compacting.
+/// Displays the number of messages in the selection range and provides a
+/// "✦ Compact" button that sends a `CompactRange` request to the server,
+/// plus a "✕ Done" button that exits select mode without compacting.
 ///
-/// The compact button is disabled until at least 2 messages are selected
-/// (summarizing a single message is pointless).  See §2.11 of the redesign
-/// doc.
+/// The compact button is disabled until a range of ≥ 2 messages is selected.
+/// See §2.11 of the redesign doc.
 #[component]
 pub fn SelectBar() -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState missing");
 
-    let count = Signal::derive(move || state.selected_seqs.get().len());
+    let count = {
+        let state = state.clone();
+        Signal::derive(move || state.selection_count())
+    };
     let can_compact = Signal::derive(move || count.get() >= 2);
 
     let do_compact = {
@@ -35,9 +37,11 @@ pub fn SelectBar() -> impl IntoView {
                 {move || {
                     let n = count.get();
                     if n == 0 {
-                        "Select messages to compact".to_string()
+                        "Click a message to start a range".to_string()
+                    } else if n == 1 {
+                        "Click another message to set the range end".to_string()
                     } else {
-                        format!("{n} selected")
+                        format!("{n} messages selected")
                     }
                 }}
             </span>

@@ -406,39 +406,31 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             expanded,
             ..
         } => {
-            let summary_html = render_markdown(&summary);
-
-            // LLM view: render the summary as a plain message — exactly what
-            // the agent sees.  No tree node, no expand arrow, no children.
-            if state.llm_view.get_untracked() {
-                let label = if manual {
-                    "✦ manual summary"
-                } else {
-                    "✦ summary"
-                };
-                return view! {
-                    <div class="msg llm-summary">
-                        <div class="llm-summary-label">{label}</div>
-                        <div class="rendered-inner" inner_html=summary_html></div>
-                    </div>
-                }
-                .into_any();
-            }
-
             let toggle = move |_| expanded.update(|v| *v = !*v);
+            let summary_html = render_markdown(&summary);
             let count = children.len();
-            let label = if manual {
+            let chat_label = if manual {
                 "✦ manual compaction"
             } else {
                 "✦ compacted"
             };
+            let llm_label = if manual {
+                "✦ manual summary"
+            } else {
+                "✦ summary"
+            };
+
+            // Always-render both views, toggled by class:hidden.  Using
+            // get_untracked() + early return doesn't work: <For> doesn't
+            // re-create the component when llm_view toggles (key unchanged),
+            // so the branch is frozen at creation time.
             view! {
-                <div class="msg group compacted" class:open=expanded>
+                <div class="msg group compacted" class:open=expanded class:hidden=move || llm_view.get()>
                     <div class="group-header" on:click=toggle>
                         <span class="arrow">"▸"</span>
                         <div class="group-summary">
-                            <div class="group-meta">{format!("{label} · {count} messages · {model}")}</div>
-                            <div class="rendered-inner" inner_html=summary_html></div>
+                            <div class="group-meta">{format!("{chat_label} · {count} messages · {model}")}</div>
+                            <div class="rendered-inner" inner_html=summary_html.clone()></div>
                         </div>
                     </div>
                     <div class="group-children">
@@ -448,6 +440,10 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                             children=move |m| view! { <Message msg=m /> }
                         />
                     </div>
+                </div>
+                <div class="msg llm-summary" class:hidden=move || !llm_view.get()>
+                    <div class="llm-summary-label">{llm_label}</div>
+                    <div class="rendered-inner" inner_html=summary_html></div>
                 </div>
             }
                 .into_any()
@@ -460,32 +456,26 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             expanded,
             ..
         } => {
+            let toggle = move |_| expanded.update(|v| *v = !*v);
             let summary_html = render_markdown(&summary);
 
-            // LLM view: render the summary as a plain message.
-            if state.llm_view.get_untracked() {
-                return view! {
-                    <div class="msg llm-summary">
-                        <div class="llm-summary-label">"◇ tool summary"</div>
-                        <div class="rendered-inner" inner_html=summary_html></div>
-                    </div>
-                }
-                .into_any();
-            }
-
-            let toggle = move |_| expanded.update(|v| *v = !*v);
+            // Always-render both views — see CompactedGroup above.
             view! {
-                <div class="msg group tool-summary" class:open=expanded>
+                <div class="msg group tool-summary" class:open=expanded class:hidden=move || llm_view.get()>
                     <div class="group-header" on:click=toggle>
                         <span class="arrow">"▸"</span>
                         <div class="group-summary">
                             <div class="group-meta">{format!("◇ tool pair summarized · {model}")}</div>
-                            <div class="rendered-inner" inner_html=summary_html></div>
+                            <div class="rendered-inner" inner_html=summary_html.clone()></div>
                         </div>
                     </div>
                     <div class="group-children">
                         <Message msg=(*child).clone() />
                     </div>
+                </div>
+                <div class="msg llm-summary" class:hidden=move || !llm_view.get()>
+                    <div class="llm-summary-label">"◇ tool summary"</div>
+                    <div class="rendered-inner" inner_html=summary_html></div>
                 </div>
             }
                 .into_any()

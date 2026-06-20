@@ -8,7 +8,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::Closure;
 
 use crate::components::message::Message;
-use crate::state::AppState;
+use crate::state::{AppState, UiMessage};
 
 /// Scrollable message list.
 ///
@@ -233,63 +233,37 @@ pub fn MessageLog() -> impl IntoView {
             //
             // In LLM view, deleted messages are filtered out — the agent
             // doesn't see them, so neither should the user in that mode.
+            //
+            // In select mode, messages are enumerated so clicking sets the
+            // range start/end for manual compaction.
             <For
                 each=move || {
                     let msgs = state.messages.get();
-                    if llm_view.get() {
+                    let filtered: Vec<UiMessage> = if llm_view.get() {
                         msgs.into_iter().filter(|m| !m.is_deleted()).collect()
                     } else {
                         msgs
-                    }
+                    };
+                    filtered.into_iter().enumerate().collect::<Vec<_>>()
                 }
-                key=|msg| msg.id()
-                children=move |msg| {
+                key=|(_, msg): &(usize, UiMessage)| msg.id()
+                children=move |(idx, msg)| {
                     let st = state.clone();
-                    let seq = msg.agent_seq();
-                    let st_cls = st.clone();
                     let st_sel = st.clone();
-
-                    // Always-render the checkbox for agent-visible messages.
-                    // Visibility is CSS-controlled (display:none unless
-                    // .msg-select-wrap has .select-mode), so no <Show> is
-                    // needed — and <Show> with get_untracked() would never
-                    // re-evaluate when select_mode changes (the bug this
-                    // fixes).  Non-agent-visible messages (seq == None) get
-                    // no checkbox at all.
-                    let checkbox = seq.map(|s| {
-                        let st_click = st.clone();
-                        let st_text = st.clone();
-                        view! {
-                            <div
-                                class="msg-check"
-                                on:click=move |evt| {
-                                    evt.stop_propagation();
-                                    st_click.toggle_select(s);
-                                }
-                            >
-                                {move || {
-                                    if st_text.selected_seqs.get().contains(&s) {
-                                        "✓"
-                                    } else {
-                                        ""
-                                    }
-                                }}
-                            </div>
-                        }
-                            .into_any()
-                    });
 
                     view! {
                         <div
                             class="msg-select-wrap"
-                            class:select-mode=move || st_cls.select_mode.get() && seq.is_some()
-                            class:selected=move || {
-                                seq.is_some()
-                                    && st_sel.select_mode.get()
-                                    && st_sel.selected_seqs.get().contains(&seq.unwrap())
-                            }
+                            class:selected=move || st_sel.select_mode.get() && st_sel.is_in_selection(idx)
                         >
-                            {checkbox}
+                            <div
+                                class="msg-select-overlay"
+                                class:hidden=move || !st.select_mode.get()
+                                on:click=move |evt| {
+                                    evt.stop_propagation();
+                                    st.select_click(idx);
+                                }
+                            ></div>
                             <Message msg />
                         </div>
                     }
