@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::events::{PromptSource, ServerMessage, SessionEvent, TurnEndReason};
+use crate::events::{EditContent, PromptSource, ServerMessage, SessionEvent, TurnEndReason};
 use crate::memory::prompt_history_path;
 use streamdown_parser::Parser;
 use streamdown_render::Renderer;
@@ -657,11 +657,34 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                     .ok();
             }
 
-            // ── overlay / metadata events (not yet emitted / UI-irrelevant) ──
-            SessionEvent::ContextSnapshot { .. }
-            | SessionEvent::ModelChanged { .. }
-            | SessionEvent::Edited { .. }
-            | SessionEvent::Deleted { .. } => {}
+            // ── overlay events ─────────────────────────────────────
+            // Edits and deletes are initiated from the web UI (the terminal
+            // can't un-print old output).  Show a one-line notice so the
+            // change is observable in the linear log; the target seq is the
+            // concrete handle for what was touched.
+            SessionEvent::Edited {
+                target,
+                replacement,
+            } => {
+                let kind = match replacement {
+                    EditContent::Text(_) => "message",
+                    EditContent::ToolCall { .. } => "tool call",
+                    EditContent::ToolResult { .. } => "tool result",
+                };
+                state
+                    .lock_printer()
+                    .print(format!("{DIM}  ✎ edited {kind} #{target}{RST}\n"))
+                    .ok();
+            }
+            SessionEvent::Deleted { target } => {
+                state
+                    .lock_printer()
+                    .print(format!("{DIM}  ✕ deleted message #{target}{RST}\n"))
+                    .ok();
+            }
+
+            // ── metadata events (audit only, no terminal rendering) ──
+            SessionEvent::ContextSnapshot { .. } | SessionEvent::ModelChanged { .. } => {}
 
             SessionEvent::HistoryComplete => {
                 // Web-only sentinel marking end of history replay.
