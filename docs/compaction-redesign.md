@@ -21,7 +21,7 @@
 | 9 — Forking | ✅ done | |
 | 10 — Manual range compaction | ✅ done | `ClientMessage::CompactRange { covers }` + `Session::compact_range`; `covered_messages` pure helper in `memory/compaction.rs` (+3 tests). Replay unchanged (already generic). Web UI: header ⊟ toggle → select mode with per-message checkboxes → `SelectBar` footer with ✦ Compact / ✕ Done. |
 | 11 — Terminal | ✅ done | `Compacted`/`ToolSummarized` inline notices; `TurnEnded` reasons (incl. cancel-repopulate); fork `Reset` notice; `Edited`/`Deleted` inline notices. History replay handles new event types via `ServerMessage::Entry`. See "As built" below. |
-| 12 — Tests & migration | ✅ mostly | 45 tests in `src/memory/` (25 replay + 10 `TransactionLog` + 10 compaction decision logic). Compaction decisions extracted to `memory/compaction.rs` for testability without a mock LLM. Remaining: end-to-end integration test (needs mock `AnyAgent`). See "As built" below. |
+| 12 — Tests & migration | ✅ done | 49 tests: 25 replay + 10 `TransactionLog` + 10 compaction decision logic + 4 end-to-end integration tests (auto-compaction, manual range compaction, rolling compaction, no-op under threshold). Integration tests use `AnyAgent::Mock` + `Session::for_compaction_test` to exercise the full `maybe_compact`/`compact_range` → emit → replay path. See "As built" below. |
 
 ---
 
@@ -1607,15 +1607,24 @@ happened:
 >   still agent-visible; **drops summaries whose pair vanished** between
 >   snapshot and commit (e.g. swept by a `Compacted`).
 >
-> **Still pending:**
+> **Integration tests (Phase 12, done):**
 >
-> - **End-to-end compaction integration test.** The replay tests cover the
->   projection in isolation (given a log with a `Compacted` event, replay
->   produces the right messages), and the compaction tests cover the decision
->   logic in isolation (given agent-visible items, the right candidates/covers
->   are selected).  Nothing yet asserts the *full* path — a session that
->   actually exceeds its budget, calls the LLM, appends a `Compacted`, and
->   continues with the LLM seeing the summary on the next turn.  This requires
->   a mock `AnyAgent` whose `summarize()` returns canned text; `AnyAgent`
->   wraps rig's concrete provider types (no built-in test provider), so a mock
->   would need either a new enum variant or a trait abstraction.
+> - **End-to-end compaction integration tests.** Four tests in
+>   `session::compaction_integration_tests` exercise the full path through
+>   `Session` — not just the pure replay/decision functions:
+>   - **Auto-compaction:** a session exceeding its token budget triggers
+>     `maybe_compact`, the mock agent's `summarize()` is called, a `Compacted`
+>     event is emitted, and replay shows only the summary.
+>   - **Manual range compaction:** `compact_range` covers a middle turn,
+>     leaving turns before and after visible alongside the summary.
+>   - **Rolling compaction:** a second compaction covers the first summary's
+>     seq, and replay shows only the latest rolling summary.
+>   - **No-op under threshold:** `maybe_compact` emits nothing when the
+>     conversation is below the budget.
+>
+>   The tests use `AnyAgent::Mock` (a new test-only enum variant that returns
+>   canned text from `summarize()` and panics on `stream_prompt()`) and
+>   `Session::for_compaction_test` (a minimal constructor that builds a session
+>   with a mock agent, an in-memory transaction log, and a low compaction
+>   threshold — bypassing the full `Session::new` which needs API keys, MCP,
+>   SSH, etc.).
