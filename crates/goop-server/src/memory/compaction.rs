@@ -50,6 +50,19 @@ pub(crate) fn compaction_covers(
     Some(items.iter().map(|i| i.seq).collect())
 }
 
+/// Filter agent-visible items to those whose seq is in `covers`, returning
+/// their messages in order.  Used by manual range compaction to collect the
+/// messages to summarize.  Items not in `covers` are left untouched by replay
+/// (they remain agent-visible alongside the summary).
+pub(crate) fn covered_messages(items: &[VisibleItem], covers: &[u64]) -> Vec<Message> {
+    let cover_set: HashSet<u64> = covers.iter().copied().collect();
+    items
+        .iter()
+        .filter(|i| cover_set.contains(&i.seq))
+        .map(|i| i.msg.clone())
+        .collect()
+}
+
 // ── tool-pair summarization (tier 1) ──
 
 /// A tool-call+result pair selected for summarization.
@@ -172,6 +185,24 @@ mod tests {
         msgs.iter().map(|m| format!("{m:?}").len()).sum()
     }
 
+    /// Extract the text of a `Message::User` (for assertions).
+    fn user_text(m: &Message) -> Option<String> {
+        use rig::message::UserContent;
+        match m {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        }
+    }
+
     // ── compaction_covers ──────────────────────────────────────────
 
     #[test]
@@ -219,6 +250,69 @@ mod tests {
             },
         ];
         assert_eq!(compaction_covers(&items, 100, 200), Some(vec![0, 3, 7]));
+    }
+
+    // ── covered_messages ───────────────────────────────────────────
+
+    #[test]
+    fn covered_messages_filters_by_seq() {
+        let items = vec![
+            VisibleItem {
+                seq: 0,
+                msg: Message::user("a"),
+            },
+            VisibleItem {
+                seq: 3,
+                msg: Message::user("b"),
+            },
+            VisibleItem {
+                seq: 7,
+                msg: Message::user("c"),
+            },
+            VisibleItem {
+                seq: 9,
+                msg: Message::user("d"),
+            },
+        ];
+        // Select a non-contiguous subset (seqs may have gaps from forks).
+        let msgs = covered_messages(&items, &[3, 9]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(user_text(&msgs[0]).as_deref(), Some("b"));
+        assert_eq!(user_text(&msgs[1]).as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn covered_messages_empty_for_no_matches() {
+        let items = vec![VisibleItem {
+            seq: 0,
+            msg: Message::user("a"),
+        }];
+        let msgs = covered_messages(&items, &[99]);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn covered_messages_preserves_order() {
+        // Covers are given out of order, but the result must follow the
+        // item order (chronological), not the covers order.
+        let items = vec![
+            VisibleItem {
+                seq: 1,
+                msg: Message::user("first"),
+            },
+            VisibleItem {
+                seq: 2,
+                msg: Message::user("second"),
+            },
+            VisibleItem {
+                seq: 3,
+                msg: Message::user("third"),
+            },
+        ];
+        let msgs = covered_messages(&items, &[3, 1]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(user_text(&msgs[0]).as_deref(), Some("first"));
+        assert_eq!(user_text(&msgs[1]).as_deref(), Some("third"));
     }
 
     // ── select_tool_summary_candidates ─────────────────────────────

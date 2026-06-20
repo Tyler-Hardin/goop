@@ -215,7 +215,7 @@ impl UiMessage {
 
     /// The transaction-log seq of the originating event, if this message is
     /// agent-visible (and thus targetable by overlays / compaction `covers`).
-    fn agent_seq(&self) -> Option<u64> {
+    pub fn agent_seq(&self) -> Option<u64> {
         match self {
             UiMessage::UserPrompt { seq, .. }
             | UiMessage::AssistantFinal { seq, .. }
@@ -299,6 +299,13 @@ pub struct AppState {
     /// or successful open.  Used by [`schedule_reconnect`] for
     /// exponential backoff (1s, 2s, 4s, …, 64s cap).
     pub(crate) reconnect_attempt: RwSignal<u32>,
+
+    /// Multi-select mode for manual range compaction.  When `true`,
+    /// agent-visible messages show a selection checkbox and the input bar
+    /// is replaced by a selection bar.  See §2.11 of the redesign doc.
+    pub select_mode: RwSignal<bool>,
+    /// Seqs of messages selected for manual compaction (in select mode).
+    pub selected_seqs: RwSignal<HashSet<u64>>,
 }
 
 /// Result of pre-forming buffered history entries into UI state.
@@ -335,6 +342,8 @@ impl AppState {
             connection_gen: RwSignal::new(0),
             input_focus_request: RwSignal::new(0),
             reconnect_attempt: RwSignal::new(0),
+            select_mode: RwSignal::new(false),
+            selected_seqs: RwSignal::new(HashSet::new()),
         }
     }
 
@@ -460,6 +469,54 @@ impl AppState {
         }
     }
 
+    // ── manual range compaction (select mode) ───────────────────────
+
+    /// Toggle select mode on/off.  Turning off clears the selection.
+    pub fn toggle_select_mode(&self) {
+        if self.select_mode.get_untracked() {
+            self.exit_select_mode();
+        } else {
+            self.select_mode.set(true);
+        }
+    }
+
+    /// Exit select mode and clear the selection.
+    pub fn exit_select_mode(&self) {
+        self.select_mode.set(false);
+        self.selected_seqs.write().clear();
+    }
+
+    /// Toggle a message's selection (only meaningful in select mode).
+    pub fn toggle_select(&self, seq: u64) {
+        self.selected_seqs.update(|s| {
+            if s.contains(&seq) {
+                s.remove(&seq);
+            } else {
+                s.insert(seq);
+            }
+        });
+    }
+
+    /// Send a manual compaction request for the selected messages, then
+    /// exit select mode.  The server collects the covered messages, calls
+    /// LLM summarization, and appends a `Compacted { manual: true }` event
+    /// which comes back as a live event and is applied by the existing
+    /// `apply_compaction` path.  See §2.11 of the redesign doc.
+    pub fn compact_selected(&self) {
+        let covers: Vec<u64> = self.selected_seqs.get_untracked().iter().copied().collect();
+        if covers.len() < 2 {
+            return;
+        }
+        if let Some(ws) = self.ws.get_untracked()
+            && ws.ready_state() == web_sys::WebSocket::OPEN
+        {
+            let msg =
+                serde_json::to_string(&ClientMessage::CompactRange { covers }).unwrap_or_default();
+            ws.send_with_str(&msg).ok();
+        }
+        self.exit_select_mode();
+    }
+
     /// Send raw WAV audio to the server for speech-to-text transcription.
     pub fn send_audio(&self, data: Vec<u8>) {
         if let Some(ws) = self.ws.get_untracked()
@@ -567,6 +624,7 @@ impl AppState {
                 self.turn_state.set(TurnState::Idle);
                 self.context_usage.set(None);
                 self.connection.set(ConnectionState::CatchingUp);
+                self.exit_select_mode();
             }
             ServerMessage::HistoryComplete => {
                 let buffer = self.history_buffer.get_untracked();

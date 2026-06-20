@@ -661,6 +661,140 @@ main {
   color: var(--fg);
 }
 
+/* ── select mode (manual range compaction) ───────────────────── */
+
+/*
+   When select mode is active, each agent-visible message gets a checkbox
+   on its left and a highlighted background when selected.  The checkbox
+   is a small square that shows ✓ when the message is selected.
+*/
+.msg-select-wrap {
+  position: relative;
+}
+.msg-select-wrap.select-mode {
+  cursor: default;
+}
+.msg-select-wrap.select-mode .msg-wrap {
+  pointer-events: none;
+}
+/* Let interactive elements inside messages still work (expand/collapse). */
+.msg-select-wrap.select-mode .msg-wrap > .msg {
+  pointer-events: auto;
+}
+
+.msg-check {
+  position: absolute;
+  left: -28px;
+  top: 4px;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--dim2);
+  border-radius: 4px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--bg);
+  background: var(--surface);
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+  z-index: 10;
+}
+.msg-select-wrap.select-mode .msg-check {
+  display: flex;
+}
+.msg-check:hover {
+  border-color: var(--blue);
+}
+.msg-select-wrap.selected .msg-check {
+  background: var(--blue);
+  border-color: var(--blue);
+}
+.msg-select-wrap.selected .msg-wrap > .msg {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
+}
+
+/* ── header select button ─────────────────────────── */
+
+.select-btn {
+  background: none;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 4px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.select-btn:hover {
+  background: var(--surface2);
+  color: var(--fg);
+}
+.select-btn.active {
+  color: var(--blue);
+  background: rgba(100, 149, 237, 0.12);
+}
+
+/* ── select bar (replaces input bar in select mode) ──────────── */
+
+.select-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  gap: 12px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+.select-count {
+  font-size: 13px;
+  color: var(--dim);
+  font-family: var(--mono);
+}
+.select-actions {
+  display: flex;
+  gap: 8px;
+}
+.select-compact-btn {
+  background: var(--blue);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.select-compact-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.select-compact-btn:not(:disabled):hover {
+  opacity: 0.88;
+}
+.select-cancel-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.select-cancel-btn:hover {
+  color: var(--fg);
+  border-color: var(--dim2);
+}
+
 /* ── inline edit mode ────────────────────────────── */
 
 .msg.editing {

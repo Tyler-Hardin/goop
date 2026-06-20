@@ -270,4 +270,11 @@ pub enum ClientMessage {
     /// is preserved in the append-only log.  See §2.9 of the redesign doc.
     #[serde(rename = "fork")]
     Fork { target: u64, content: String },
+    /// Manually compact a range of agent-visible messages into a summary.
+    /// `covers` is the seqs of the messages to summarize.  The server
+    /// collects those messages, calls LLM summarization, and appends a
+    /// `Compacted` event with `manual = true`.  See §2.11 of the redesign
+    /// doc.
+    #[serde(rename = "compact_range")]
+    CompactRange { covers: Vec<u64> },
 }

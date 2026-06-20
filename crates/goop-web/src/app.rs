@@ -4,7 +4,8 @@ use wasm_bindgen::prelude::Closure;
 
 use crate::components::{
     empty_state::EmptyState, header::Header, input_bar::InputBar, message_log::MessageLog,
-    refresh_indicator::RefreshIndicator, session_list::SessionList, swipe_sidebar::SwipeSidebar,
+    refresh_indicator::RefreshIndicator, select_bar::SelectBar, session_list::SessionList,
+    swipe_sidebar::SwipeSidebar,
 };
 use crate::state::AppState;
 
@@ -176,7 +177,12 @@ pub fn App() -> impl IntoView {
             </Show>
             // Input bar is visible when a session is selected.
             <Show when=move || has_session.get()>
-                <InputBar />
+                <Show
+                    when=move || state.select_mode.get()
+                    fallback=move || view! { <InputBar /> }
+                >
+                    <SelectBar />
+                </Show>
             </Show>
         </div>
 

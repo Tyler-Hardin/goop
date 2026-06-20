@@ -485,6 +485,47 @@ impl Session {
             .map(|e| e.seq)
     }
 
+    /// Manually compact a range of agent-visible messages into a summary.
+    /// The user selects messages in the UI; `covers` is their seqs.  The
+    /// server collects those messages, calls LLM summarization, and appends a
+    /// [`Compacted`](SessionEvent::Compacted) event with `manual = true`.
+    /// See §2.11 of the redesign doc.
+    ///
+    /// Unlike [`maybe_compact`](Self::maybe_compact) (which covers the entire
+    /// agent-visible prefix), manual compaction covers only the selected
+    /// range — messages before and after the range remain agent-visible.
+    /// Replay is the same either way: `covers` is an arbitrary `Vec<u64>`, so
+    /// no special-casing is needed.
+    pub async fn compact_range(&self, covers: Vec<u64>) {
+        if covers.len() < 2 {
+            return;
+        }
+        let items = self.memory.agent_visible_items().await;
+        let messages = memory::covered_messages(&items, &covers);
+        if messages.is_empty() {
+            return;
+        }
+        tracing::info!("manual compaction of {} items", covers.len());
+        match self
+            .agent
+            .summarize(messages, COMPACTION_SYSTEM_PROMPT)
+            .await
+        {
+            Ok(summary) => {
+                self.emit(SessionEvent::Compacted {
+                    summary,
+                    model: self.model_label.clone(),
+                    covers,
+                    manual: true,
+                })
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!("manual compaction failed: {e:#}");
+            }
+        }
+    }
+
     /// Submit audio for speech-to-text transcription.
     ///
     /// The WAV-encoded audio is transcribed using the server's local

@@ -20,6 +20,11 @@ use crate::state::AppState;
 /// Auto-scrolls to the bottom on new content unless the user has scrolled
 /// away.  Scrolls are throttled via `requestAnimationFrame` so the visual
 /// update stays smooth even when streaming chunks arrive faster than 60 fps.
+///
+/// **Select mode:** when `AppState::select_mode` is on, each agent-visible
+/// message gets a checkbox on its left.  Clicking the checkbox toggles the
+/// message's selection for manual range compaction (§2.11).  Non-agent-
+/// visible messages (Thinking, FinalResponse, etc.) don't get a checkbox.
 #[component]
 pub fn MessageLog() -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState missing");
@@ -218,7 +223,44 @@ pub fn MessageLog() -> impl IntoView {
             <For
                 each=move || state.messages.get()
                 key=|msg| msg.id()
-                children=move |msg| view! { <Message msg /> }
+                children=move |msg| {
+                    let st = state.clone();
+                    let seq = msg.agent_seq();
+                    let st_cls = st.clone();
+                    let st_sel = st.clone();
+                    view! {
+                        <div
+                            class="msg-select-wrap"
+                            class:select-mode=move || st_cls.select_mode.get() && seq.is_some()
+                            class:selected=move || {
+                                seq.is_some()
+                                    && st_sel.select_mode.get()
+                                    && st_sel.selected_seqs.get().contains(&seq.unwrap())
+                            }
+                        >
+                            <Show when=move || st.select_mode.get_untracked() && seq.is_some()>
+                                {let st = st.clone(); let s = seq.unwrap(); view! {
+                                    <div
+                                        class="msg-check"
+                                        on:click=move |evt| {
+                                            evt.stop_propagation();
+                                            st.toggle_select(s);
+                                        }
+                                    >
+                                        {move || {
+                                            if st.selected_seqs.get().contains(&s) {
+                                                "✓"
+                                            } else {
+                                                ""
+                                            }
+                                        }}
+                                    </div>
+                                }.into_any()}
+                            </Show>
+                            <Message msg />
+                        </div>
+                    }
+                }
             />
             // Live streaming assistant text (not yet flushed to messages).
             // The "streaming" class suppresses the per-message fadeIn
