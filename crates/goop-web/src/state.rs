@@ -425,7 +425,6 @@ impl AppState {
     /// appends a `Deleted` overlay (and, for a tool call/result, one for the
     /// matching half) which comes back as a live event and is applied by the
     /// existing `apply_delete` path.
-    #[allow(dead_code)] // wired to UI affordances in the next change
     pub fn delete_message(&self, target: u64) {
         if let Some(ws) = self.ws.get_untracked()
             && ws.ready_state() == web_sys::WebSocket::OPEN
@@ -439,7 +438,6 @@ impl AppState {
     /// The server appends an `Edited` overlay which comes back as a live
     /// event and is applied by the existing `apply_edit` path (setting an
     /// `EditOverlay` so the UI shows the replacement with a ✎ toggle).
-    #[allow(dead_code)] // wired to UI affordances in the next change
     pub fn edit_message(&self, target: u64, replacement: EditContent) {
         if let Some(ws) = self.ws.get_untracked()
             && ws.ready_state() == web_sys::WebSocket::OPEN

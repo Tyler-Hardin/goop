@@ -189,8 +189,10 @@ The web UI shows a session sidebar for switching between sessions.
   `Edited`/`Deleted` overlays (`apply_edit`/`apply_delete`) search the
   message tree recursively; edits set an `EditOverlay` signal (replacement +
   show-original `✎` toggle), deletes set a `deleted` flag (faded
-  strikethrough).  No overlay events are emitted yet (Phase 8), so this
-  rendering is dormant but ready — and like all lazily-populated `UiMessage`
+  strikethrough).  Phase 8 wires the trigger: `ClientMessage::Edit`/`Delete`
+  are sent from the web UI's hover-revealed ✎/✕ action buttons; the server
+  appends the overlay events which come back as live events and set the
+  signals — and like all lazily-populated `UiMessage`
   state, the overlays are `RwSignal`s (the `<For>`-keyed constraint above).
 
 - **Tools** (`src/tools/`) — each tool implements `rig::tool::Tool` on a

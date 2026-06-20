@@ -17,7 +17,7 @@
 | 5 — Tool-pair summarization | ✅ done | `apply_tool_summary` replay surgery; `maybe_summarize_tool_pairs` summarizer (snapshot→summarize→revalidate); `ToolSummarizationConfig` (top-level `[tool_summarization]`, not nested under `[compaction]`); terminal + web UI notices. Config: `[tool_summarization]` (env vars: `GOOP_TOOL_SUMMARIZATION*`). Default off. |
 | 6 — Config | ✅ done | Stale compaction descriptions fixed (template + `config.rs` doc comments + AGENTS.md config example). `[tool_summarization]` section + `GOOP_TOOL_SUMMARIZATION*` env vars documented in template and AGENTS.md. `CompactionMode` kept (not replaced with `auto_compact_threshold` — see note below). |
 | 7 — Web UI tree view | ✅ done | `CompactedGroup` / `ToolSummaryGroup` collapsible tree nodes; per-message `seq` tracked locally (counting received events); `Edited`/`Deleted` overlays rendered (✎ badge + show-original toggle; faded strikethrough). See "As built" below. |
-| 8 — Edit/delete overlays | ⬜ planned | |
+| 8 — Edit/delete overlays | ✅ done | `ClientMessage::Edit`/`Delete` + `Session::edit`/`delete` (deletes auto-emit both halves of a tool pair). Replay applies `Edited`/`Deleted` overlays (previously ignored): tool targets resolve to tool-call id via the log → content-granularity surgery; text targets replace the whole `VisibleItem` (assistant tool calls preserved when editing narration). Web UI: hover-revealed ✎/✕ action buttons on `UserPrompt`/`AssistantFinal`/`ToolCall`; inline `<textarea>` edit mode with Save/Cancel. 8 replay tests added. |
 | 9 — Forking | ⬜ future | |
 | 10 — Manual range compaction | ⬜ future | |
 | 11 — Terminal | ⬜ planned | |
@@ -1387,11 +1387,46 @@ happened:
 > flags, tool results) is stored as `RwSignal`s — the established pattern
 > (see AGENTS.md "ToolCall fields must be signals").
 
-### Phase 8: Edit/delete overlays  ⬜ planned
+### Phase 8: Edit/delete overlays  ✅ done
 - Add `ClientMessage` variants for edit/delete requests.
 - Server handler: append `Edited`/`Deleted` events (deletes emit both halves
   of a tool pair).
 - UI: edit affordance on messages; delete button; range selection (future).
+
+> **As built:** `ClientMessage::Edit { target, replacement }` and
+> `ClientMessage::Delete { target }` added to `goop-shared`.  `Session::edit`
+> appends an `Edited` overlay; `Session::delete` appends `Deleted` and, if the
+> target is one half of a tool pair, resolves the matching id via the log and
+> emits a second `Deleted` for the other half (so the agent never sees an
+> orphaned call or result).
+>
+> **Replay** — `Edited`/`Deleted` were previously ignored (fell through to
+> `Replay::feed`'s catch-all).  They are now top-level arms in `replay_visible`.
+> Tool call/result targets are resolved to their tool-call `id` via the log
+> (replay merges consecutive calls/results, losing individual seqs) and
+> spliced out of merged messages at content granularity — the same rebuild
+> pattern as `apply_tool_summary` / `drop_orphaned_tool_pairs`.  Text targets
+> (UserPrompt, AssistantText, Compacted, ToolSummarized) replace the whole
+> `VisibleItem`; editing assistant text preserves any tool calls in the same
+> merged message.  The `drop_orphaned_tool_pairs` safety net catches any edge
+> case (e.g. a single `Deleted` for one half of a pair).  8 replay tests
+> added: delete user prompt, delete tool pair (both halves), delete one of
+> merged parallel calls (orphan net drops the result), edit user prompt, edit
+> assistant text keeping calls, edit tool result, delete missing target
+> (no-op), edit-then-delete (delete wins).
+>
+> **Web UI** — hover-revealed ✎ (edit) and ✕ (delete) action buttons on
+> `UserPrompt`, `AssistantFinal`, and `ToolCall` (tool calls get delete only).
+> Actions are hidden while the LLM is running or the message is deleted.
+> Clicking ✎ swaps the display for an inline `<textarea>` (pre-filled with
+> the current text, auto-resizing, cursor at end); Save sends
+> `ClientMessage::Edit`, Cancel reverts.  The server echoes the `Edited`
+> event back, setting the existing `EditOverlay` signal (✎ edited/original
+> toggle badge).  Deleting sends `ClientMessage::Delete`; the `Deleted` event
+> comes back and sets the `deleted` flag (faded strikethrough).  Both display
+> and edit views are always in the DOM, toggled via `class:hidden` — this
+> avoids the Leptos `FnOnce`-in-`Fn` trap (event-handler closures are moved
+> directly into `on:click`, not inside a `move ||` that runs many times).
 
 ### Phase 9: Forking (future)  ⬜ future
 - Add `active_tip` to `<name>.state.toml`.

@@ -555,6 +555,114 @@ main {
   font-size: 12.5px;
 }
 
+/* ── message action buttons (edit / delete) ──────────────────── */
+
+/* Utility: elements with class `hidden` are removed from the layout.
+   Used to toggle between display and inline-edit views without
+   conditional rendering (which would move FnOnce closures into Fn). */
+.hidden {
+  display: none !important;
+}
+
+.msg-actions {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  display: flex;
+  gap: 1px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 1;
+}
+.msg:hover .msg-actions,
+.msg.editing .msg-actions {
+  opacity: 1;
+}
+.msg-action {
+  background: none;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 4px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.msg-action:hover {
+  background: var(--surface2);
+  color: var(--fg);
+}
+.msg-action.delete:hover {
+  color: var(--red);
+}
+/* On touch devices there's no hover — keep actions faintly visible. */
+@media (hover: none) {
+  .msg-actions {
+    opacity: 0.5;
+  }
+}
+
+/* ── inline edit mode ────────────────────────────── */
+
+.msg.editing {
+  padding: 8px;
+}
+.msg-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.msg-edit-area {
+  width: 100%;
+  min-height: 38px;
+  max-height: 200px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  resize: none;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.msg-edit-area:focus {
+  border-color: var(--cyan);
+}
+.msg-edit-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.msg-edit-btn {
+  padding: 3px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg);
+  transition:
+    background 0.15s,
+    opacity 0.15s;
+}
+.msg-edit-btn.save {
+  background: var(--blue-dim);
+  color: #fff;
+  border-color: transparent;
+}
+.msg-edit-btn.save:hover {
+  opacity: 0.85;
+}
+.msg-edit-btn.cancel:hover {
+  background: var(--surface2);
+}
+
 /* ── rendered markdown ────────────────────────── */
 
 .msg.assistant.rendered {
