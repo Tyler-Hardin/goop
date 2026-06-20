@@ -542,9 +542,12 @@ impl AppState {
     }
 
     /// Whether message at `idx` is inside the current selection range.
+    ///
+    /// Uses tracked `.get()` so reactive callers (e.g. `class:selected`
+    /// closures) re-evaluate when the selection changes.
     pub fn is_in_selection(&self, idx: usize) -> bool {
-        let start = self.selection_start.get_untracked();
-        let end = self.selection_end.get_untracked();
+        let start = self.selection_start.get();
+        let end = self.selection_end.get();
         match (start, end) {
             (Some(s), Some(e)) => idx >= s && idx <= e,
             (Some(s), None) => idx == s,
@@ -553,9 +556,12 @@ impl AppState {
     }
 
     /// Number of messages in the selection range (0 if no selection).
+    ///
+    /// Uses tracked `.get()` so the `SelectBar`'s derived count signal
+    /// re-evaluates when the selection changes.
     pub fn selection_count(&self) -> usize {
-        let start = self.selection_start.get_untracked();
-        let end = self.selection_end.get_untracked();
+        let start = self.selection_start.get();
+        let end = self.selection_end.get();
         match (start, end) {
             (Some(s), Some(e)) => e - s + 1,
             (Some(_), None) => 1,
