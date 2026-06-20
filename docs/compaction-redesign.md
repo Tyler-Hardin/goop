@@ -21,7 +21,7 @@
 | 9 — Forking | ✅ done | |
 | 10 — Manual range compaction | ⬜ future | |
 | 11 — Terminal | ✅ done | `Compacted`/`ToolSummarized` inline notices; `TurnEnded` reasons (incl. cancel-repopulate); fork `Reset` notice; `Edited`/`Deleted` inline notices. History replay handles new event types via `ServerMessage::Entry`. See "As built" below. |
-| 12 — Tests & migration | ✅ mostly | 35 tests in `src/memory/` (replay projection + `TransactionLog` migration/serde/fork). Remaining: mock-LLM summarizer tests, end-to-end compaction integration test. See "As built" below. |
+| 12 — Tests & migration | ✅ mostly | 45 tests in `src/memory/` (25 replay + 10 `TransactionLog` + 10 compaction decision logic). Compaction decisions extracted to `memory/compaction.rs` for testability without a mock LLM. Remaining: end-to-end integration test (needs mock `AnyAgent`). See "As built" below. |
 
 ---
 
@@ -1517,7 +1517,8 @@ happened:
 ### Phase 12: Tests & migration  ✅ mostly
 
 - ✅ Unit tests for log replay → agent-visible messages (all overlay types).
-- ⬜ Unit tests for compaction (mock LLM, like goose's `MockProvider`).
+- ✅ Unit tests for compaction decision logic (threshold, covers, candidate
+  selection, revalidation — without a mock LLM).
 - ✅ Unit tests for overlapping/nested compaction (`covers` includes prior
   summaries).
 - ✅ Unit tests for edit/delete (last-wins, orphan safety net).
@@ -1559,20 +1560,32 @@ happened:
 > (`FinalResponse`/`Error`/`Cancelled` → `TurnEnded`) and un-id'd tool calls
 > (order-paired synthetic ids); `LogEntry` serde round-trip.
 >
+> The **compaction decision logic** (`compaction.rs`) has 10 tests.  The pure
+> decision functions were extracted from `session.rs`'s `maybe_compact` and
+> `maybe_summarize_tool_pairs` — the LLM call and event emission stay in
+> `session.rs` as thin glue, while the testable logic lives in `memory/compaction.rs`:
+>
+> - **`compaction_covers`:** returns `None` when under threshold, `None` when
+>   < 2 items, returns all item seqs (including non-contiguous ones from
+>   forks/legacy) when over threshold.
+> - **`select_tool_summary_candidates`:** returns empty when disabled; empty
+>   when below the trigger threshold; **protects the most-recent turn's** tool
+>   calls (only earlier turns are candidates); **filters by `min_tokens`**
+>   (short results skipped, verbose ones kept); **truncates to the batch cap**
+>   (oldest-first when more candidates than the limit).
+> - **`revalidate_tool_summaries`:** keeps summaries whose tool-call id is
+>   still agent-visible; **drops summaries whose pair vanished** between
+>   snapshot and commit (e.g. swept by a `Compacted`).
+>
 > **Still pending:**
 >
-> - **Mock-LLM summarizer tests.** The *summarizer* logic itself —
->   `maybe_compact` / `maybe_summarize_tool_pairs` in `session.rs` — has no
->   unit tests.  `session.rs` has no test module at all.  Testing it requires
->   a mock `AnyAgent` whose `summarize()` returns canned text, so the
->   snapshot → summarize → revalidate → commit lifecycle (and the
->   "protect the most-recent turn" / "skip vanished pairs" guards from
->   Phase 5) can be exercised without a real provider.  No such mock exists
->   yet — `AnyAgent` wraps rig's concrete provider types, and rig has no
->   built-in test provider.
 > - **End-to-end compaction integration test.** The replay tests cover the
 >   projection in isolation (given a log with a `Compacted` event, replay
->   produces the right messages).  Nothing yet asserts the *full* path —
->   a session that actually exceeds its budget, calls the LLM, appends a
->   `Compacted`, and continues with the LLM seeing the summary on the next
->   turn.  This depends on the same mock-LLM prerequisite.
+>   produces the right messages), and the compaction tests cover the decision
+>   logic in isolation (given agent-visible items, the right candidates/covers
+>   are selected).  Nothing yet asserts the *full* path — a session that
+>   actually exceeds its budget, calls the LLM, appends a `Compacted`, and
+>   continues with the LLM seeing the summary on the next turn.  This requires
+>   a mock `AnyAgent` whose `summarize()` returns canned text; `AnyAgent`
+>   wraps rig's concrete provider types (no built-in test provider), so a mock
+>   would need either a new enum variant or a trait abstraction.

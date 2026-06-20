@@ -264,7 +264,7 @@ The web UI shows a session sidebar for switching between sessions.
   with no `id`) are migrated on load (in `transaction_log.rs`) — turn-end
   variants map to `TurnEnded` and tool calls/results get order-paired
   synthetic ids.
-- **Compaction** (`src/memory/mod.rs` + `src/session.rs`) — when the
+- **Compaction** (`src/memory/compaction.rs` + `src/session.rs`) — when the
   agent-visible conversation exceeds a token threshold, the whole prefix
   is summarized into a rolling `Compacted { summary, model, covers,
   manual }` event before the next turn. Replay applies it: the covered
@@ -276,15 +276,23 @@ The web UI shows a session sidebar for switching between sessions.
   Env: `GOOP_COMPACTION`. Summarization is a one-shot, tool-less,
   memory-less completion (`AnyAgent::summarize`) with an embedded system
   prompt. A failed summarization is logged and skipped (full history kept).
-- **Tool-pair summarization** (`src/session.rs` + `src/memory/replay.rs`) —
-  tier-1 compaction: verbose individual tool call+result pairs are summarized
-  by an LLM into `ToolSummarized { id, summary, model }` events, reclaiming
-  tokens incrementally without a full context rewrite. `maybe_summarize_tool_pairs()`
-  runs between prompts in `drain_queue` (alongside `maybe_compact`), using a
-  snapshot → summarize (outside lock) → revalidate → commit lifecycle.
-  Replay applies `ToolSummarized` via `apply_tool_summary()` — content-granularity
-  surgery that splices the target call/result out of merged messages (reusing
-  the `drop_orphaned_tool_pairs` rebuild pattern), since replay merges
+  The pure decision logic (`compaction_covers`) is in `memory/compaction.rs`
+  and unit-tested; `session.rs`'s `maybe_compact` is thin glue (snapshot →
+  decide → LLM call → emit).
+- **Tool-pair summarization** (`src/memory/compaction.rs` + `src/session.rs`
+  + `src/memory/replay.rs`) — tier-1 compaction: verbose individual tool
+  call+result pairs are summarized by an LLM into `ToolSummarized { id,
+  summary, model }` events, reclaiming tokens incrementally without a full
+  context rewrite. `maybe_summarize_tool_pairs()` runs between prompts in
+  `drain_queue` (alongside `maybe_compact`), using a snapshot → summarize
+  (outside lock) → revalidate → commit lifecycle. The pure decision logic
+  (`select_tool_summary_candidates` — trigger check, most-recent-turn
+  protection, min-tokens filter, batch truncation; `revalidate_tool_summaries`
+  — drop vanished pairs) is in `memory/compaction.rs` and unit-tested;
+  `session.rs` is thin glue around the LLM calls. Replay applies
+  `ToolSummarized` via `apply_tool_summary()` — content-granularity surgery
+  that splices the target call/result out of merged messages (reusing the
+  `drop_orphaned_tool_pairs` rebuild pattern), since replay merges
   consecutive calls into one assistant `VisibleItem` and consecutive results
   into one user `VisibleItem`. Targets by tool-call `id` (stable across
   merging), not `seq`. Config: `[tool_summarization]` in config.toml
