@@ -231,6 +231,37 @@ pub fn MessageLog() -> impl IntoView {
                     let seq = msg.agent_seq();
                     let st_cls = st.clone();
                     let st_sel = st.clone();
+
+                    // Always-render the checkbox for agent-visible messages.
+                    // Visibility is CSS-controlled (display:none unless
+                    // .msg-select-wrap has .select-mode), so no <Show> is
+                    // needed — and <Show> with get_untracked() would never
+                    // re-evaluate when select_mode changes (the bug this
+                    // fixes).  Non-agent-visible messages (seq == None) get
+                    // no checkbox at all.
+                    let checkbox = seq.map(|s| {
+                        let st_click = st.clone();
+                        let st_text = st.clone();
+                        view! {
+                            <div
+                                class="msg-check"
+                                on:click=move |evt| {
+                                    evt.stop_propagation();
+                                    st_click.toggle_select(s);
+                                }
+                            >
+                                {move || {
+                                    if st_text.selected_seqs.get().contains(&s) {
+                                        "✓"
+                                    } else {
+                                        ""
+                                    }
+                                }}
+                            </div>
+                        }
+                            .into_any()
+                    });
+
                     view! {
                         <div
                             class="msg-select-wrap"
@@ -241,25 +272,7 @@ pub fn MessageLog() -> impl IntoView {
                                     && st_sel.selected_seqs.get().contains(&seq.unwrap())
                             }
                         >
-                            <Show when=move || st.select_mode.get_untracked() && seq.is_some()>
-                                {let st = st.clone(); let s = seq.unwrap(); view! {
-                                    <div
-                                        class="msg-check"
-                                        on:click=move |evt| {
-                                            evt.stop_propagation();
-                                            st.toggle_select(s);
-                                        }
-                                    >
-                                        {move || {
-                                            if st.selected_seqs.get().contains(&s) {
-                                                "✓"
-                                            } else {
-                                                ""
-                                            }
-                                        }}
-                                    </div>
-                                }.into_any()}
-                            </Show>
+                            {checkbox}
                             <Message msg />
                         </div>
                     }
