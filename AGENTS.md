@@ -240,7 +240,11 @@ The web UI shows a session sidebar for switching between sessions.
   write.  Keeping `next_seq` inside the struct (not a separate `AtomicU64`
   on `Session`) makes the ordering invariant (seq == parent == file order)
   structural, so a future background appender (tool-pair summarizer) can't
-  corrupt the tree by racing the lock.
+  corrupt the tree by racing the lock.  The system prompt (preamble) is
+  stored as a `SystemPrompt` event: `ensure_system_prompt()` injects it for
+  new/legacy sessions (no-op if already present), `system_prompt()` reads
+  it.  On resume the stored value is authoritative — the preamble is NOT
+  rebuilt, so the log is a complete audit trail of what the LLM saw.
 - **LogReplayMemory** (`src/memory/mod.rs`) — implements rig's
   `ConversationMemory` trait by **replaying the session's append-only
   transaction log** into `Vec<Message>` (the agent view). The events log
@@ -314,6 +318,17 @@ The web UI shows a session sidebar for switching between sessions.
 - **Context snapshots** (`src/session.rs`) — before each turn the session
   emits `ContextSnapshot { seqs, model }`, recording which events formed
   the LLM's context. Replay skips it (audit-only metadata).
+- **System prompt** (`src/preamble.rs` + `src/session.rs` +
+  `src/memory/transaction_log.rs`) — the preamble (system prompt) is built
+  once via `build_preamble()` for new sessions, stored as a `SystemPrompt`
+  event in the transaction log, and baked into the agent at build time.
+  On resume the log's stored value is authoritative — the preamble is NOT
+  rebuilt, so edits to USER.md / AGENTS.md only take effect on new sessions.
+  This makes the log a complete audit trail of what the LLM saw.  The web
+  UI's LLM view (👁) renders the stored preamble in a collapsible panel
+  above the message log.  `SystemPrompt` is metadata — skipped during
+  agent-memory replay (it's already in the agent's preamble, not the
+  conversation messages).
 
 ## Startup modes
 
@@ -447,7 +462,10 @@ directly to pass the configurable `ollama_base_url` (from `Config` or
 - **Creation:** `SessionManager::create(name)` → `Session::new(256, Some(name))`.
   The session loads events, messages, and state (config overrides + CWD +
   transport) from disk if files exist.  Session config overrides are merged
-  into the global config before building the agent.
+  into the global config before building the agent.  The system prompt
+  (preamble) is taken from the transaction log if present (resume) or built
+  via `build_preamble()` and injected (new session) — see **System prompt**
+  in the Architecture section.
 - **Discovery:** On server start, `SessionManager::discover()` scans
   `~/.config/goop/sessions/` for `*.jsonl` and `*.state.toml` files,
   extracts session names, and calls `get_or_create` for each **except**

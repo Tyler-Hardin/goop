@@ -29,6 +29,9 @@ pub fn connect(state: &AppState, session_name: String) {
     // Clear the context-usage bar so the previous session's value
     // doesn't linger until history replay completes.
     state.context_usage.set(None);
+    // Clear the system prompt so the previous session's preamble doesn't
+    // linger until history replay delivers the new one.
+    state.system_prompt.set(None);
 
     let w = web_sys::window().expect("no global window");
     let host = w

@@ -8,6 +8,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::Closure;
 
 use crate::components::message::Message;
+use crate::markdown::render_markdown;
 use crate::state::{AppState, UiMessage};
 
 /// Scrollable message list.
@@ -217,6 +218,19 @@ pub fn MessageLog() -> impl IntoView {
     let select_mode = state.select_mode;
     let llm_view = state.llm_view;
 
+    // System prompt (preamble) — shown only in LLM view.  Collapsed by
+    // default (the preamble can be very long — it includes AGENTS.md).
+    let system_prompt = state.system_prompt;
+    let sp_expanded = RwSignal::new(false);
+    let sp_html = RwSignal::new(String::new());
+    Effect::new(move || {
+        if let Some(text) = system_prompt.get() {
+            sp_html.set(render_markdown(&text));
+        } else {
+            sp_html.set(String::new());
+        }
+    });
+
     view! {
         <main
             id="log"
@@ -225,6 +239,22 @@ pub fn MessageLog() -> impl IntoView {
             class:select-mode=move || select_mode.get()
             class:llm-view=move || llm_view.get()
         >
+            // System prompt — metadata, not a conversation message.  Rendered
+            // above the <For> so it doesn't interfere with compaction
+            // targeting, selection indices, or <For> keying.  Visible only in
+            // LLM view when a preamble is present.
+            <div
+                class="msg system-prompt"
+                class:hidden=move || !llm_view.get() || system_prompt.get().is_none()
+            >
+                <div class="system-prompt-header" on:click=move |_| sp_expanded.update(|v| *v = !*v)>
+                    <span class="arrow" class:open=move || sp_expanded.get()>"▸"</span>
+                    <span class="system-prompt-label">"⚙ System Prompt"</span>
+                </div>
+                <div class="system-prompt-body" class:hidden=move || !sp_expanded.get()>
+                    <div class="rendered-inner" inner_html=move || sp_html.get()></div>
+                </div>
+            </div>
             // Messages from state, rendered with stable keys via <For>.
             // Each message has a unique `id` — Leptos tracks items by key,
             // so adding a new message only inserts one DOM node instead of

@@ -684,7 +684,9 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             }
 
             // ── metadata events (audit only, no terminal rendering) ──
-            SessionEvent::ContextSnapshot { .. } | SessionEvent::ModelChanged { .. } => {}
+            SessionEvent::ContextSnapshot { .. }
+            | SessionEvent::ModelChanged { .. }
+            | SessionEvent::SystemPrompt { .. } => {}
 
             SessionEvent::HistoryComplete => {
                 // Web-only sentinel marking end of history replay.

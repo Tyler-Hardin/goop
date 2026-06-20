@@ -163,6 +163,10 @@ fn replay_branch(branch: &[LogEntry]) -> Vec<VisibleItem> {
                 apply_delete(&mut visible, branch, *target);
             }
 
+            // `SystemPrompt` is session metadata, not conversation.  It falls
+            // through to `replay.feed` → `_ => {}`, so it's correctly excluded
+            // from the agent-visible message list (the preamble is already
+            // baked into the agent, not part of the message history).
             _ => replay.feed(entry),
         }
     }
@@ -2066,5 +2070,40 @@ mod tests {
         assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("a1"));
         assert_eq!(user_text(&msgs[2]).as_deref(), Some("p2'"));
         assert_eq!(assistant_text(&msgs[3]).as_deref(), Some("a2'"));
+    }
+
+    /// A `SystemPrompt` event is metadata — it must not produce an
+    /// agent-visible message during replay (the preamble is already baked
+    /// into the agent, not part of the conversation).
+    #[test]
+    fn replay_skips_system_prompt() {
+        let log = vec![
+            entry(0, SessionEvent::SessionInfo { name: "s".into() }),
+            entry(
+                1,
+                SessionEvent::SystemPrompt {
+                    content: "You are a helpful assistant.".into(),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::UserPrompt {
+                    content: "hi".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(3, SessionEvent::AssistantText("hello".into())),
+            entry(
+                4,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ];
+        let msgs = replay_log(&log, None);
+        // Only the user prompt + assistant text — no system prompt message.
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[0], Message::User { .. }));
+        assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("hello"));
     }
 }

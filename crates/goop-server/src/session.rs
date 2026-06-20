@@ -261,11 +261,6 @@ impl Session {
             }
         };
 
-        let preamble = build_preamble(
-            &initial_cwd_for_preamble.display().to_string(),
-            &config.home_dir,
-        );
-
         // ── MCP servers ────────────────────────────────────────
         // Resolve which servers to enable: global ∪ session overrides.
         let session_names = crate::mcp::resolve(config, persisted.config.mcp_server_names());
@@ -306,6 +301,26 @@ impl Session {
         if let Some(info) = log.entries().first() {
             let _ = tx.send(ServerMessage::Entry(info.clone()));
         }
+
+        // ── system prompt (preamble) ────────────────────────────────
+        // The log is the source of truth.  For a new/legacy session the
+        // preamble is built from the template + env context and injected; for
+        // a resumed session the stored value is authoritative (the preamble is
+        // NOT rebuilt — the log records exactly what the agent saw).
+        let preamble = match log.system_prompt() {
+            Some(stored) => {
+                tracing::debug!("session {name}: using stored system prompt");
+                stored
+            }
+            None => {
+                let built = build_preamble(
+                    &initial_cwd_for_preamble.display().to_string(),
+                    &config.home_dir,
+                );
+                log.ensure_system_prompt(&built).await;
+                built
+            }
+        };
 
         // ── shared transaction log: the source of truth for agent memory ──
         // The same `Arc` is handed to the `LogReplayMemory` below, so every

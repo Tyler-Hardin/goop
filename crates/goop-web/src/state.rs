@@ -328,6 +328,11 @@ pub struct AppState {
     /// deleted messages hidden, tool summaries flattened.  Toggled by the
     /// 👁 button in the header.
     pub llm_view: RwSignal<bool>,
+
+    /// The session's system prompt (preamble), extracted from the
+    /// `SystemPrompt` event in the transaction log.  `None` until history
+    /// replay delivers it.  Shown in LLM view above the message log.
+    pub system_prompt: RwSignal<Option<String>>,
 }
 
 /// Result of pre-forming buffered history entries into UI state.
@@ -338,6 +343,7 @@ struct BuildResult {
     turn_state: TurnState,
     next_id: usize,
     context_usage: Option<(usize, usize)>,
+    system_prompt: Option<String>,
 }
 
 impl AppState {
@@ -368,6 +374,7 @@ impl AppState {
             selection_start: RwSignal::new(None),
             selection_end: RwSignal::new(None),
             llm_view: RwSignal::new(false),
+            system_prompt: RwSignal::new(None),
         }
     }
 
@@ -712,6 +719,7 @@ impl AppState {
                 self.streaming_seq.set(None);
                 self.turn_state.set(TurnState::Idle);
                 self.context_usage.set(None);
+                self.system_prompt.set(None);
                 self.connection.set(ConnectionState::CatchingUp);
                 self.exit_select_mode();
             }
@@ -739,6 +747,7 @@ impl AppState {
                 self.streaming_text.set(String::new());
                 self.messages.set(result.messages);
                 self.context_usage.set(result.context_usage);
+                self.system_prompt.set(result.system_prompt);
 
                 // Session is now loaded — refresh the sidebar.
                 log::info!("HistoryComplete — refreshing session list");
@@ -782,12 +791,16 @@ impl AppState {
         let mut next_id = start_id;
         let mut turn = TurnState::Idle;
         let mut context_usage: Option<(usize, usize)> = None;
+        let mut system_prompt: Option<String> = None;
 
         for entry in entries {
             let event_seq = entry.seq;
             match &entry.event {
                 SessionEvent::SessionInfo { name } => {
                     session_name = Some(name.clone());
+                }
+                SessionEvent::SystemPrompt { content } => {
+                    system_prompt = Some(content.clone());
                 }
                 SessionEvent::UserPrompt { content, .. } => {
                     running = true;
@@ -976,6 +989,7 @@ impl AppState {
             turn_state: turn,
             next_id,
             context_usage,
+            system_prompt,
         }
     }
 
@@ -1018,6 +1032,9 @@ impl AppState {
         match entry.event {
             SessionEvent::SessionInfo { name } => {
                 self.current_session.set(Some(name));
+            }
+            SessionEvent::SystemPrompt { content } => {
+                self.system_prompt.set(Some(content));
             }
             SessionEvent::UserPrompt { content, .. } => {
                 self.btn_state.set(BtnState::Running);

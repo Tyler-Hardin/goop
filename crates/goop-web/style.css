@@ -770,6 +770,54 @@ main.select-mode .msg-select-overlay {
   margin-bottom: 4px;
 }
 
+/* ── system prompt (LLM view only) ─────────────────── */
+
+/*
+   Shown above the message log in LLM view.  Collapsed by default — the
+   preamble can be very long (it includes AGENTS.md).  Click the header to
+   expand/collapse the rendered markdown.
+*/
+.msg.system-prompt {
+  align-self: stretch;
+  margin-bottom: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.system-prompt-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.system-prompt-header .arrow {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  color: var(--dim2);
+  font-size: 11px;
+}
+.system-prompt-header .arrow.open {
+  transform: rotate(90deg);
+}
+.system-prompt-label {
+  font-size: 11px;
+  color: var(--dim2);
+  font-family: var(--mono);
+}
+.system-prompt-body {
+  padding: 0 14px 12px;
+  border-top: 1px solid var(--border);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.system-prompt-body .rendered-inner {
+  font-size: 13px;
+  color: var(--dim);
+}
+
 /* ── select bar (replaces input bar in select mode) ──────────── */
 
 .select-bar {

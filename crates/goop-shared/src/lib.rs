@@ -90,6 +90,16 @@ pub enum SessionEvent {
     /// session name for copy/paste at exit.
     SessionInfo { name: String },
 
+    /// The system prompt (preamble) the agent received at session creation.
+    /// Appended to the log once (for new sessions) and persisted; on resume
+    /// the stored value is authoritative — the preamble is NOT rebuilt.
+    ///
+    /// This is metadata: skipped during agent-memory replay (the preamble is
+    /// already baked into the agent, not part of the conversation messages),
+    /// but recorded in the log so it is a complete audit trail of what the
+    /// LLM saw. The web UI's LLM view (👁) renders it above the message log.
+    SystemPrompt { content: String },
+
     /// The session is currently processing a prompt (true) or idle (false).
     /// Sent to late-joining clients after history replay so they know
     /// whether to show a Cancel button.  Not persisted to disk.

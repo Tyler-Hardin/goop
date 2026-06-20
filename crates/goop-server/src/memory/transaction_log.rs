@@ -139,6 +139,34 @@ impl TransactionLog {
             .or_else(|| self.entries.last().map(|e| e.seq))
     }
 
+    /// Return the stored system prompt (preamble), if any.  Walks the entries
+    /// in reverse so a future "preamble changed mid-session" feature (appending
+    /// a second `SystemPrompt`) would naturally return the latest one.
+    pub(crate) fn system_prompt(&self) -> Option<String> {
+        self.entries.iter().rev().find_map(|e| match &e.event {
+            SessionEvent::SystemPrompt { content } => Some(content.clone()),
+            _ => None,
+        })
+    }
+
+    /// Inject a `SystemPrompt` event if the log doesn't already have one.
+    ///
+    /// For a brand-new session this appends the preamble right after the
+    /// `SessionInfo` root (the first real entry on the branch).  For a resumed
+    /// session that already has a `SystemPrompt`, this is a no-op — the stored
+    /// value is authoritative.
+    ///
+    /// Mirrors [`ensure_session_info`](Self::ensure_session_info) in pattern.
+    pub(crate) async fn ensure_system_prompt(&mut self, preamble: &str) {
+        if self.system_prompt().is_some() {
+            return;
+        }
+        self.append(SessionEvent::SystemPrompt {
+            content: preamble.to_owned(),
+        })
+        .await;
+    }
+
     /// Move the active tip to `tip` (a fork point).  The next [`append`](Self::append)
     /// branches from `tip` instead of the current tip.  `tip` must be the seq
     /// of an existing entry.
@@ -682,5 +710,98 @@ mod tests {
             } => assert_eq!(p, "hey"),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    /// `ensure_system_prompt` injects a `SystemPrompt` event into a new log.
+    #[tokio::test]
+    async fn ensure_system_prompt_injects_for_new_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+        let mut log = TransactionLog::open_at(path.clone(), "s").await.unwrap();
+        // After open: only the SessionInfo root.
+        assert_eq!(log.entries().len(), 1);
+        assert!(log.system_prompt().is_none());
+
+        log.ensure_system_prompt("You are a helpful assistant.")
+            .await;
+
+        // SessionInfo + SystemPrompt.
+        assert_eq!(log.entries().len(), 2);
+        assert_eq!(
+            log.system_prompt().as_deref(),
+            Some("You are a helpful assistant.")
+        );
+        // The SystemPrompt is the second entry, parent = SessionInfo.
+        assert_eq!(log.entries()[1].seq, 1);
+        assert_eq!(log.entries()[1].parent, Some(0));
+        assert!(matches!(
+            &log.entries()[1].event,
+            SessionEvent::SystemPrompt { content } if content == "You are a helpful assistant."
+        ));
+
+        // Persisted to disk.
+        let (entries, _) = load_from_file(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[1].event,
+            SessionEvent::SystemPrompt { content } if content == "You are a helpful assistant."
+        ));
+    }
+
+    /// `ensure_system_prompt` is a no-op for a log that already has one.
+    #[tokio::test]
+    async fn ensure_system_prompt_noop_if_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+        let mut log = TransactionLog::open_at(path, "s").await.unwrap();
+        log.ensure_system_prompt("original preamble").await;
+        assert_eq!(log.entries().len(), 2);
+
+        // Second call should NOT inject a duplicate.
+        log.ensure_system_prompt("replacement preamble").await;
+        assert_eq!(log.entries().len(), 2);
+        // The stored value is unchanged.
+        assert_eq!(log.system_prompt().as_deref(), Some("original preamble"));
+    }
+
+    /// A resumed session that has a `SystemPrompt` in its log file loads it,
+    /// and `system_prompt()` returns the stored value.
+    #[tokio::test]
+    async fn resumed_session_loads_stored_system_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+        // Write a log with SessionInfo + SystemPrompt + a user prompt.
+        let lines = [
+            serde_json::to_string(&LogEntry {
+                seq: 0,
+                parent: None,
+                ts: Utc::now(),
+                event: SessionEvent::SessionInfo { name: "s".into() },
+            })
+            .unwrap(),
+            serde_json::to_string(&LogEntry {
+                seq: 1,
+                parent: Some(0),
+                ts: Utc::now(),
+                event: SessionEvent::SystemPrompt {
+                    content: "stored preamble".into(),
+                },
+            })
+            .unwrap(),
+            serde_json::to_string(&LogEntry {
+                seq: 2,
+                parent: Some(1),
+                ts: Utc::now(),
+                event: SessionEvent::UserPrompt {
+                    content: "hi".into(),
+                    source: PromptSource::Terminal,
+                },
+            })
+            .unwrap(),
+        ];
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let log = TransactionLog::open_at(path, "s").await.unwrap();
+        assert_eq!(log.system_prompt().as_deref(), Some("stored preamble"));
     }
 }
