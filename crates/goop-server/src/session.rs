@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -649,18 +648,11 @@ impl Session {
             return;
         };
         let items = self.memory.agent_visible_items().await;
-        if items.len() < 2 {
-            return;
-        }
         let messages: Vec<Message> = items.iter().map(|i| i.msg.clone()).collect();
         let tokens = self.memory.count_tokens(&messages);
-        if tokens < threshold {
+        let Some(covers) = memory::compaction_covers(&items, threshold, tokens) else {
             return;
-        }
-
-        // Cover every agent-visible item; the current (in-progress) prompt is
-        // not among them and is preserved by rig appending it itself.
-        let covers: Vec<u64> = items.iter().map(|i| i.seq).collect();
+        };
         tracing::info!(
             "compacting {} agent-visible items (~{} tokens >= threshold {threshold})",
             items.len(),
@@ -698,56 +690,18 @@ impl Session {
     /// No-op when tool-pair summarization is disabled, the tool-call count
     /// is below the trigger, or there are no qualifying candidate pairs.
     async fn maybe_summarize_tool_pairs(&self) {
-        let ts_config = &self.tool_summarization;
-        if !ts_config.enabled {
+        if !self.tool_summarization.enabled {
             return;
         }
 
-        let trigger = ts_config
-            .trigger_tool_count
-            .unwrap_or(DEFAULT_TOOL_SUMMARY_TRIGGER);
-        let min_tokens = ts_config
-            .min_tokens
-            .unwrap_or(DEFAULT_TOOL_SUMMARY_MIN_TOKENS);
-
-        // ── 1. Snapshot candidates (under the log lock) ──
-        let candidates: Vec<(String, Message, Message)>;
-        {
-            let items = self.memory.agent_visible_items().await;
-
-            // Check trigger: not enough tool calls to bother.
-            let tool_call_count = memory::count_tool_calls(&items);
-            if tool_call_count < trigger {
-                return;
-            }
-
-            // Protect the most-recent turn's tool calls — the LLM may still
-            // reference them in a follow-up.
-            let protect_from = memory::last_prompt_boundary(&items);
-            let candidate_ids = memory::tool_call_ids(&items, protect_from);
-
-            // Select pairs whose combined token count exceeds `min_tokens`.
-            let mut candidates_vec = Vec::new();
-            for id in &candidate_ids {
-                if let Some((call_msg, result_msg)) = memory::extract_tool_pair_messages(&items, id)
-                {
-                    let tokens = self
-                        .memory
-                        .count_tokens(&[call_msg.clone(), result_msg.clone()]);
-                    if tokens >= min_tokens {
-                        candidates_vec.push((id.clone(), call_msg, result_msg));
-                    }
-                }
-            }
-
-            // Summarize the oldest batch (bounds latency/cost before next turn).
-            if candidates_vec.len() > DEFAULT_TOOL_SUMMARY_BATCH {
-                candidates_vec.truncate(DEFAULT_TOOL_SUMMARY_BATCH);
-            }
-            candidates = candidates_vec;
-        }
-        // Log lock dropped — the LLM calls below don't hold it.
-
+        // ── 1. Snapshot candidates ──
+        // `agent_visible_items` returns an owned snapshot (the log lock is
+        // released on return), so the pure selection logic runs lock-free.
+        let items = self.memory.agent_visible_items().await;
+        let candidates =
+            memory::select_tool_summary_candidates(&items, &self.tool_summarization, |m| {
+                self.memory.count_tokens(m)
+            });
         if candidates.is_empty() {
             return;
         }
@@ -757,17 +711,17 @@ impl Session {
             self.tool_summarizer.as_deref().unwrap_or(&self.agent);
 
         let mut summaries: Vec<(String, String)> = Vec::new();
-        for (id, call_msg, result_msg) in &candidates {
+        for c in &candidates {
             match summarizer
                 .summarize(
-                    vec![call_msg.clone(), result_msg.clone()],
+                    vec![c.call_msg.clone(), c.result_msg.clone()],
                     TOOL_PAIR_SYSTEM_PROMPT,
                 )
                 .await
             {
-                Ok(summary) => summaries.push((id.clone(), summary)),
+                Ok(summary) => summaries.push((c.id.clone(), summary)),
                 Err(e) => {
-                    tracing::warn!("tool-pair summarization failed for {id}: {e:#}");
+                    tracing::warn!("tool-pair summarization failed for {}: {e:#}", c.id);
                 }
             }
         }
@@ -776,31 +730,13 @@ impl Session {
             return;
         }
 
-        // ── 3. Commit (under the log lock, with re-validation) ──
-        // Re-validate: the conversation hasn't changed (drain_queue is
-        // serial), but defence in depth for future concurrency.
+        // ── 3. Commit (with re-validation) ──
+        // Re-acquire the snapshot and confirm each id is still agent-visible.
+        // The conversation is serial (drain_queue), but this is defence in
+        // depth for future concurrency — see §5.3 step 3.
         let items = self.memory.agent_visible_items().await;
-        let visible_ids: HashSet<&str> = items
-            .iter()
-            .flat_map(|item| {
-                let rig::completion::Message::Assistant { content, .. } = &item.msg else {
-                    return Vec::new();
-                };
-                content
-                    .iter()
-                    .filter_map(|c| match c {
-                        rig::completion::AssistantContent::ToolCall(tc) => Some(tc.id.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        for (id, summary) in &summaries {
-            if !visible_ids.contains(id.as_str()) {
-                tracing::debug!("tool-pair summary for {id} skipped — no longer visible");
-                continue;
-            }
+        let validated = memory::revalidate_tool_summaries(&items, &summaries);
+        for (id, summary) in &validated {
             self.emit(SessionEvent::ToolSummarized {
                 id: id.clone(),
                 summary: summary.clone(),
@@ -1418,15 +1354,6 @@ Drop:
 
 The summary replaces the original tool call and result, so it must stand \
 alone.  Keep it short — a few sentences at most.";
-
-/// Default tool-call count at which tool-pair summarization triggers.
-const DEFAULT_TOOL_SUMMARY_TRIGGER: usize = 15;
-
-/// Default minimum token count for a pair to be worth summarizing.
-const DEFAULT_TOOL_SUMMARY_MIN_TOKENS: usize = 2000;
-
-/// Maximum number of pairs to summarize per invocation (oldest first).
-const DEFAULT_TOOL_SUMMARY_BATCH: usize = 10;
 
 /// Resolve the compaction token threshold from the merged config.
 ///

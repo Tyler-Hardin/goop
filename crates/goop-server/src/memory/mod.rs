@@ -13,13 +13,14 @@
 //!
 //! See `docs/compaction-redesign.md` §2.4–2.5 for the full design.
 
+mod compaction;
 mod replay;
 mod transaction_log;
 
-pub(crate) use replay::{
-    VisibleItem, collect_branch, count_tool_calls, extract_tool_pair_messages,
-    last_prompt_boundary, replay_log, replay_visible, tool_call_ids,
+pub(crate) use compaction::{
+    compaction_covers, revalidate_tool_summaries, select_tool_summary_candidates,
 };
+pub(crate) use replay::{VisibleItem, collect_branch, replay_log, replay_visible};
 pub(crate) use transaction_log::TransactionLog;
 
 use std::path::PathBuf;
