@@ -16,7 +16,10 @@
 mod replay;
 mod transaction_log;
 
-pub(crate) use replay::{VisibleItem, replay_log, replay_visible};
+pub(crate) use replay::{
+    VisibleItem, count_tool_calls, extract_tool_pair_messages, last_prompt_boundary, replay_log,
+    replay_visible, tool_call_ids,
+};
 pub(crate) use transaction_log::TransactionLog;
 
 use std::path::PathBuf;

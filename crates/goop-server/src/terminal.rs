@@ -606,9 +606,19 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                     .ok();
             }
 
+            // ── tool-pair summarization ─────────────────────────────
+            // A single tool call+result pair was summarized.
+            SessionEvent::ToolSummarized { id, model, .. } => {
+                state
+                    .lock_printer()
+                    .print(format!(
+                        "{DIM}  ◇ summarized tool call {id} · {model}{RST}\n",
+                    ))
+                    .ok();
+            }
+
             // ── overlay / metadata events (not yet emitted / UI-irrelevant) ──
-            SessionEvent::ToolSummarized { .. }
-            | SessionEvent::ContextSnapshot { .. }
+            SessionEvent::ContextSnapshot { .. }
             | SessionEvent::ModelChanged { .. }
             | SessionEvent::Edited { .. }
             | SessionEvent::Deleted { .. } => {}

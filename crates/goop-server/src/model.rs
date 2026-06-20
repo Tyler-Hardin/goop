@@ -329,3 +329,78 @@ fn finish_agent<M: rig::completion::CompletionModel>(
         .memory(memory)
         .build()
 }
+
+/// Build a minimal agent (no tools, no memory) for tool-pair summarization.
+///
+/// Returns `Ok(None)` when no separate summarization model is configured —
+/// the caller should use the session's main agent in that case.
+///
+/// On error (bad model string, missing API key), the caller should log a
+/// warning and fall back to the main model.
+pub fn build_summarizer(config: &Config) -> anyhow::Result<Option<Arc<AnyAgent>>> {
+    let model_str = match &config.tool_summarization.model {
+        Some(m) => m.as_str(),
+        None => return Ok(None),
+    };
+    let model: crate::config::Model = model_str
+        .parse()
+        .map_err(|e: crate::config::ConfigError| anyhow::anyhow!("{e}"))?;
+    let provider = model.provider();
+    let model_name = model.model_name().to_string();
+
+    macro_rules! arm {
+        ($variant:ident, $new_client:expr) => {{
+            let client = $new_client;
+            AnyAgent::$variant(client.agent(&model_name).build())
+        }};
+    }
+
+    let any_agent = match provider {
+        Provider::DeepSeek => arm!(
+            DeepSeek,
+            deepseek::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::OpenAI => arm!(
+            OpenAI,
+            openai::CompletionsClient::new(
+                &config::api_key_for(provider).map_err(anyhow::Error::new)?
+            )?
+        ),
+        Provider::OpenRouter => arm!(
+            OpenRouter,
+            openrouter::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::Groq => arm!(
+            Groq,
+            groq::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::Ollama => {
+            let ollama_api_key = std::env::var("OLLAMA_API_KEY").ok();
+            arm!(
+                Ollama,
+                ollama::Client::builder()
+                    .api_key(ollama::OllamaApiKey::from(
+                        ollama_api_key.unwrap_or_default().as_str(),
+                    ))
+                    .base_url(&config.ollama_base_url)
+                    .build()?
+            )
+        }
+        Provider::Anthropic => arm!(
+            Anthropic,
+            anthropic::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::Zai => arm!(
+            Zai,
+            zai::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+    };
+
+    tracing::info!(
+        "● summarizer · {}  model · {}",
+        provider.label(),
+        model_name
+    );
+
+    Ok(Some(Arc::new(any_agent)))
+}

@@ -1,9 +1,13 @@
 # goop configuration — ~/.config/goop/config.toml
 #
 # Environment variable overrides this file:
-#   GOOP_MODEL                     — model in provider/model format (e.g. "deepseek/deepseek-v4-pro")
-#   GOOP_OLLAMA_BASE_URL           — Ollama API base URL (default: http://localhost:11434)
-#   GOOP_COMPACTION              — compaction budget (integer or "80%")
+#   GOOP_MODEL                        — model in provider/model format (e.g. "deepseek/deepseek-v4-pro")
+#   GOOP_OLLAMA_BASE_URL              — Ollama API base URL (default: http://localhost:11434)
+#   GOOP_COMPACTION                   — compaction budget (integer or "80%")
+#   GOOP_TOOL_SUMMARIZATION           — enable tool-pair summarization ("true" or "1")
+#   GOOP_TOOL_SUMMARIZATION_MODEL     — model for tool-pair summaries (provider/model format)
+#   GOOP_TOOL_SUMMARIZATION_MIN_TOKENS — min tokens for a pair to be worth summarizing
+#   GOOP_TOOL_SUMMARIZATION_TRIGGER    — tool-call count that triggers summarization
 
 # LLM model in litellm-style provider/model format.
 # Provider is the first segment before "/", model is everything after.
@@ -17,12 +21,14 @@ max_tokens = {{ max_tokens }}
 default_max_turns = {{ default_max_turns }}
 
 # ── Compaction ──────────────────────────────────────────────────────
-# When the conversation exceeds a token budget, older messages are
-# evicted and replaced with a rolling text summary (no extra LLM call).
+# When the agent-visible conversation exceeds a token budget, the entire
+# prefix is summarized by an LLM into a rolling summary before the next
+# turn.  Summaries are themselves agent-visible, so later compactions
+# summarize the prior summary.
 #
 # Accepts either:
 #   compaction = 64000     # absolute token limit
-#   compaction = "75%"      # percentage of model's context window
+#   compaction = "75%"     # percentage of model's context window
 #
 # Uncomment to enable.  Leave commented for unlimited context.
 # compaction = "75%"
@@ -34,6 +40,17 @@ enabled_tool_groups = [{% for g in groups %}"{{ g }}"{% if not loop.last %}, {% 
 # Base URL for the Ollama API.  Only used when provider is ollama.
 # Set this if Ollama runs on a nonstandard port or remote host.
 # ollama_base_url = "{{ ollama_base_url }}"
+
+# ── Tool-pair summarization ──────────────────────────────────────────
+# When enabled, verbose tool call+result pairs are individually summarized
+# by an LLM, reclaiming tokens without a full context compaction.
+# Independent of the compaction budget above.
+#
+# [tool_summarization]
+# enabled = true
+# model = "deepseek/deepseek-v4-flash"   # omit → session's main model
+# min_tokens = 2000                      # only summarize verbose pairs
+# trigger_tool_count = 15                # omit → default
 
 # ── MCP servers (Model Context Protocol) ─────────────────────────────
 # Define named MCP servers here.  Enable them globally (enabled_mcp_servers)

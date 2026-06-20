@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,6 +92,15 @@ pub struct Session {
     /// The session's model string (e.g. `deepseek/deepseek-v4-pro`), recorded
     /// in `Compacted` events for "which model produced this summary".
     model_label: String,
+
+    /// Tool-pair summarization configuration.  When `enabled` is false, the
+    /// summarizer is a no-op.
+    tool_summarization: crate::config::ToolSummarizationConfig,
+
+    /// Separate agent for tool-pair summarization (built from
+    /// `tool_summarization.model`).  `None` when no separate model is
+    /// configured — the session's main `agent` is used instead.
+    tool_summarizer: Option<Arc<crate::model::AnyAgent>>,
 
     /// Push a prompt here from any view; the background worker drains it.
     /// Each entry carries an optional completion signal for the submitter.
@@ -269,6 +279,21 @@ impl Session {
 
         let model_label = merged_config.model.to_string();
 
+        // Build a separate summarizer agent if a tool-summarization model is
+        // configured; otherwise fall back to the main agent.
+        let tool_summarizer = match model::build_summarizer(&merged_config) {
+            Ok(Some(a)) => Some(a),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to build tool summarizer agent, falling back to main model: {e}"
+                );
+                None
+            }
+        };
+
+        let tool_summarization = merged_config.tool_summarization.clone();
+
         let agent = model::build_agent(&merged_config, &preamble, mem, state.clone(), mcp_tools)?;
 
         let this = Arc::new(Self {
@@ -281,6 +306,8 @@ impl Session {
             context_limit,
             compaction_threshold,
             model_label,
+            tool_summarization,
+            tool_summarizer,
             submit_tx,
             cancel_tx: Mutex::new(None),
             is_running: AtomicBool::new(false),
@@ -418,6 +445,10 @@ impl Session {
             // configured budget, so the next turn stays within context.
             self.maybe_compact().await;
 
+            // Summarize verbose tool pairs (tier-1 compaction) before the
+            // next turn.  No-op when disabled.
+            self.maybe_summarize_tool_pairs().await;
+
             self.emit(SessionEvent::UserPrompt {
                 content: prompt.clone(),
                 source,
@@ -489,6 +520,129 @@ impl Session {
                 // Keep the full history this turn; it'll be retried next prompt.
                 tracing::warn!("compaction summarization failed; keeping full history: {e:#}");
             }
+        }
+    }
+
+    /// Summarize verbose tool call+result pairs into short `ToolSummarized`
+    /// events, reclaiming tokens incrementally (tier-1 compaction).
+    ///
+    /// Runs **between prompts** in `drain_queue` (alongside `maybe_compact`),
+    /// not during streaming.  The log lock is held only for the fast snapshot
+    /// and commit steps; the slow LLM summarization happens outside the lock.
+    /// See §5.3 of the redesign doc.
+    ///
+    /// No-op when tool-pair summarization is disabled, the tool-call count
+    /// is below the trigger, or there are no qualifying candidate pairs.
+    async fn maybe_summarize_tool_pairs(&self) {
+        let ts_config = &self.tool_summarization;
+        if !ts_config.enabled {
+            return;
+        }
+
+        let trigger = ts_config
+            .trigger_tool_count
+            .unwrap_or(DEFAULT_TOOL_SUMMARY_TRIGGER);
+        let min_tokens = ts_config
+            .min_tokens
+            .unwrap_or(DEFAULT_TOOL_SUMMARY_MIN_TOKENS);
+
+        // ── 1. Snapshot candidates (under the log lock) ──
+        let candidates: Vec<(String, Message, Message)>;
+        {
+            let items = self.memory.agent_visible_items().await;
+
+            // Check trigger: not enough tool calls to bother.
+            let tool_call_count = memory::count_tool_calls(&items);
+            if tool_call_count < trigger {
+                return;
+            }
+
+            // Protect the most-recent turn's tool calls — the LLM may still
+            // reference them in a follow-up.
+            let protect_from = memory::last_prompt_boundary(&items);
+            let candidate_ids = memory::tool_call_ids(&items, protect_from);
+
+            // Select pairs whose combined token count exceeds `min_tokens`.
+            let mut candidates_vec = Vec::new();
+            for id in &candidate_ids {
+                if let Some((call_msg, result_msg)) = memory::extract_tool_pair_messages(&items, id)
+                {
+                    let tokens = self
+                        .memory
+                        .count_tokens(&[call_msg.clone(), result_msg.clone()]);
+                    if tokens >= min_tokens {
+                        candidates_vec.push((id.clone(), call_msg, result_msg));
+                    }
+                }
+            }
+
+            // Summarize the oldest batch (bounds latency/cost before next turn).
+            if candidates_vec.len() > DEFAULT_TOOL_SUMMARY_BATCH {
+                candidates_vec.truncate(DEFAULT_TOOL_SUMMARY_BATCH);
+            }
+            candidates = candidates_vec;
+        }
+        // Log lock dropped — the LLM calls below don't hold it.
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        // ── 2. Summarize (outside the lock) ──
+        let summarizer: &crate::model::AnyAgent =
+            self.tool_summarizer.as_deref().unwrap_or(&self.agent);
+
+        let mut summaries: Vec<(String, String)> = Vec::new();
+        for (id, call_msg, result_msg) in &candidates {
+            match summarizer
+                .summarize(
+                    vec![call_msg.clone(), result_msg.clone()],
+                    TOOL_PAIR_SYSTEM_PROMPT,
+                )
+                .await
+            {
+                Ok(summary) => summaries.push((id.clone(), summary)),
+                Err(e) => {
+                    tracing::warn!("tool-pair summarization failed for {id}: {e:#}");
+                }
+            }
+        }
+
+        if summaries.is_empty() {
+            return;
+        }
+
+        // ── 3. Commit (under the log lock, with re-validation) ──
+        // Re-validate: the conversation hasn't changed (drain_queue is
+        // serial), but defence in depth for future concurrency.
+        let items = self.memory.agent_visible_items().await;
+        let visible_ids: HashSet<&str> = items
+            .iter()
+            .flat_map(|item| {
+                let rig::completion::Message::Assistant { content, .. } = &item.msg else {
+                    return Vec::new();
+                };
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        rig::completion::AssistantContent::ToolCall(tc) => Some(tc.id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (id, summary) in &summaries {
+            if !visible_ids.contains(id.as_str()) {
+                tracing::debug!("tool-pair summary for {id} skipped — no longer visible");
+                continue;
+            }
+            self.emit(SessionEvent::ToolSummarized {
+                id: id.clone(),
+                summary: summary.clone(),
+                model: self.model_label.clone(),
+            })
+            .await;
         }
     }
 
@@ -1076,6 +1230,38 @@ established (file listings, counts, the relevant excerpts).
 Format the result as prose with short sections or bullet points as needed. \
 The summary replaces the earlier conversation, so it must stand alone; do not \
 omit technical details, and when unsure whether something matters, keep it.";
+
+/// System prompt for tool-pair summarization (embedded at compile time).
+///
+/// Instructs the model to summarize a single tool call+result pair — what was
+/// requested, what happened, and any key data — so the summary can stand in
+/// for the original verbose call and result.
+const TOOL_PAIR_SYSTEM_PROMPT: &str = "\
+You are summarizing a single tool call and its result from a conversation \
+between a user and an AI coding assistant (goop). Produce a concise summary \
+that preserves the essential outcome.
+
+Preserve:
+- What the tool was asked to do (the tool name and key arguments).
+- The result: success or failure, key data (file paths, counts, error \
+messages, relevant excerpts).
+- Any facts established by the tool call that matter for the ongoing work.
+
+Drop:
+- Verbatim file contents, raw command output, and redundant detail.
+- Narration or commentary.
+
+The summary replaces the original tool call and result, so it must stand \
+alone.  Keep it short — a few sentences at most.";
+
+/// Default tool-call count at which tool-pair summarization triggers.
+const DEFAULT_TOOL_SUMMARY_TRIGGER: usize = 15;
+
+/// Default minimum token count for a pair to be worth summarizing.
+const DEFAULT_TOOL_SUMMARY_MIN_TOKENS: usize = 2000;
+
+/// Maximum number of pairs to summarize per invocation (oldest first).
+const DEFAULT_TOOL_SUMMARY_BATCH: usize = 10;
 
 /// Resolve the compaction token threshold from the merged config.
 ///

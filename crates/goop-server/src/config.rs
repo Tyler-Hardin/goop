@@ -336,12 +336,44 @@ pub struct SttConfig {
     pub enabled: bool,
 }
 
+// ── tool-pair summarization ────────────────────────────────────────
+
+/// Tool-pair summarization configuration.
+///
+/// When enabled, verbose tool call+result pairs are individually summarized
+/// by an LLM, replacing the original call and result with a short summary.
+/// This reclaims tokens incrementally without a full context compaction.
+///
+/// Independent of the full-compaction budget (`compaction`) — can be enabled
+/// while full compaction is off.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolSummarizationConfig {
+    /// Whether tool-pair summarization is active.  Default: `false` (opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Model in `provider/model` format for summarization.  If `None`, uses
+    /// the session's main model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Only summarize a pair when its call+result exceeds this many tokens.
+    /// If `None`, a built-in default is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<usize>,
+
+    /// Start summarizing when the agent-visible tool-call count exceeds this.
+    /// If `None`, a built-in default is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_tool_count: Option<usize>,
+}
+
 // ── config ──────────────────────────────────────────────────────────
 
 /// Compaction budget for the conversation memory.
 ///
-/// When set, messages exceeding the budget are evicted from the active
-/// window and replaced with a rolling text summary (no extra LLM call).
+/// When the agent-visible conversation exceeds this budget, the entire prefix
+/// is summarized by an LLM into a rolling summary before the next turn.
 /// `None` disables compaction (unlimited context).
 ///
 /// In config files this accepts either a bare integer (absolute tokens)
@@ -413,9 +445,9 @@ pub struct Config {
     pub default_max_turns: usize,
     /// Compaction budget for the conversation memory.
     ///
-    /// When set, messages exceeding the budget are evicted from the active
-    /// window and replaced with a rolling text summary (no extra LLM call).
-    /// `None` disables compaction (unlimited context).
+    /// When the agent-visible conversation exceeds this budget, the entire
+    /// prefix is summarized by an LLM into a rolling summary before the next
+    /// turn.  `None` disables compaction (unlimited context).
     ///
     /// In config files, either a bare integer (absolute token limit) or a
     /// string like `"80%"` (percentage of the model's context window).
@@ -440,6 +472,11 @@ pub struct Config {
     /// Speech-to-text configuration.
     #[serde(default)]
     pub stt: SttConfig,
+
+    /// Tool-pair summarization settings.  Independent of `compaction` — can
+    /// be on while full compaction is off.
+    #[serde(default)]
+    pub tool_summarization: ToolSummarizationConfig,
 }
 
 fn default_model() -> Model {
@@ -471,6 +508,7 @@ impl Default for Config {
             mcp_servers: default_mcp_servers(),
             enabled_mcp_servers: default_enabled_mcp_servers(),
             stt: SttConfig::default(),
+            tool_summarization: ToolSummarizationConfig::default(),
         }
     }
 }
@@ -517,6 +555,9 @@ pub struct SessionConfig {
     /// global list — no need to repeat globally-enabled names here).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled_mcp_servers: Option<Vec<String>>,
+    /// Override tool-pair summarization.  `None` means "defer to global".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_summarization: Option<ToolSummarizationConfig>,
 }
 
 impl SessionConfig {
@@ -547,6 +588,9 @@ impl SessionConfig {
         }
         if let Some(ref u) = self.ollama_base_url {
             merged.ollama_base_url = u.clone();
+        }
+        if let Some(ref ts) = self.tool_summarization {
+            merged.tool_summarization = ts.clone();
         }
         // enabled_mcp_servers is NOT merged here — it's a union
         // (global + session) computed in Session::new.
@@ -615,8 +659,13 @@ pub fn load_config(
         }
     }
 
-    // Layer 2: environment variables
-    fig = fig.merge(Env::prefixed("GOOP_"));
+    // Layer 2: environment variables.
+    //
+    // Tool-pair summarization env vars (`GOOP_TOOL_SUMMARIZATION*`) are
+    // filtered out of figment's automatic mapping — they target nested
+    // struct fields that figment's flat key model can't express, so they're
+    // applied manually after extraction (below).
+    fig = fig.merge(Env::prefixed("GOOP_").filter(|key| !key.starts_with("tool_summarization")));
 
     // Layer 1: CLI overrides
     if let Some(cli) = cli {
@@ -629,6 +678,26 @@ pub fn load_config(
 
     // home_dir is never in any provider — set it explicitly.
     config.home_dir = home_dir();
+
+    // ── Tool-pair summarization env vars (manual — see comment above) ──
+    if let Ok(v) = std::env::var("GOOP_TOOL_SUMMARIZATION") {
+        config.tool_summarization.enabled = matches!(v.as_str(), "true" | "1");
+    }
+    if let Ok(v) = std::env::var("GOOP_TOOL_SUMMARIZATION_MODEL") {
+        config.tool_summarization.model = Some(v);
+    }
+    if let Some(n) = std::env::var("GOOP_TOOL_SUMMARIZATION_MIN_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.tool_summarization.min_tokens = Some(n);
+    }
+    if let Some(n) = std::env::var("GOOP_TOOL_SUMMARIZATION_TRIGGER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.tool_summarization.trigger_tool_count = Some(n);
+    }
 
     Ok(config)
 }
@@ -1016,5 +1085,84 @@ command = "my-indexer"
             assert_eq!(Provider::from_model_prefix(s), Some(p));
             assert_eq!(p.as_str(), s);
         }
+    }
+
+    // ── ToolSummarizationConfig deserialization ──────────────────────
+
+    #[test]
+    fn tool_summarization_default_disabled() {
+        let toml_str = r#"model = "openai/gpt-4o""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.tool_summarization.enabled);
+        assert!(config.tool_summarization.model.is_none());
+        assert!(config.tool_summarization.min_tokens.is_none());
+        assert!(config.tool_summarization.trigger_tool_count.is_none());
+    }
+
+    #[test]
+    fn tool_summarization_full_config() {
+        let toml_str = r#"
+model = "openai/gpt-4o"
+
+[tool_summarization]
+enabled = true
+model = "deepseek/deepseek-v4-flash"
+min_tokens = 3000
+trigger_tool_count = 20
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let ts = &config.tool_summarization;
+        assert!(ts.enabled);
+        assert_eq!(ts.model.as_deref(), Some("deepseek/deepseek-v4-flash"));
+        assert_eq!(ts.min_tokens, Some(3000));
+        assert_eq!(ts.trigger_tool_count, Some(20));
+    }
+
+    #[test]
+    fn tool_summarization_partial_config() {
+        let toml_str = r#"
+model = "openai/gpt-4o"
+
+[tool_summarization]
+enabled = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.tool_summarization.enabled);
+        assert!(config.tool_summarization.model.is_none());
+    }
+
+    #[test]
+    fn session_config_overrides_tool_summarization() {
+        let global = Config::default();
+        assert!(!global.tool_summarization.enabled);
+
+        let session = SessionConfig {
+            tool_summarization: Some(ToolSummarizationConfig {
+                enabled: true,
+                min_tokens: Some(500),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = session.merge(&global);
+        assert!(merged.tool_summarization.enabled);
+        assert_eq!(merged.tool_summarization.min_tokens, Some(500));
+    }
+
+    #[test]
+    fn session_config_defers_tool_summarization() {
+        let global = Config {
+            tool_summarization: ToolSummarizationConfig {
+                enabled: true,
+                min_tokens: Some(1000),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        // Session config with no override keeps global settings.
+        let session = SessionConfig::default();
+        let merged = session.merge(&global);
+        assert!(merged.tool_summarization.enabled);
+        assert_eq!(merged.tool_summarization.min_tokens, Some(1000));
     }
 }

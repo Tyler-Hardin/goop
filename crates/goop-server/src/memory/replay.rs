@@ -81,6 +81,16 @@ pub(crate) fn replay_visible(log: &[LogEntry]) -> Vec<VisibleItem> {
                 });
             }
 
+            // A single tool call+result pair has been summarized.  Replaces
+            // the pair (targeted by `id`) with the summary.  Because replay
+            // merges consecutive calls/results into single messages, this
+            // requires content-granularity surgery — splicing the target
+            // call/result out of their messages and inserting the summary.
+            // See §5.1–5.2 of the redesign doc.
+            SessionEvent::ToolSummarized { id, summary, .. } => {
+                apply_tool_summary(&mut visible, id, summary.clone(), entry.seq);
+            }
+
             _ => replay.feed(entry),
         }
     }
@@ -300,6 +310,208 @@ fn drop_orphaned_tool_pairs(visible: &mut Vec<VisibleItem>) {
         }
     }
     *visible = rebuilt;
+}
+
+/// Replace a single tool call+result pair (identified by `id`) with a
+/// summary message.
+///
+/// Replay merges consecutive tool calls into one assistant `VisibleItem` and
+/// consecutive results into one user `VisibleItem`, so the target call/result
+/// may be *inside* a message alongside siblings.  This function splices the
+/// target out of each message (content-granularity, like
+/// [`drop_orphaned_tool_pairs`]), drops now-empty messages, and inserts the
+/// summary at the call's former position.
+///
+/// If only one half of the pair is present (the other was already compacted
+/// or deleted), that half is dropped too — the orphan net would catch it
+/// anyway, but doing it here keeps the intermediate state valid.  If neither
+/// half is present, the event is a no-op (defence in depth).
+fn apply_tool_summary(visible: &mut Vec<VisibleItem>, id: &str, summary: String, seq: u64) {
+    // Check whether the id exists at all.
+    let has_call = visible.iter().any(|item| {
+        matches!(&item.msg, Message::Assistant { content, .. }
+            if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.id == id)))
+    });
+    let has_result = visible.iter().any(|item| {
+        matches!(&item.msg, Message::User { content }
+            if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr) if tr.id == id)))
+    });
+    if !has_call && !has_result {
+        return;
+    }
+
+    // The summary goes at the call's position (the earlier of the pair).
+    // If only the result survives (call already removed), use its position.
+    let insert_pos = visible
+        .iter()
+        .position(|item| {
+            matches!(&item.msg, Message::Assistant { content, .. }
+            if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.id == id)))
+        })
+        .or_else(|| {
+            visible.iter().position(|item| {
+                matches!(&item.msg, Message::User { content }
+            if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr) if tr.id == id)))
+            })
+        });
+
+    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len() + 1);
+    let mut inserted = false;
+
+    for (orig_idx, item) in visible.drain(..).enumerate() {
+        // Insert the summary just before the item at the target position.
+        if !inserted && insert_pos.is_some_and(|p| p == orig_idx) {
+            rebuilt.push(VisibleItem {
+                seq,
+                msg: Message::user(summary.clone()),
+            });
+            inserted = true;
+        }
+
+        match item.msg {
+            Message::Assistant {
+                id: msg_id,
+                content,
+            } => {
+                let items: Vec<AssistantContent> = content
+                    .into_iter()
+                    .filter(|c| !matches!(c, AssistantContent::ToolCall(tc) if tc.id == id))
+                    .collect();
+                if let Ok(oom) = OneOrMany::many(items) {
+                    rebuilt.push(VisibleItem {
+                        seq: item.seq,
+                        msg: Message::Assistant {
+                            id: msg_id,
+                            content: oom,
+                        },
+                    });
+                }
+                // else: every content item was the target call → dropped.
+            }
+            Message::User { content } => {
+                let items: Vec<UserContent> = content
+                    .into_iter()
+                    .filter(|c| !matches!(c, UserContent::ToolResult(tr) if tr.id == id))
+                    .collect();
+                if let Ok(oom) = OneOrMany::many(items) {
+                    rebuilt.push(VisibleItem {
+                        seq: item.seq,
+                        msg: Message::User { content: oom },
+                    });
+                }
+            }
+            other => rebuilt.push(VisibleItem {
+                seq: item.seq,
+                msg: other,
+            }),
+        }
+    }
+
+    if !inserted {
+        rebuilt.push(VisibleItem {
+            seq,
+            msg: Message::user(summary),
+        });
+    }
+
+    *visible = rebuilt;
+}
+
+/// Extract a single tool call and its matching result from the visible items
+/// as standalone [`Message`]s, suitable for LLM summarization input.
+///
+/// Returns `None` if either half is absent (the pair is incomplete).
+pub(crate) fn extract_tool_pair_messages(
+    items: &[VisibleItem],
+    id: &str,
+) -> Option<(Message, Message)> {
+    let call = items.iter().find_map(|item| {
+        let Message::Assistant { content, .. } = &item.msg else {
+            return None;
+        };
+        for c in content.iter() {
+            if let AssistantContent::ToolCall(tc) = c
+                && tc.id == id
+            {
+                let content = OneOrMany::one(AssistantContent::ToolCall(tc.clone()));
+                return Some(Message::Assistant { id: None, content });
+            }
+        }
+        None
+    });
+
+    let result = items.iter().find_map(|item| {
+        let Message::User { content } = &item.msg else {
+            return None;
+        };
+        for c in content.iter() {
+            if let UserContent::ToolResult(tr) = c
+                && tr.id == id
+            {
+                let content = OneOrMany::one(UserContent::ToolResult(tr.clone()));
+                return Some(Message::User { content });
+            }
+        }
+        None
+    });
+
+    match (call, result) {
+        (Some(c), Some(r)) => Some((c, r)),
+        _ => None,
+    }
+}
+
+/// Collect all tool-call IDs from the visible items, optionally excluding
+/// those at or after `protect_from` (used to protect the most-recent turn's
+/// calls from summarization).
+pub(crate) fn tool_call_ids(items: &[VisibleItem], protect_from: usize) -> Vec<String> {
+    items
+        .iter()
+        .take(protect_from)
+        .flat_map(|item| {
+            let Message::Assistant { content, .. } = &item.msg else {
+                return Vec::new();
+            };
+            content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Count all tool calls across the visible items.
+pub(crate) fn count_tool_calls(items: &[VisibleItem]) -> usize {
+    items
+        .iter()
+        .map(|item| {
+            let Message::Assistant { content, .. } = &item.msg else {
+                return 0;
+            };
+            content
+                .iter()
+                .filter(|c| matches!(c, AssistantContent::ToolCall(_)))
+                .count()
+        })
+        .sum()
+}
+
+/// Find the index just past the most-recent user prompt (a `User` message
+/// containing text content, not just tool results).  Tool calls at or after
+/// this index belong to the most-recent turn and are protected from
+/// summarization.  Returns `items.len()` if no prompt is found.
+pub(crate) fn last_prompt_boundary(items: &[VisibleItem]) -> usize {
+    items
+        .iter()
+        .rposition(|item| {
+            matches!(&item.msg, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::Text(_))))
+        })
+        .map(|i| i + 1)
+        .unwrap_or(items.len())
 }
 
 #[cfg(test)]
@@ -607,5 +819,252 @@ mod tests {
         assert_eq!(msgs.len(), 2); // user prompt + assistant text only
         assert!(matches!(msgs[0], Message::User { .. }));
         assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("hello"));
+    }
+
+    // ── ToolSummarized replay tests ───────────────────────────────
+
+    /// A `ToolSummarized` event replaces the targeted call+result pair with
+    /// the summary.  Sibling messages remain visible.
+    #[test]
+    fn replay_tool_summarized_replaces_pair() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "read f".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "long file contents".into(),
+                },
+            ),
+            entry(3, SessionEvent::AssistantText("done".into())),
+            entry(
+                4,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // tool-pair summary replaces the call+result (ids "a")
+            entry(
+                5,
+                SessionEvent::ToolSummarized {
+                    id: "a".into(),
+                    summary: "read f → long file contents".into(),
+                    model: "m".into(),
+                },
+            ),
+        ];
+        let items = replay_visible(&log);
+        // prompt (seq 0) + summary (seq 5) + assistant text (seq 3)
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].seq, 0);
+        assert_eq!(items[1].seq, 5);
+        assert_eq!(items[2].seq, 3);
+    }
+
+    /// When parallel tool calls share a merged assistant message, summarizing
+    /// one removes *only its own half* — siblings survive.
+    #[test]
+    fn replay_tool_summarized_preserves_sibling_calls() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "multi".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            // parallel calls: a, b (merged into one assistant VisibleItem)
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolCall {
+                    id: "b".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            // parallel results: a, b (merged into one user VisibleItem)
+            entry(
+                3,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "ra".into(),
+                },
+            ),
+            entry(
+                4,
+                SessionEvent::ToolResult {
+                    id: "b".into(),
+                    content: "rb".into(),
+                },
+            ),
+            entry(
+                5,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // summarize only pair "a"
+            entry(
+                6,
+                SessionEvent::ToolSummarized {
+                    id: "a".into(),
+                    summary: "summary a".into(),
+                    model: "m".into(),
+                },
+            ),
+        ];
+        let items = replay_visible(&log);
+        // prompt (0) + summary (6) + assistant[call b] (1) + user[result b] (3)
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].seq, 0); // prompt
+        assert_eq!(items[1].seq, 6); // summary
+        // The remaining assistant message should still have call "b".
+        let call_b = match &items[2].msg {
+            Message::Assistant { content, .. } => content
+                .iter()
+                .filter(|c| matches!(c, AssistantContent::ToolCall(_)))
+                .count(),
+            _ => panic!("expected assistant"),
+        };
+        assert_eq!(call_b, 1); // only call "b" remains
+        // The remaining user message should still have result "b".
+        let result_b = match &items[3].msg {
+            Message::User { content } => content
+                .iter()
+                .filter(|c| matches!(c, UserContent::ToolResult(_)))
+                .count(),
+            _ => panic!("expected user"),
+        };
+        assert_eq!(result_b, 1);
+    }
+
+    /// A `ToolSummarized` for a pair already swept by an earlier `Compacted`
+    /// is a no-op — the call/result are gone from the visible set.
+    #[test]
+    fn replay_tool_summarized_after_compacted_is_noop() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "q".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "data".into(),
+                },
+            ),
+            entry(
+                3,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // full compaction covers everything (seqs 0,1,2)
+            entry(
+                4,
+                SessionEvent::Compacted {
+                    summary: "FULL".into(),
+                    model: "m".into(),
+                    covers: vec![0, 1, 2],
+                    manual: false,
+                },
+            ),
+            // tool summary for "a" — but "a" is already gone → no-op
+            entry(
+                5,
+                SessionEvent::ToolSummarized {
+                    id: "a".into(),
+                    summary: "should not appear".into(),
+                    model: "m".into(),
+                },
+            ),
+        ];
+        let items = replay_visible(&log);
+        // Only the compaction summary (seq 4) should remain.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].seq, 4);
+    }
+
+    /// A `ToolSummarized` for a non-existent id is a no-op (defence in depth).
+    #[test]
+    fn replay_tool_summarized_missing_id_is_noop() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "q".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "data".into(),
+                },
+            ),
+            entry(
+                3,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            entry(
+                4,
+                SessionEvent::ToolSummarized {
+                    id: "nonexistent".into(),
+                    summary: "ghost".into(),
+                    model: "m".into(),
+                },
+            ),
+        ];
+        let items = replay_visible(&log);
+        // All three original items survive; the ghost summary is not added.
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].seq, 0);
+        assert_eq!(items[1].seq, 1);
+        assert_eq!(items[2].seq, 2);
     }
 }
