@@ -53,6 +53,13 @@ pub(crate) enum AnyAgent {
     Anthropic(Agent<anthropic::completion::CompletionModel>),
     /// Z.ai / GLM — OpenAI-compatible API.  Only GLM-5.2 is used.
     Zai(Agent<openai::completion::GenericCompletionModel<zai::ZAiExt>>),
+    /// Test-only mock that returns a canned summary.  Panics on
+    /// [`stream_prompt`](Self::stream_prompt) — the integration test only
+    /// exercises the compaction path (which uses [`summarize`](Self::summarize)).
+    #[cfg(test)]
+    Mock {
+        summarize_result: String,
+    },
 }
 
 impl AnyAgent {
@@ -66,6 +73,8 @@ impl AnyAgent {
             AnyAgent::Ollama(a) => AnyStream::Ollama(a.stream_prompt(prompt).await),
             AnyAgent::Anthropic(a) => AnyStream::Anthropic(a.stream_prompt(prompt).await),
             AnyAgent::Zai(a) => AnyStream::Zai(a.stream_prompt(prompt).await),
+            #[cfg(test)]
+            AnyAgent::Mock { .. } => panic!("Mock agent does not support streaming"),
         }
     }
 
@@ -112,6 +121,8 @@ impl AnyAgent {
             AnyAgent::Ollama(a) => do_summarize!(a),
             AnyAgent::Anthropic(a) => do_summarize!(a),
             AnyAgent::Zai(a) => do_summarize!(a),
+            #[cfg(test)]
+            AnyAgent::Mock { summarize_result } => Ok(summarize_result.clone()),
         }
     }
 }

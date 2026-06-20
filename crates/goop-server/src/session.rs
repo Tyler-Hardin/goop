@@ -1042,6 +1042,63 @@ impl Session {
         let entry = log.append(event).await;
         let _ = self.tx.send(ServerMessage::Entry(entry));
     }
+
+    // ── test support ───────────────────────────────────────────────────
+
+    /// Build a minimal session backed by a mock agent and an in-memory
+    /// transaction log.  Only the fields needed for compaction testing
+    /// (`agent`, `memory`, `history`, `compaction_threshold`, `model_label`,
+    /// `tx`) are populated; everything else is a no-op sentinel.
+    ///
+    /// The returned `(Session, broadcast::Receiver)` pair lets the test
+    /// drive compaction (`maybe_compact` / `compact_range`) and observe the
+    /// emitted events.
+    #[cfg(test)]
+    pub(crate) async fn for_compaction_test(
+        name: &str,
+        summarize_result: &str,
+        compaction_threshold: usize,
+    ) -> (Arc<Self>, broadcast::Receiver<ServerMessage>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = TransactionLog::open_at(tmp.path().join("test.jsonl"), name)
+            .await
+            .unwrap();
+        // Keep tempdir alive for the session's lifetime.
+        std::mem::forget(tmp);
+
+        let history = Arc::new(Mutex::new(log));
+        let memory = LogReplayMemory::new(history.clone());
+        let (tx, rx) = broadcast::channel(256);
+
+        let session = Arc::new(Self {
+            name: name.to_string(),
+            state: Arc::new(SessionState::new(
+                PathBuf::from("/tmp"),
+                PathBuf::from("/tmp"),
+                Default::default(),
+                PathBuf::from("/tmp/test.state.toml"),
+            )),
+            agent: Arc::new(model::AnyAgent::Mock {
+                summarize_result: summarize_result.to_string(),
+            }),
+            tx: tx.clone(),
+            history,
+            memory,
+            context_limit: None,
+            compaction_threshold: Some(compaction_threshold),
+            model_label: "mock/model".to_string(),
+            tool_summarization: Default::default(),
+            tool_summarizer: None,
+            submit_tx: mpsc::unbounded_channel().0,
+            cancel_tx: Mutex::new(None),
+            is_running: AtomicBool::new(false),
+            session_mcp: crate::mcp::McpManager::empty(),
+            push_notifier: Arc::new(crate::push::PushManager::new()),
+            stt: None,
+        });
+
+        (session, rx)
+    }
 }
 
 // ── session manager ───────────────────────────────────────────────
@@ -1441,5 +1498,232 @@ async fn append_prompt_to_history(prompt: &str) {
     };
     if let Err(e) = file.write_all(format!("{json}\n").as_bytes()).await {
         tracing::error!("failed to write to history file {path:?}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod compaction_integration_tests {
+    use super::*;
+    use crate::memory::replay_log;
+
+    /// Helper: append a completed turn (UserPrompt → AssistantText → TurnEnded)
+    /// to the session's log.
+    async fn add_turn(session: &Session, user: &str, assistant: &str) {
+        session
+            .emit(SessionEvent::UserPrompt {
+                content: user.into(),
+                source: PromptSource::Terminal,
+            })
+            .await;
+        session
+            .emit(SessionEvent::AssistantText(assistant.into()))
+            .await;
+        session
+            .emit(SessionEvent::TurnEnded {
+                reason: TurnEndReason::Completed,
+            })
+            .await;
+    }
+
+    /// Collect all `SessionEvent`s from the broadcast channel, filtering out
+    /// the initial `SessionInfo` that `TransactionLog::open_at` injects.
+    fn collect_events(rx: &mut broadcast::Receiver<ServerMessage>) -> Vec<SessionEvent> {
+        let mut events = Vec::new();
+        while let Ok(ServerMessage::Entry(entry)) = rx.try_recv() {
+            if !matches!(entry.event, SessionEvent::SessionInfo { .. }) {
+                events.push(entry.event);
+            }
+        }
+        events
+    }
+
+    /// Auto-compaction: a session that exceeds its token budget triggers
+    /// `maybe_compact`, which calls the mock agent's `summarize`, appends a
+    /// `Compacted` event, and the next replay shows the summary instead of the
+    /// covered messages.
+    #[tokio::test]
+    async fn auto_compact_replaces_prefix_with_summary() {
+        // Threshold of 1 token means any non-empty conversation triggers
+        // compaction.
+        let (session, mut rx) =
+            Session::for_compaction_test("auto-compact", "SUMMARY OF CHAT", 1).await;
+
+        // Two completed turns — enough to exceed the 1-token threshold.
+        add_turn(&session, "hello", "hi there").await;
+        add_turn(&session, "how are you", "doing well").await;
+
+        // Drain the broadcast queue (the turns' events).
+        let _ = collect_events(&mut rx);
+
+        // Trigger compaction (as drain_queue would before the next prompt).
+        session.maybe_compact().await;
+
+        // A Compacted event was emitted.
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1, "expected one Compacted event");
+        match &events[0] {
+            SessionEvent::Compacted {
+                summary,
+                model,
+                manual,
+                covers,
+            } => {
+                assert_eq!(summary, "SUMMARY OF CHAT");
+                assert_eq!(model, "mock/model");
+                assert!(!*manual, "auto-compaction should not be manual");
+                assert!(
+                    covers.len() >= 2,
+                    "covers should include all agent-visible items"
+                );
+            }
+            other => panic!("expected Compacted, got {other:?}"),
+        }
+
+        // Replay the log: the covered messages should be replaced by the
+        // summary.  The summary is a single User message (the Compacted event
+        // becomes a user-role summary in the agent view).
+        let log = session.history.lock().await;
+        let messages = replay_log(log.entries(), log.active_tip());
+        drop(log);
+
+        // Should be exactly 1 message (the summary) — the 4 original messages
+        // (2 user + 2 assistant) are all covered.
+        assert_eq!(
+            messages.len(),
+            1,
+            "replay should show only the summary, got {messages:?}"
+        );
+    }
+
+    /// Manual compaction via `compact_range`: the user selects a range of
+    /// messages, the server summarizes them, and replay shows the summary
+    /// replacing those messages while uncovered messages remain.
+    #[tokio::test]
+    async fn manual_compact_range_preserves_uncovered_messages() {
+        // No auto-compaction (huge threshold).
+        let (session, mut rx) =
+            Session::for_compaction_test("manual-compact", "RANGE SUMMARY", usize::MAX).await;
+
+        // Three turns.
+        add_turn(&session, "q1", "a1").await;
+        add_turn(&session, "q2", "a2").await;
+        add_turn(&session, "q3", "a3").await;
+
+        let _ = collect_events(&mut rx);
+
+        // Get the agent-visible items to find the seqs of the middle turn.
+        let items = session.memory.agent_visible_items().await;
+        // items: [q1, a1, q2, a2, q3, a3] — seqs 1..=6 (0 is SessionInfo).
+        assert_eq!(items.len(), 6);
+        // Cover the middle turn: q2 (seq 3) and a2 (seq 4).
+        let covers = vec![items[2].seq, items[3].seq];
+
+        session.compact_range(covers).await;
+
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1, "expected one Compacted event");
+        match &events[0] {
+            SessionEvent::Compacted {
+                summary,
+                manual,
+                covers,
+                ..
+            } => {
+                assert_eq!(summary, "RANGE SUMMARY");
+                assert!(*manual, "should be manual compaction");
+                assert_eq!(*covers, vec![items[2].seq, items[3].seq]);
+            }
+            other => panic!("expected Compacted, got {other:?}"),
+        }
+
+        // Replay: the middle turn is replaced by the summary, but turns 1
+        // and 3 remain.  So we expect: q1, a1, [summary], q3, a3 = 5 messages.
+        let log = session.history.lock().await;
+        let messages = replay_log(log.entries(), log.active_tip());
+        drop(log);
+
+        assert_eq!(
+            messages.len(),
+            5,
+            "replay should have 5 messages (turn1 + summary + turn3), got {messages:?}"
+        );
+    }
+
+    /// Compacting an already-compacted conversation creates a rolling summary:
+    /// the second compaction's `covers` includes the first summary's seq, and
+    /// replay shows only the latest summary.
+    #[tokio::test]
+    async fn rolling_compaction_summarizes_prior_summary() {
+        let (session, mut rx) = Session::for_compaction_test("rolling", "ROLLING SUMMARY", 1).await;
+
+        add_turn(&session, "first", "answer1").await;
+        add_turn(&session, "second", "answer2").await;
+
+        let _ = collect_events(&mut rx);
+
+        // First compaction — covers all 4 original messages.
+        session.maybe_compact().await;
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SessionEvent::Compacted { covers, .. } => {
+                assert!(covers.len() >= 2, "should cover the original messages");
+            }
+            _ => panic!("expected Compacted"),
+        }
+
+        // After compaction, the agent-visible items should be just the summary.
+        let items = session.memory.agent_visible_items().await;
+        assert_eq!(items.len(), 1, "only the summary should be visible");
+        let summary_seq = items[0].seq;
+
+        // Add another turn so there are ≥ 2 items to trigger a second
+        // compaction (compaction_covers requires items.len() >= 2).
+        add_turn(&session, "third", "answer3").await;
+        let _ = collect_events(&mut rx);
+
+        // Second compaction — covers the first summary + the new turn.
+        session.maybe_compact().await;
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1, "expected a second Compacted event");
+        match &events[0] {
+            SessionEvent::Compacted {
+                summary,
+                covers,
+                manual,
+                ..
+            } => {
+                assert_eq!(summary, "ROLLING SUMMARY");
+                assert!(!*manual);
+                // The second compaction covers the first summary's seq.
+                assert!(
+                    covers.contains(&summary_seq),
+                    "second compaction should cover the first summary's seq {summary_seq}, got {covers:?}"
+                );
+            }
+            other => panic!("expected Compacted, got {other:?}"),
+        }
+
+        // Replay: only the latest rolling summary survives.
+        let log = session.history.lock().await;
+        let messages = replay_log(log.entries(), log.active_tip());
+        drop(log);
+        assert_eq!(messages.len(), 1, "only the latest rolling summary");
+    }
+
+    /// When the conversation is under the threshold, `maybe_compact` is a
+    /// no-op — no `Compacted` event is emitted.
+    #[tokio::test]
+    async fn no_compaction_when_under_threshold() {
+        let (session, mut rx) =
+            Session::for_compaction_test("no-compact", "SHOULD NOT APPEAR", usize::MAX).await;
+
+        add_turn(&session, "hello", "hi").await;
+        let _ = collect_events(&mut rx);
+
+        session.maybe_compact().await;
+
+        let events = collect_events(&mut rx);
+        assert!(events.is_empty(), "no Compacted event when under threshold");
     }
 }
