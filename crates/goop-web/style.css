@@ -274,6 +274,13 @@ main {
     var(--bg);
 }
 
+/* Extra left padding in select mode so checkboxes (positioned at
+   `left: -28px` relative to each message) are visible and not clipped
+   by `main`'s `overflow: auto`. */
+main.select-mode {
+  padding-left: 44px;
+}
+
 .msg {
   max-width: 78%;
   padding: 11px 16px;
@@ -667,8 +674,18 @@ main {
    When select mode is active, each agent-visible message gets a checkbox
    on its left and a highlighted background when selected.  The checkbox
    is a small square that shows ✓ when the message is selected.
+
+   `.msg-select-wrap` is a flex column so `.msg-wrap`'s `align-self`
+   (flex-end for user, flex-start for assistant) still works — the wrapper
+   replaced `.msg-wrap` as the direct child of `main`'s flex column.
+
+   `main.select-mode` adds left padding so the absolutely-positioned
+   checkbox (`left: -28px`) is not clipped by `main`'s `overflow: auto`
+   (which clips anything outside the padding box).
 */
 .msg-select-wrap {
+  display: flex;
+  flex-direction: column;
   position: relative;
 }
 .msg-select-wrap.select-mode {

@@ -213,8 +213,11 @@ pub fn MessageLog() -> impl IntoView {
         }
     };
 
+    // Capture select_mode before `state` is moved into the <For> closure.
+    let select_mode = state.select_mode;
+
     view! {
-        <main id="log" node_ref=scroll_ref on:scroll=on_scroll>
+        <main id="log" node_ref=scroll_ref on:scroll=on_scroll class:select-mode=move || select_mode.get()>
             // Messages from state, rendered with stable keys via <For>.
             // Each message has a unique `id` — Leptos tracks items by key,
             // so adding a new message only inserts one DOM node instead of
