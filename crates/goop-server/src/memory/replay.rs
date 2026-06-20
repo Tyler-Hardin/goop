@@ -1057,6 +1057,73 @@ mod tests {
         assert!(matches!(items[1].msg, Message::User { .. }));
     }
 
+    /// Overlapping/nested compaction: a later `Compacted` whose `covers`
+    /// includes the seq of a *prior* `Compacted` summary must remove that
+    /// prior summary too — otherwise it would linger alongside the new one
+    /// and corrupt the agent's context.  This is the case §2.5 of the
+    /// redesign doc flags as why `covers` must reference *current
+    /// agent-visible items*, including prior summaries.
+    #[test]
+    fn replay_compacted_includes_prior_summary() {
+        let log = vec![
+            // turn 0: user "q1" + assistant "a1"
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "q1".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(1, SessionEvent::AssistantText("a1".into())),
+            entry(
+                2,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // first compaction covers turn 0's two items → summary S1 (seq 3)
+            entry(
+                3,
+                SessionEvent::Compacted {
+                    summary: "S1".into(),
+                    model: "m".into(),
+                    covers: vec![0, 1],
+                    manual: false,
+                },
+            ),
+            // turn 1: user "q2" + assistant "a2"
+            entry(
+                4,
+                SessionEvent::UserPrompt {
+                    content: "q2".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(5, SessionEvent::AssistantText("a2".into())),
+            entry(
+                6,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // second compaction covers S1 (seq 3) + turn 1's items → S2 (seq 7)
+            entry(
+                7,
+                SessionEvent::Compacted {
+                    summary: "S2".into(),
+                    model: "m".into(),
+                    covers: vec![3, 4, 5],
+                    manual: false,
+                },
+            ),
+        ];
+        let items = replay_visible(&log, None);
+        // Only the second summary survives — S1 (seq 3) is swept away.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].seq, 7);
+        assert_eq!(user_text(&items[0].msg).as_deref(), Some("S2"));
+    }
+
     /// Metadata/control events (`ContextSnapshot`, `Thinking`) are never
     /// agent-visible — they must not leak into the replayed message list.
     #[test]
