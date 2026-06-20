@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::events::SessionEvent;
+use crate::events::{PromptSource, ServerMessage, SessionEvent, TurnEndReason};
 use crate::memory::prompt_history_path;
 use streamdown_parser::Parser;
 use streamdown_render::Renderer;
@@ -122,7 +122,7 @@ impl TerminalClient {
         let ready_rx = Arc::new(StdMutex::new(Some(ready_rx)));
 
         // Events from WS → render task.
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
         // Shared session name — captured from SessionInfo event, printed on exit.
         let session_name: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
@@ -221,10 +221,10 @@ impl TerminalClient {
         });
 
         // ── WS receive task ───────────────────────────────────
-        // Reads JSON SessionEvent from the WebSocket and forwards
-        // to the render task. Filters out UserPrompt echoes — the
-        // terminal user already saw their input on the readline.
-        // Captures SessionInfo for display on exit.
+        // Reads `ServerMessage` envelopes from the WebSocket and forwards
+        // them to the render task.  Suppresses UserPrompt echoes for terminal-
+        // sourced prompts — the terminal user already saw their input on the
+        // readline.  Captures SessionInfo for display on exit.
         let fwd_tx = ev_tx.clone();
         let mut ws_rx = ws_rx;
         let ws_session_name = session_name.clone();
@@ -232,21 +232,32 @@ impl TerminalClient {
             while let Some(msg) = ws_rx.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        let event: SessionEvent = match serde_json::from_str(&text) {
-                            Ok(e) => e,
+                        let sm: ServerMessage = match serde_json::from_str(&text) {
+                            Ok(s) => s,
                             Err(_) => continue,
                         };
-                        // Capture session name when we see SessionInfo.
-                        if let SessionEvent::SessionInfo { ref name } = event {
-                            *ws_session_name.lock().expect("session name mutex poisoned") =
-                                Some(name.clone());
-                        }
-                        // Suppress UserPrompt echoes — the terminal
-                        // user already saw their input on the readline.
-                        if matches!(event, SessionEvent::UserPrompt { .. }) {
-                            continue;
-                        }
-                        if fwd_tx.send(event).is_err() {
+                        // Capture session name + suppress terminal UserPrompt
+                        // echoes on `Entry` events.
+                        let sm = match sm {
+                            ServerMessage::Entry(entry) => {
+                                if let SessionEvent::SessionInfo { ref name } = entry.event {
+                                    *ws_session_name.lock().expect("session name mutex poisoned") =
+                                        Some(name.clone());
+                                }
+                                if matches!(
+                                    &entry.event,
+                                    SessionEvent::UserPrompt {
+                                        source: PromptSource::Terminal,
+                                        ..
+                                    }
+                                ) {
+                                    continue;
+                                }
+                                ServerMessage::Entry(entry)
+                            }
+                            other => other,
+                        };
+                        if fwd_tx.send(sm).is_err() {
                             break;
                         }
                     }
@@ -358,6 +369,11 @@ struct RenderState<P: rustyline::ExternalPrinter> {
     renderer: Option<Renderer<PrinterWriter<P>>>,
     line_buf: String,
     in_turn: bool,
+    /// While `true`, incoming `Entry` events are skipped — they're a
+    /// post-fork history re-replay whose content is already on screen.
+    /// Set by `Reset`, cleared by `HistoryComplete`.  (The terminal can't
+    /// un-print the old branch, so it just continues from the fork point.)
+    resetting: bool,
 }
 
 impl<P: rustyline::ExternalPrinter> RenderState<P> {
@@ -376,6 +392,7 @@ impl<P: rustyline::ExternalPrinter> RenderState<P> {
             renderer,
             line_buf: String::new(),
             in_turn: false,
+            resetting: false,
         }
     }
 
@@ -426,15 +443,38 @@ impl<P: rustyline::ExternalPrinter> RenderState<P> {
 
 pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
     printer: Arc<StdMutex<P>>,
-    mut events: mpsc::UnboundedReceiver<SessionEvent>,
+    mut events: mpsc::UnboundedReceiver<ServerMessage>,
     done_tx: mpsc::UnboundedSender<Option<String>>,
     term_width: usize,
 ) {
-    use crate::events::{PromptSource, TurnEndReason};
-
     let mut state = RenderState::new(printer, term_width);
 
-    while let Some(event) = events.recv().await {
+    while let Some(msg) = events.recv().await {
+        let event = match msg {
+            // A fork happened.  The server re-replays the active branch
+            // (already on screen); skip it until HistoryComplete.  Print a
+            // notice so the fork is visible in the linear terminal log.
+            ServerMessage::Reset { .. } => {
+                state.resetting = true;
+                state
+                    .lock_printer()
+                    .print(format!("{DIM}  ↻ forked — regenerating from here{RST}\n"))
+                    .ok();
+                continue;
+            }
+            ServerMessage::HistoryComplete => {
+                // End of a history batch (initial catch-up or post-fork
+                // re-replay).  Stop skipping.
+                state.resetting = false;
+                continue;
+            }
+            ServerMessage::Entry(entry) => {
+                if state.resetting {
+                    continue; // re-replayed history — already on screen.
+                }
+                entry.event
+            }
+        };
         match event {
             SessionEvent::SessionInfo { ref name } => {
                 state

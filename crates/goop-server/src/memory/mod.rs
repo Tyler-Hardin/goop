@@ -17,8 +17,8 @@ mod replay;
 mod transaction_log;
 
 pub(crate) use replay::{
-    VisibleItem, count_tool_calls, extract_tool_pair_messages, last_prompt_boundary, replay_log,
-    replay_visible, tool_call_ids,
+    VisibleItem, collect_branch, count_tool_calls, extract_tool_pair_messages,
+    last_prompt_boundary, replay_log, replay_visible, tool_call_ids,
 };
 pub(crate) use transaction_log::TransactionLog;
 
@@ -71,7 +71,7 @@ impl LogReplayMemory {
     /// file-backed memory used for the progress bar.
     pub async fn estimated_tokens(&self) -> usize {
         let log = self.history.lock().await;
-        let messages = replay_log(log.entries());
+        let messages = replay_log(log.entries(), log.active_tip());
         messages.iter().map(|m| self.counter.count(m)).sum()
     }
 
@@ -80,7 +80,7 @@ impl LogReplayMemory {
     /// the `Compacted.covers` list.
     pub(crate) async fn agent_visible_items(&self) -> Vec<VisibleItem> {
         let log = self.history.lock().await;
-        replay_visible(log.entries())
+        replay_visible(log.entries(), log.active_tip())
     }
 
     /// Approximate token count of an arbitrary message list, using the same
@@ -99,7 +99,7 @@ impl ConversationMemory for LogReplayMemory {
     > {
         Box::pin(async move {
             let log = self.history.lock().await;
-            Ok(replay_log(log.entries()))
+            Ok(replay_log(log.entries(), log.active_tip()))
         })
     }
 

@@ -40,6 +40,18 @@ use crate::events::{LogEntry, SessionEvent, TurnEndReason};
 pub(crate) struct TransactionLog {
     entries: Vec<LogEntry>,
     next_seq: u64,
+    /// The seq of the latest entry on the **active branch** — the branch
+    /// replay walks.  `None` for an empty log.  After any [`append`](Self::append)
+    /// this is the just-appended entry's seq (the active branch extends
+    /// linearly).  A fork ([`set_active_tip`](Self::set_active_tip)) moves it
+    /// to an earlier seq so the next append branches from there.
+    ///
+    /// In the common (linear) case this always equals the last entry's seq,
+    /// so persisting it is redundant — the default on load is "last entry".
+    /// It only differs from the last entry transiently during a fork (between
+    /// [`set_active_tip`](Self::set_active_tip) and the next [`append`](Self::append)),
+    /// or persistently when a user switches to an older branch (future UI).
+    active_tip: Option<u64>,
     /// On-disk path.  `None` for in-memory logs (tests).
     path: Option<PathBuf>,
 }
@@ -71,9 +83,11 @@ impl TransactionLog {
     /// Shared implementation: load from disk, inject `SessionInfo`, return.
     async fn open_inner(path: PathBuf, session_name: &str) -> anyhow::Result<Self> {
         let (entries, next_seq) = load_from_file(&path)?;
+        let active_tip = entries.last().map(|e| e.seq);
         let mut log = Self {
             entries,
             next_seq,
+            active_tip,
             path: Some(path),
         };
         log.ensure_session_info(session_name).await;
@@ -110,20 +124,41 @@ impl TransactionLog {
             append_to_file_opt(&self.path, &entry).await;
         }
         self.entries.insert(0, entry);
+        // The injected SessionInfo is now the last entry of an otherwise-empty
+        // log, or sits before the existing entries.  Only update active_tip
+        // when the log was empty (the only case where this entry is the tip).
+        if was_empty {
+            self.active_tip = Some(seq);
+        }
+    }
+
+    /// The resolved active tip: the configured tip, or the last entry's seq
+    /// when unset (the linear default).  `None` only for an empty log.
+    pub(crate) fn active_tip(&self) -> Option<u64> {
+        self.active_tip
+            .or_else(|| self.entries.last().map(|e| e.seq))
+    }
+
+    /// Move the active tip to `tip` (a fork point).  The next [`append`](Self::append)
+    /// branches from `tip` instead of the current tip.  `tip` must be the seq
+    /// of an existing entry.
+    pub(crate) fn set_active_tip(&mut self, tip: u64) {
+        self.active_tip = Some(tip);
     }
 
     /// Append an event as a new [`LogEntry`]: assign the next monotonic `seq`,
-    /// compute `parent` from the current last entry, stamp `ts: now`, push,
-    /// and persist to disk — all in one call.
+    /// compute `parent` from the active tip, stamp `ts: now`, push, persist to
+    /// disk, and advance the active tip — all in one call.  Returns the
+    /// appended entry (for broadcast).
     ///
-    /// This is the **sole mutation path**.  No external code can assign seqs,
-    /// push entries directly, or observe `next_seq`.  Persistence is not
-    /// separable: an entry is either in memory *and* on disk, or it doesn't
-    /// exist.
-    pub(crate) async fn append(&mut self, event: SessionEvent) {
+    /// This is the **sole mutation path** for linear appends.  No external
+    /// code can assign seqs, push entries directly, or observe `next_seq`.
+    /// Persistence is not separable: an entry is either in memory *and* on
+    /// disk, or it doesn't exist.
+    pub(crate) async fn append(&mut self, event: SessionEvent) -> LogEntry {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let parent = self.entries.last().map(|e| e.seq);
+        let parent = self.active_tip();
         let entry = LogEntry {
             seq,
             parent,
@@ -133,19 +168,16 @@ impl TransactionLog {
         // Persist before pushing so the file is always ahead of any
         // subscriber that might race a crash.
         append_to_file_opt(&self.path, &entry).await;
-        self.entries.push(entry);
+        self.entries.push(entry.clone());
+        // The active branch now extends to this new entry.
+        self.active_tip = Some(seq);
+        entry
     }
 
     /// Read-only access to the full entry list.  Used by replay (agent-memory
     /// reconstruction) and history snapshots (late-joining client catch-up).
     pub(crate) fn entries(&self) -> &[LogEntry] {
         &self.entries
-    }
-
-    /// Clone the entry list (for [`SessionSubscriber`](crate::SessionSubscriber)
-    /// history replay, which needs an owned snapshot under the lock).
-    pub(crate) fn entries_vec(&self) -> Vec<LogEntry> {
-        self.entries.clone()
     }
 }
 
@@ -388,7 +420,8 @@ mod tests {
         assert_eq!(log.entries().len(), 1); // no injection
     }
 
-    /// `append` assigns monotonic seqs and chains parent pointers.
+    /// `append` assigns monotonic seqs, chains parent pointers, and advances
+    /// the active tip.
     #[tokio::test]
     async fn append_assigns_seq_and_parent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -405,6 +438,85 @@ mod tests {
         let e1 = &log.entries()[2];
         assert_eq!(e1.seq, 2);
         assert_eq!(e1.parent, Some(1));
+        // active_tip tracks the last append.
+        assert_eq!(log.active_tip(), Some(2));
+    }
+
+    /// `set_active_tip` + `append` creates a fork: the new entry's parent is
+    /// the fork point, not the last entry.  Subsequent appends extend the new
+    /// branch linearly.
+    #[tokio::test]
+    async fn fork_appends_branch_from_active_tip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+        let mut log = TransactionLog::open_at(path, "s").await.unwrap();
+        // Build a linear trunk: SessionInfo(0), A(1), B(2).
+        log.append(SessionEvent::Thinking).await; // seq 1
+        log.append(SessionEvent::AssistantText("B".into())).await; // seq 2
+        assert_eq!(log.active_tip(), Some(2));
+
+        // Fork from seq 1 (the parent of seq 2).  The next append branches.
+        log.set_active_tip(1);
+        assert_eq!(log.active_tip(), Some(1));
+        let forked = log.append(SessionEvent::AssistantText("fork".into())).await; // seq 3
+        assert_eq!(forked.seq, 3);
+        assert_eq!(forked.parent, Some(1)); // branched from seq 1, not seq 2
+        assert_eq!(log.active_tip(), Some(3));
+
+        // A subsequent append extends the new branch linearly.
+        let next = log.append(SessionEvent::Thinking).await; // seq 4
+        assert_eq!(next.seq, 4);
+        assert_eq!(next.parent, Some(3));
+    }
+
+    /// End-to-end fork flow using the real `TransactionLog` + `collect_branch`:
+    /// build a trunk turn, fork from before the prompt, run a new turn on the
+    /// new branch, and verify the active branch (default tip) excludes the old
+    /// turn entirely.
+    #[tokio::test]
+    async fn fork_flow_active_branch_excludes_old_turn() {
+        use crate::memory::collect_branch;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+        let mut log = TransactionLog::open_at(path, "s").await.unwrap();
+        // seq 0 = SessionInfo (injected)
+        // Trunk turn: UserPrompt "old" → AssistantText → TurnEnded
+        log.append(SessionEvent::UserPrompt {
+            content: "old".into(),
+            source: PromptSource::Terminal,
+        })
+        .await; // seq 1, parent 0
+        log.append(SessionEvent::AssistantText("old answer".into()))
+            .await; // seq 2, parent 1
+        log.append(SessionEvent::TurnEnded {
+            reason: TurnEndReason::Completed,
+        })
+        .await; // seq 3, parent 2
+
+        // Fork from seq 0 (the parent of the old prompt) — simulating
+        // edit-and-regenerate of seq 1.
+        log.set_active_tip(0);
+        log.append(SessionEvent::UserPrompt {
+            content: "new".into(),
+            source: PromptSource::Web,
+        })
+        .await; // seq 4, parent 0 (branched)
+        log.append(SessionEvent::AssistantText("new answer".into()))
+            .await; // seq 5, parent 4
+        log.append(SessionEvent::TurnEnded {
+            reason: TurnEndReason::Completed,
+        })
+        .await; // seq 6, parent 5
+
+        // The default active tip is the last entry (seq 6) → the new branch.
+        let branch = collect_branch(None, log.entries());
+        let seqs: Vec<u64> = branch.iter().map(|e| e.seq).collect();
+        // Excludes the old turn (seqs 1,2,3); includes the shared root + new turn.
+        assert_eq!(seqs, vec![0, 4, 5, 6]);
+
+        // And replaying it yields just the new prompt + answer.
+        let msgs = crate::memory::replay_log(log.entries(), None);
+        assert_eq!(msgs.len(), 2);
     }
 
     /// Legacy bare-event lines are migrated into `LogEntry` envelopes with

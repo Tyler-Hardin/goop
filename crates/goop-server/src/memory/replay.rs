@@ -22,7 +22,46 @@ pub(crate) struct VisibleItem {
     pub(crate) msg: Message,
 }
 
+/// Walk the conversation tree backward from `active_tip` to the root,
+/// returning the active branch in chronological (root→tip) order.
+///
+/// `active_tip = None` means "the last entry" (the linear default) — every
+/// entry is on the branch, so the whole log is returned in order.  `Some(tip)`
+/// follows `parent` pointers from `tip` to the root, collecting ancestors;
+/// entries not on that chain (sibling branches) are excluded.
+///
+/// This is git's model: commits have parents, branches are tips.  See §2.9 of
+/// the redesign doc.
+///
+/// Returns owned entries (cloned) so the result can outlive the log lock —
+/// the subscriber uses it for history replay.
+pub(crate) fn collect_branch(active_tip: Option<u64>, log: &[LogEntry]) -> Vec<LogEntry> {
+    let Some(tip) = active_tip.or_else(|| log.last().map(|e| e.seq)) else {
+        return Vec::new();
+    };
+    // Index entries by seq for O(1) parent lookup.  (seqs are dense in the
+    // common case but may have gaps from forks/legacy migration, so a map is
+    // safer than a vec.)
+    let by_seq: std::collections::HashMap<u64, &LogEntry> =
+        log.iter().map(|e| (e.seq, e)).collect();
+    let mut branch: Vec<&LogEntry> = Vec::new();
+    let mut cur = Some(tip);
+    while let Some(seq) = cur {
+        let Some(entry) = by_seq.get(&seq) else {
+            break; // dangling parent — stop (defence in depth).
+        };
+        cur = entry.parent;
+        branch.push(entry);
+    }
+    branch.reverse(); // root → tip
+    branch.into_iter().cloned().collect()
+}
+
 /// Replay the transaction log into the agent-visible message list.
+///
+/// **Branch-aware:** only the active branch (walked from `active_tip`) is
+/// replayed — sibling branches (old forks) are excluded.  `active_tip = None`
+/// means "last entry" (linear).
 ///
 /// **Turn buffering:** content events (`UserPrompt`, `AssistantText`,
 /// `ToolCall`, `ToolResult`) are buffered into the current turn and only
@@ -42,11 +81,19 @@ pub(crate) struct VisibleItem {
 /// (e.g. an in-flight tool call at the moment a turn was cancelled with
 /// work committed) is dropped by [`drop_orphaned_tool_pairs`], since some
 /// provider APIs reject an unpaired call or result.
-pub(crate) fn replay_visible(log: &[LogEntry]) -> Vec<VisibleItem> {
+pub(crate) fn replay_visible(log: &[LogEntry], active_tip: Option<u64>) -> Vec<VisibleItem> {
+    let branch = collect_branch(active_tip, log);
+    replay_branch(&branch)
+}
+
+/// Replay a pre-collected branch (a slice of `LogEntry` in chronological
+/// order).  Separated from [`replay_visible`] so callers that already have a
+/// branch avoid re-walking.
+fn replay_branch(branch: &[LogEntry]) -> Vec<VisibleItem> {
     let mut visible: Vec<VisibleItem> = Vec::new();
     let mut replay = Replay::new();
 
-    for entry in log {
+    for entry in branch {
         match &entry.event {
             SessionEvent::TurnEnded { reason } => {
                 // Finalise any pending assistant text/calls and tool results
@@ -110,10 +157,10 @@ pub(crate) fn replay_visible(log: &[LogEntry]) -> Vec<VisibleItem> {
                 target,
                 replacement,
             } => {
-                apply_edit(&mut visible, log, *target, replacement);
+                apply_edit(&mut visible, branch, *target, replacement);
             }
             SessionEvent::Deleted { target } => {
-                apply_delete(&mut visible, log, *target);
+                apply_delete(&mut visible, branch, *target);
             }
 
             _ => replay.feed(entry),
@@ -130,8 +177,8 @@ pub(crate) fn replay_visible(log: &[LogEntry]) -> Vec<VisibleItem> {
 
 /// Replay the log into the agent-visible [`Message`] list (the shape rig
 /// consumes).  Thin wrapper over [`replay_visible`].
-pub(crate) fn replay_log(log: &[LogEntry]) -> Vec<Message> {
-    replay_visible(log)
+pub(crate) fn replay_log(log: &[LogEntry], active_tip: Option<u64>) -> Vec<Message> {
+    replay_visible(log, active_tip)
         .into_iter()
         .map(|item| item.msg)
         .collect()
@@ -798,7 +845,7 @@ mod tests {
                 },
             ),
         ];
-        let msgs = replay_log(&log);
+        let msgs = replay_log(&log, None);
         assert_eq!(msgs.len(), 2);
         assert!(matches!(msgs[0], Message::User { .. }));
         assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("Hello there"));
@@ -832,7 +879,7 @@ mod tests {
             ),
             entry(3, SessionEvent::AssistantText("partial".into())),
         ];
-        let msgs = replay_log(&log);
+        let msgs = replay_log(&log, None);
         // Only the first turn (1 user, 0 assistant since no text) survives.
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0], Message::User { .. }));
@@ -859,7 +906,7 @@ mod tests {
                 },
             ),
         ];
-        assert!(replay_log(&log).is_empty());
+        assert!(replay_log(&log, None).is_empty());
     }
 
     /// Cancel after work was committed keeps the committed work; the
@@ -905,7 +952,7 @@ mod tests {
                 },
             ),
         ];
-        let msgs = replay_log(&log);
+        let msgs = replay_log(&log, None);
         // user prompt + (assistant call "a" + user result "a"); call "b" dropped.
         assert_eq!(msgs.len(), 3);
         assert!(matches!(msgs[0], Message::User { .. })); // prompt
@@ -948,7 +995,7 @@ mod tests {
                 },
             ),
         ];
-        let msgs = replay_log(&log);
+        let msgs = replay_log(&log, None);
         assert_eq!(msgs.len(), 4);
         assert!(matches!(msgs[0], Message::User { .. })); // prompt
         assert!(matches!(msgs[1], Message::Assistant { .. })); // call x
@@ -1002,7 +1049,7 @@ mod tests {
                 },
             ),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // summary (seq 3) + the later prompt (seq 4)
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].seq, 3);
@@ -1047,7 +1094,7 @@ mod tests {
                 },
             ),
         ];
-        let msgs = replay_log(&log);
+        let msgs = replay_log(&log, None);
         assert_eq!(msgs.len(), 2); // user prompt + assistant text only
         assert!(matches!(msgs[0], Message::User { .. }));
         assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("hello"));
@@ -1099,7 +1146,7 @@ mod tests {
                 },
             ),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // prompt (seq 0) + summary (seq 5) + assistant text (seq 3)
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].seq, 0);
@@ -1167,7 +1214,7 @@ mod tests {
                 },
             ),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // prompt (0) + summary (6) + assistant[call b] (1) + user[result b] (3)
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].seq, 0); // prompt
@@ -1245,7 +1292,7 @@ mod tests {
                 },
             ),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // Only the compaction summary (seq 4) should remain.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].seq, 4);
@@ -1292,7 +1339,7 @@ mod tests {
                 },
             ),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // All three original items survive; the ghost summary is not added.
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].seq, 0);
@@ -1377,7 +1424,7 @@ mod tests {
             // delete the first prompt
             entry(4, SessionEvent::Deleted { target: 0 }),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].seq, 2);
         assert_eq!(user_text(&items[0].msg).as_deref(), Some("second"));
@@ -1421,7 +1468,7 @@ mod tests {
             entry(5, SessionEvent::Deleted { target: 1 }), // call
             entry(6, SessionEvent::Deleted { target: 2 }), // result
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // prompt (0) + assistant text (3); the call+result pair is gone.
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].seq, 0);
@@ -1480,7 +1527,7 @@ mod tests {
             // delete only call "a"; its result is dropped by the orphan net
             entry(6, SessionEvent::Deleted { target: 1 }),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // prompt (0) + assistant[call b] (1) + user[result b] (3)
         assert_eq!(items.len(), 3);
         // The surviving assistant message has only call "b".
@@ -1528,7 +1575,7 @@ mod tests {
                 },
             ),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         assert_eq!(items.len(), 1);
         assert_eq!(user_text(&items[0].msg).as_deref(), Some("rewritten"));
     }
@@ -1576,7 +1623,7 @@ mod tests {
                 },
             ),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // prompt (0) + assistant[text + call a] (1) + user[result a] (3)
         assert_eq!(items.len(), 3);
         let (text, calls) = match &items[1].msg {
@@ -1644,7 +1691,7 @@ mod tests {
                 },
             ),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         // prompt (0) + assistant[call a] (1) + user[result a] (2)
         assert_eq!(items.len(), 3);
         assert_eq!(
@@ -1672,7 +1719,7 @@ mod tests {
             ),
             entry(2, SessionEvent::Deleted { target: 999 }),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].seq, 0);
     }
@@ -1704,7 +1751,253 @@ mod tests {
             ),
             entry(3, SessionEvent::Deleted { target: 0 }),
         ];
-        let items = replay_visible(&log);
+        let items = replay_visible(&log, None);
         assert!(items.is_empty());
+    }
+
+    // ── Forking / branching tests ────────────────────────────────────
+
+    /// Build an entry with an explicit parent (for forked logs).  The default
+    /// `entry()` helper always chains `parent = seq - 1`.
+    fn fork_entry(seq: u64, parent: Option<u64>, event: SessionEvent) -> LogEntry {
+        LogEntry {
+            seq,
+            parent,
+            ts: chrono::Utc::now(),
+            event,
+        }
+    }
+
+    /// `collect_branch` with `None` (the linear default) returns the whole log
+    /// in order.
+    #[test]
+    fn collect_branch_linear_returns_all() {
+        let log = vec![
+            entry(0, SessionEvent::SessionInfo { name: "s".into() }),
+            entry(
+                1,
+                SessionEvent::UserPrompt {
+                    content: "hi".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(2, SessionEvent::Thinking),
+        ];
+        let branch = collect_branch(None, &log);
+        assert_eq!(branch.len(), 3);
+        assert_eq!(
+            branch.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    /// `collect_branch` with a fork tip walks parents, excluding the sibling
+    /// (old) branch.
+    #[test]
+    fn collect_branch_fork_excludes_sibling() {
+        // Trunk: 0(SessionInfo) → 1(UserPrompt A) → 2(AssistantText) → 3(TurnEnded)
+        // Fork:  4(UserPrompt A') parent=0  → 5(AssistantText) → 6(TurnEnded)
+        let log = vec![
+            fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
+            fork_entry(
+                1,
+                Some(0),
+                SessionEvent::UserPrompt {
+                    content: "A".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            fork_entry(2, Some(1), SessionEvent::AssistantText("old".into())),
+            fork_entry(
+                3,
+                Some(2),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // fork branch
+            fork_entry(
+                4,
+                Some(0),
+                SessionEvent::UserPrompt {
+                    content: "A'".into(),
+                    source: crate::events::PromptSource::Web,
+                },
+            ),
+            fork_entry(5, Some(4), SessionEvent::AssistantText("new".into())),
+            fork_entry(
+                6,
+                Some(5),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ];
+        // Active tip = 6 (the new branch).  Should exclude seqs 1,2,3.
+        let branch = collect_branch(Some(6), &log);
+        assert_eq!(
+            branch.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 4, 5, 6]
+        );
+    }
+
+    /// Replaying the new branch shows only the new prompt + response; the old
+    /// branch is invisible to the agent.
+    #[test]
+    fn replay_fork_shows_new_branch_only() {
+        let log = vec![
+            fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
+            fork_entry(
+                1,
+                Some(0),
+                SessionEvent::UserPrompt {
+                    content: "old prompt".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            fork_entry(2, Some(1), SessionEvent::AssistantText("old answer".into())),
+            fork_entry(
+                3,
+                Some(2),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // fork from seq 0 (before the old prompt)
+            fork_entry(
+                4,
+                Some(0),
+                SessionEvent::UserPrompt {
+                    content: "new prompt".into(),
+                    source: crate::events::PromptSource::Web,
+                },
+            ),
+            fork_entry(5, Some(4), SessionEvent::AssistantText("new answer".into())),
+            fork_entry(
+                6,
+                Some(5),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ];
+        let msgs = replay_log(&log, Some(6));
+        // new prompt + new answer only
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(user_text(&msgs[0]).as_deref(), Some("new prompt"));
+        assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("new answer"));
+    }
+
+    /// Replaying the OLD branch (active tip = 3) shows the old prompt+answer;
+    /// the fork is invisible.  This is branch switching.
+    #[test]
+    fn replay_old_branch_shows_old_branch_only() {
+        let log = vec![
+            fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
+            fork_entry(
+                1,
+                Some(0),
+                SessionEvent::UserPrompt {
+                    content: "old prompt".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            fork_entry(2, Some(1), SessionEvent::AssistantText("old answer".into())),
+            fork_entry(
+                3,
+                Some(2),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            fork_entry(
+                4,
+                Some(0),
+                SessionEvent::UserPrompt {
+                    content: "new prompt".into(),
+                    source: crate::events::PromptSource::Web,
+                },
+            ),
+            fork_entry(5, Some(4), SessionEvent::AssistantText("new answer".into())),
+            fork_entry(
+                6,
+                Some(5),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ];
+        let msgs = replay_log(&log, Some(3));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(user_text(&msgs[0]).as_deref(), Some("old prompt"));
+        assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("old answer"));
+    }
+
+    /// A fork that shares a trunk with a prior turn: the shared prefix is
+    /// visible on both branches, only the divergent suffix differs.
+    #[test]
+    fn replay_fork_preserves_shared_prefix() {
+        // Trunk: 0(root) → 1(prompt1) → 2(answer1) → 3(TurnEnded)
+        //        → 4(prompt2) → 5(answer2) → 6(TurnEnded)
+        // Fork from 3 (after turn 1): 7(prompt2') → 8(answer2') → 9(TurnEnded)
+        let log = vec![
+            fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
+            fork_entry(
+                1,
+                Some(0),
+                SessionEvent::UserPrompt {
+                    content: "p1".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            fork_entry(2, Some(1), SessionEvent::AssistantText("a1".into())),
+            fork_entry(
+                3,
+                Some(2),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            fork_entry(
+                4,
+                Some(3),
+                SessionEvent::UserPrompt {
+                    content: "p2".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            fork_entry(5, Some(4), SessionEvent::AssistantText("a2".into())),
+            fork_entry(
+                6,
+                Some(5),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // fork from 3
+            fork_entry(
+                7,
+                Some(3),
+                SessionEvent::UserPrompt {
+                    content: "p2'".into(),
+                    source: crate::events::PromptSource::Web,
+                },
+            ),
+            fork_entry(8, Some(7), SessionEvent::AssistantText("a2'".into())),
+            fork_entry(
+                9,
+                Some(8),
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ];
+        // New branch (tip 9): p1, a1, p2', a2'.
+        let msgs = replay_log(&log, Some(9));
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(user_text(&msgs[0]).as_deref(), Some("p1"));
+        assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("a1"));
+        assert_eq!(user_text(&msgs[2]).as_deref(), Some("p2'"));
+        assert_eq!(assistant_text(&msgs[3]).as_deref(), Some("a2'"));
     }
 }

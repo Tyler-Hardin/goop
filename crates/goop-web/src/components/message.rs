@@ -55,7 +55,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             let confirm_delete = RwSignal::new(false);
             let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
             let edit_sig = edit;
-            let state_edit = state.clone();
+            let state_fork = state.clone();
             let state_del = state.clone();
             // Clone for start_edit before `content` is moved into the view.
             let content_for_edit = content.clone();
@@ -76,12 +76,19 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                 focus_and_fill_textarea(&textarea_ref, &text);
             };
 
+            // Editing a user prompt forks the conversation (edit-and-
+            // regenerate, like ChatGPT): the server appends a new `UserPrompt`
+            // with this text branching from the prompt's parent and reruns the
+            // turn.  The old branch is preserved; the client re-catches-up to
+            // the new branch via a `Reset`.  This is distinct from the
+            // `AssistantFinal`/`ToolCall` edit, which overlays the change in
+            // place ("writing into the LLM's mind") without regenerating.
             let save_edit = move |evt: ev::MouseEvent| {
                 evt.stop_propagation();
                 if let Some(el) = textarea_ref.get() {
                     let text = el.value();
                     if !text.trim().is_empty() {
-                        state_edit.edit_message(seq, EditContent::Text(text));
+                        state_fork.fork_message(seq, text);
                     }
                 }
                 editing.set(false);
@@ -142,7 +149,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                                 rows="1"
                             ></textarea>
                             <div class="msg-edit-actions">
-                                <button class="msg-edit-btn save" on:click=save_edit>"Save"</button>
+                                <button class="msg-edit-btn save" on:click=save_edit>"↻ Save & regenerate"</button>
                                 <button class="msg-edit-btn cancel" on:click=cancel_edit>"Cancel"</button>
                             </div>
                         </div>

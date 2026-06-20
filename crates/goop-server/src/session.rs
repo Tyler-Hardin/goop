@@ -13,9 +13,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::config::{self, Config, McpServerDef};
-use crate::events::{EditContent, LogEntry, PromptSource, SessionEvent, TurnEndReason};
+use crate::events::{
+    EditContent, LogEntry, PromptSource, ServerMessage, SessionEvent, TurnEndReason,
+};
 use crate::memory::{
-    self, LogReplayMemory, TransactionLog, build_session_memory, prompt_history_path,
+    self, LogReplayMemory, TransactionLog, build_session_memory, collect_branch,
+    prompt_history_path,
 };
 use crate::model;
 use crate::preamble::build_preamble;
@@ -24,36 +27,72 @@ use crate::transport::{PersistedTransport, Transport};
 
 // ── subscriber with history replay ──────────────────────────────
 
-/// Returned by [`Session::subscribe_all`]. Replays every prior event
-/// before yielding live events.
+/// Returned by [`Session::subscribe_all`]. Replays the active branch's
+/// history before yielding live events.
+///
+/// On a [`Reset`](ServerMessage::Reset) (fork), the subscriber re-snapshots
+/// the active branch up to the fork point and re-replays it — so clients
+/// see the new branch without reconnecting.
 pub struct SessionSubscriber {
+    /// Shared log, for re-snapshotting the active branch on `Reset`.
+    log: Arc<Mutex<TransactionLog>>,
+    /// Current history-replay buffer (the active branch, owned).
     history: Vec<LogEntry>,
     history_cursor: usize,
     history_done: bool,
-    rx: broadcast::Receiver<SessionEvent>,
+    rx: broadcast::Receiver<ServerMessage>,
 }
 
 impl SessionSubscriber {
-    /// Wait for the next event (history first, then live).
+    /// Wait for the next [`ServerMessage`] (history first, then live).
     ///
-    /// After the last history event, the next call returns
-    /// [`SessionEvent::HistoryComplete`] to signal the transition to
-    /// live events.
-    pub async fn recv(&mut self) -> Result<SessionEvent, broadcast::error::RecvError> {
+    /// After the last history entry, the next call returns
+    /// [`HistoryComplete`](ServerMessage::HistoryComplete) to signal the
+    /// transition to live events.  A [`Reset`](ServerMessage::Reset) (fork)
+    /// triggers a re-snapshot of the active branch: the subscriber refills
+    /// its history buffer from the fork point and the *next* calls replay it
+    /// again, followed by another `HistoryComplete`.
+    pub async fn recv(&mut self) -> Result<ServerMessage, broadcast::error::RecvError> {
         if self.history_cursor < self.history.len() {
-            let event = self.history[self.history_cursor].event.clone();
+            let entry = self.history[self.history_cursor].clone();
             self.history_cursor += 1;
-            return Ok(event);
+            return Ok(ServerMessage::Entry(entry));
         }
         if !self.history_done {
             self.history_done = true;
-            return Ok(SessionEvent::HistoryComplete);
+            return Ok(ServerMessage::HistoryComplete);
         }
-        self.rx.recv().await
+        match self.rx.recv().await {
+            // A fork happened at `tip`.  Re-snapshot the active branch up to
+            // `tip` (the fork point) so the re-replay excludes the new
+            // branch's entries — which may already have been appended to the
+            // log by the time we process this.  Yield the Reset so the client
+            // clears and re-enters catch-up; the re-replayed history and a
+            // fresh HistoryComplete follow.
+            Ok(ServerMessage::Reset { tip }) => {
+                let log = self.log.lock().await;
+                self.history = collect_branch(Some(tip), log.entries());
+                self.history_cursor = 0;
+                self.history_done = false;
+                Ok(ServerMessage::Reset { tip })
+            }
+            Ok(other) => Ok(other),
+            Err(e) => Err(e),
+        }
     }
 }
 
 // ── session ─────────────────────────────────────────────────────
+
+/// A queued prompt: the text, its source, an optional fork point (the seq to
+/// branch from — `None` for a normal linear prompt), and an optional
+/// completion signal for the submitter.
+type QueuedPrompt = (
+    String,
+    PromptSource,
+    Option<u64>,
+    Option<oneshot::Sender<()>>,
+);
 
 /// Holds the agent, conversation state, and a serialised prompt queue.
 ///
@@ -70,7 +109,7 @@ pub struct Session {
     #[allow(dead_code)]
     pub(crate) state: Arc<SessionState>,
     agent: Arc<crate::model::AnyAgent>,
-    tx: broadcast::Sender<SessionEvent>,
+    tx: broadcast::Sender<ServerMessage>,
     history: Arc<Mutex<TransactionLog>>,
 
     /// Clone of the log-replay memory, used to estimate token counts for
@@ -103,8 +142,8 @@ pub struct Session {
     tool_summarizer: Option<Arc<crate::model::AnyAgent>>,
 
     /// Push a prompt here from any view; the background worker drains it.
-    /// Each entry carries an optional completion signal for the submitter.
-    submit_tx: mpsc::UnboundedSender<(String, PromptSource, Option<oneshot::Sender<()>>)>,
+    /// See [`QueuedPrompt`] for the fields.
+    submit_tx: mpsc::UnboundedSender<QueuedPrompt>,
 
     /// Set by `cancel()` and consumed by the currently-running turn.
     /// When the sender is dropped or fired, the turn is cancelled.
@@ -252,10 +291,22 @@ impl Session {
 
         // ── open the transaction log (RAII: loads, migrates, injects
         //    SessionInfo, persists if new) ──────────────────────────
-        let log = TransactionLog::open(&name).await?;
+        let mut log = TransactionLog::open(&name).await?;
+        // Apply a persisted active tip (a resumed session that was viewing an
+        // older branch — future UI).  `None` (the default) means "last entry"
+        // — linear, or the newest fork (basic forking always continues on the
+        // newest branch, whose entries are appended last, so the default is
+        // correct without any persistence).
+        if let Some(tip) = persisted.active_tip {
+            log.set_active_tip(tip);
+            state.set_active_tip(Some(tip)).await;
+        }
         // Broadcast SessionInfo immediately so live subscribers see it.
-        // (The log already has it; this is the delivery mechanism.)
-        let _ = tx.send(SessionEvent::SessionInfo { name: name.clone() });
+        // (The log already has it as the first entry; this is the delivery
+        // mechanism for live-only subscribers.)
+        if let Some(info) = log.entries().first() {
+            let _ = tx.send(ServerMessage::Entry(info.clone()));
+        }
 
         // ── shared transaction log: the source of truth for agent memory ──
         // The same `Arc` is handed to the `LogReplayMemory` below, so every
@@ -333,9 +384,44 @@ impl Session {
     /// emitted).
     pub fn submit(&self, prompt: impl Into<String>, source: PromptSource) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
-        // Unbounded send never fails.
-        let _ = self.submit_tx.send((prompt.into(), source, Some(tx)));
+        // Unbounded send never fails.  No fork point → linear append.
+        let _ = self.submit_tx.send((prompt.into(), source, None, Some(tx)));
         rx
+    }
+
+    /// Fork the conversation from the point *before* `target` (i.e. from
+    /// `target`'s parent) and regenerate: a new `UserPrompt` carrying
+    /// `content` is appended with `parent` set to that fork point, the active
+    /// tip moves to the new branch, and a turn runs.  The old branch is
+    /// preserved in the append-only log.  See §2.9 of the redesign doc.
+    ///
+    /// This is edit-and-regenerate (like ChatGPT): the user edits a past user
+    /// message and resubmits.  Unlike [`edit`](Self::edit) (which overlays the
+    /// change in place without branching), forking creates a new branch and
+    /// reruns the turn.
+    ///
+    /// The fork point is computed now (from the log) but applied in
+    /// [`drain_queue`](Self::drain_queue) when the prompt is processed, so it
+    /// is atomic with respect to other queued prompts.
+    pub async fn fork(&self, target: u64, content: String) {
+        // The fork point is the parent of the target event — branching from
+        // there excludes the target and everything after it on the old branch.
+        let fork_point = {
+            let log = self.history.lock().await;
+            log.entries()
+                .iter()
+                .find(|e| e.seq == target)
+                .and_then(|e| e.parent)
+        };
+        let Some(fork_point) = fork_point else {
+            tracing::warn!("fork: target seq {target} not found or has no parent");
+            return;
+        };
+        tracing::info!("forking from seq {fork_point} (target {target} replaced)");
+        let (tx, _rx) = oneshot::channel();
+        let _ = self
+            .submit_tx
+            .send((content, PromptSource::Web, Some(fork_point), Some(tx)));
     }
 
     /// Cancel the currently-running LLM turn (if any).
@@ -465,18 +551,25 @@ impl Session {
     /// Use this for views that have been present since session creation
     /// and don't need a history replay.
     #[allow(dead_code)] // useful for future views that don't need history replay
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<ServerMessage> {
         self.tx.subscribe()
     }
 
-    /// Subscribe with **full history replay**.
+    /// Subscribe with **full history replay** of the active branch.
     ///
-    /// Late-joining views (web, phone, …) receive every event since
-    /// session creation before transitioning to live events.
+    /// Late-joining views (web, phone, …) receive every event on the active
+    /// branch (walked from the active tip) before transitioning to live
+    /// events.  On a later fork, the subscriber re-replays the new branch
+    /// automatically (see [`SessionSubscriber`]).
     pub async fn subscribe_all(&self) -> SessionSubscriber {
-        let history = self.history.lock().await.entries_vec();
-        let rx = self.tx.subscribe();
+        let (history, rx) = {
+            let log = self.history.lock().await;
+            let history = collect_branch(log.active_tip(), log.entries());
+            let rx = self.tx.subscribe();
+            (history, rx)
+        };
         SessionSubscriber {
+            log: self.history.clone(),
             history,
             history_cursor: 0,
             history_done: false,
@@ -487,13 +580,30 @@ impl Session {
     // ── internals ────────────────────────────────────────────────
 
     /// Background worker: drain prompts one at a time.
-    async fn drain_queue(
-        self: Arc<Self>,
-        mut rx: mpsc::UnboundedReceiver<(String, PromptSource, Option<oneshot::Sender<()>>)>,
-    ) {
-        while let Some((prompt, source, done)) = rx.recv().await {
+    async fn drain_queue(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<QueuedPrompt>) {
+        while let Some((prompt, source, fork_point, done)) = rx.recv().await {
             // Write every prompt to the global history file (all sources).
             append_prompt_to_history(&prompt).await;
+
+            // ── fork (edit-and-regenerate) ──
+            // Move the active tip to the fork point and signal subscribers to
+            // re-catch-up *before* the new turn's events are appended.  The
+            // Reset carries the fork point so subscribers re-snapshot the
+            // shared prefix deterministically, even if the new turn's entries
+            // have already been appended by the time they process it.
+            //
+            // We do NOT persist the active tip here: basic forking always
+            // continues on the newest branch, whose entries are appended last,
+            // so the default ("last entry") is correct after the turn.  The
+            // tip is only non-default transiently (between this set and the
+            // UserPrompt append); a crash in that window just drops the
+            // in-progress fork, which the user re-triggers.
+            if let Some(tip) = fork_point {
+                let mut log = self.history.lock().await;
+                log.set_active_tip(tip);
+                drop(log);
+                let _ = self.tx.send(ServerMessage::Reset { tip });
+            }
 
             // Compact the agent-visible conversation if it has grown past the
             // configured budget, so the next turn stays within context.
@@ -937,22 +1047,23 @@ impl Session {
     /// (which persists to disk atomically).
     ///
     /// `TransactionLog::append` assigns the next monotonic `seq`, computes
-    /// `parent` from the last entry, stamps `ts`, pushes to memory, and writes
+    /// `parent` from the active tip, stamps `ts`, pushes to memory, and writes
     /// the JSONL line to disk — all under the history lock, so seq order,
     /// parent-pointer order, and file-append order can never diverge.  Live
-    /// subscribers receive the bare event over the WebSocket; the envelope
-    /// lives in the on-disk log and the in-memory history (the sources for
-    /// replay).
+    /// subscribers receive the full [`LogEntry`] envelope (wrapped in
+    /// [`ServerMessage::Entry`]) over the WebSocket; the envelope carries the
+    /// `seq` and `parent` the client needs for overlay targeting and fork
+    /// detection.
     ///
     /// The append and broadcast stay under the lock deliberately:
-    /// `subscribe_all` does `lock → snapshot entries → subscribe to tx`,
+    /// `subscribe_all` does `lock → snapshot active branch → subscribe to tx`,
     /// so keeping `append + send` atomic with respect to that ensures every
     /// subscriber sees each event exactly once (history XOR live — never
     /// both, never neither).
     async fn emit(&self, event: SessionEvent) {
         let mut log = self.history.lock().await;
-        log.append(event.clone()).await;
-        let _ = self.tx.send(event);
+        let entry = log.append(event).await;
+        let _ = self.tx.send(ServerMessage::Entry(entry));
     }
 }
 

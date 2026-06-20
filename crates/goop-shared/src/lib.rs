@@ -208,6 +208,37 @@ pub struct LogEntry {
     pub event: SessionEvent,
 }
 
+/// One item the server streams to a client over WebSocket.
+///
+/// Real conversation events arrive as [`Entry(LogEntry)`](ServerMessage::Entry),
+/// carrying the full envelope (`seq`, `parent`, `ts`, `event`).  Sending the
+/// envelope — not just the bare [`SessionEvent`] — gives the client the real
+/// `seq` of every event (so overlay/compaction targeting works even on a
+/// forked branch whose seqs are non-contiguous) and the `parent` (the
+/// conversation-tree edge, used for branching).
+///
+/// [`HistoryComplete`](ServerMessage::HistoryComplete) is a sentinel injected
+/// by the [`SessionSubscriber`](goop_server::SessionSubscriber) marking the end
+/// of a history-replay batch — the initial catch-up *or* a post-fork
+/// re-replay.  It is never appended to the log.
+///
+/// [`Reset`](ServerMessage::Reset) is broadcast when a fork happens.  Each
+/// subscriber re-snapshots the active branch up to `tip` and re-replays it;
+/// clients clear their state and re-enter catch-up.  Also never appended to
+/// the log (a live-only signal).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum ServerMessage {
+    Entry(LogEntry),
+    HistoryComplete,
+    /// A fork happened at `tip` (the fork point — the parent of the new
+    /// branch's first entry).  Subscribers re-replay the active branch up to
+    /// `tip`; clients clear and re-catch-up.
+    Reset {
+        tip: u64,
+    },
+}
+
 /// Messages sent from client to server over WebSocket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -232,4 +263,11 @@ pub enum ClientMessage {
     /// or result.  See [`SessionEvent::Deleted`].
     #[serde(rename = "delete")]
     Delete { target: u64 },
+    /// Fork the conversation from the point *before* `target` (i.e. from
+    /// `target`'s parent) and regenerate: a new `UserPrompt` carrying
+    /// `content` is appended with `parent` set to that fork point, the
+    /// active tip moves to the new branch, and a turn runs.  The old branch
+    /// is preserved in the append-only log.  See §2.9 of the redesign doc.
+    #[serde(rename = "fork")]
+    Fork { target: u64, content: String },
 }

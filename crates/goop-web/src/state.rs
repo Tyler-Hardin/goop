@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use goop_shared::{ClientMessage, EditContent, SessionEvent, TurnEndReason};
+use goop_shared::{
+    ClientMessage, EditContent, LogEntry, ServerMessage, SessionEvent, TurnEndReason,
+};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -110,8 +112,10 @@ pub(crate) struct EditOverlay {
 /// carry a `seq` — the transaction-log sequence number of the originating
 /// event.  This lets later overlay events ([`SessionEvent::Edited`],
 /// [`SessionEvent::Deleted`]) and compaction
-/// ([`SessionEvent::Compacted`] `covers`) target them.  The seq is tracked
-/// locally by counting received events (see [`AppState::seq_counter`]).
+/// ([`SessionEvent::Compacted`] `covers`) target them.  The seq comes
+/// directly from the [`LogEntry`] envelope the server sends (see
+/// [`ServerMessage::Entry`]) — not a counted value — so it stays correct on a
+/// forked branch whose seqs are non-contiguous.
 #[derive(Clone, Debug)]
 pub enum UiMessage {
     UserPrompt {
@@ -251,15 +255,6 @@ pub struct AppState {
     /// agent-visible item whose seq is the *first* chunk's; we track it
     /// here so the flushed `AssistantFinal` carries the right seq.
     pub(crate) streaming_seq: RwSignal<Option<u64>>,
-    /// Running count of events received, matching the server's transaction-
-    /// log seq.  Every event the client receives went through
-    /// [`Session::emit`](goop_server::Session) (append to the log with a
-    /// contiguous seq), so counting received events reproduces the server's
-    /// seq assignment.  Reset to 0 on connect; advanced once per event in
-    /// [`build_messages`](Self::build_messages) (history) and
-    /// [`dispatch`](Self::dispatch) (live).  If a live-only event (not
-    /// appended to the log) is ever added, this counter must skip it.
-    pub(crate) seq_counter: RwSignal<u64>,
     /// Turn-level state machine.  When `Thinking`, a `UiMessage::Thinking`
     /// is present at the end of `messages` and the animated dot is shown.
     /// Replaces the former `thinking: bool` + `remove_last_thinking()`
@@ -280,11 +275,11 @@ pub struct AppState {
     pub context_usage: RwSignal<Option<(usize, usize)>>,
 
     // ── history catch-up ──────────────────────────────────────────
-    /// Raw `SessionEvent`s accumulated during history replay.  No signals
-    /// are touched while `connection` is `CatchingUp` — every event lands
+    /// Raw `LogEntry` envelopes accumulated during history replay.  No signals
+    /// are touched while `connection` is `CatchingUp` — every entry lands
     /// here.  On `HistoryComplete` the buffer is pre-formed into a single
     /// `Vec<UiMessage>` and all signals are set in one shot.
-    pub(crate) history_buffer: RwSignal<Vec<SessionEvent>>,
+    pub(crate) history_buffer: RwSignal<Vec<LogEntry>>,
 
     /// Monotonically increasing connection counter.  Each `connect()`
     /// increments it; the `on_close` callback captures the value at
@@ -306,14 +301,13 @@ pub struct AppState {
     pub(crate) reconnect_attempt: RwSignal<u32>,
 }
 
-/// Result of pre-forming buffered history events into UI state.
+/// Result of pre-forming buffered history entries into UI state.
 struct BuildResult {
     messages: Vec<UiMessage>,
     session_name: Option<String>,
     running: bool,
     turn_state: TurnState,
     next_id: usize,
-    next_seq: u64,
     context_usage: Option<(usize, usize)>,
 }
 
@@ -332,7 +326,6 @@ impl AppState {
             ws: RwSignal::new(None),
             streaming_text: RwSignal::new(String::new()),
             streaming_seq: RwSignal::new(None),
-            seq_counter: RwSignal::new(0),
             turn_state: RwSignal::new(TurnState::Idle),
             sidebar_open: RwSignal::new(false),
             input_text: RwSignal::new(String::new()),
@@ -451,6 +444,22 @@ impl AppState {
         }
     }
 
+    /// Fork the conversation from the point before `target` (edit-and-
+    /// regenerate).  The server appends a new `UserPrompt` with `content`
+    /// branching from `target`'s parent, moves the active tip to the new
+    /// branch, and runs a turn.  The client receives a `Reset` and re-catches-
+    /// up to the new branch automatically.  See §2.9 of the redesign doc.
+    pub fn fork_message(&self, target: u64, content: String) {
+        if let Some(ws) = self.ws.get_untracked()
+            && ws.ready_state() == web_sys::WebSocket::OPEN
+        {
+            self.btn_state.set(BtnState::Running);
+            let msg =
+                serde_json::to_string(&ClientMessage::Fork { target, content }).unwrap_or_default();
+            ws.send_with_str(&msg).ok();
+        }
+    }
+
     /// Send raw WAV audio to the server for speech-to-text transcription.
     pub fn send_audio(&self, data: Vec<u8>) {
         if let Some(ws) = self.ws.get_untracked()
@@ -532,64 +541,78 @@ impl AppState {
 
     // ── Event intake (called from ws.rs) ──────────────────────────
 
-    /// Handle an incoming `SessionEvent` from the WebSocket.
+    /// Handle an incoming [`ServerMessage`] from the WebSocket.
     ///
-    /// During history catch-up (`connection == CatchingUp`), events are
-    /// buffered without touching any reactive signals.  When
-    /// `HistoryComplete` arrives the entire buffer is pre-formed into
-    /// a single `Vec<UiMessage>` and all signals are set in one shot —
-    /// the page materialises instantly, as if the chat had already
-    /// happened.
+    /// During history catch-up (`connection == CatchingUp`), [`Entry`](ServerMessage::Entry)
+    /// envelopes are buffered without touching any reactive signals.  When
+    /// [`HistoryComplete`](ServerMessage::HistoryComplete) arrives the entire
+    /// buffer is pre-formed into a single `Vec<UiMessage>` and all signals are
+    /// set in one shot — the page materialises instantly, as if the chat had
+    /// already happened.
     ///
-    /// In live mode, each event is dispatched immediately.
-    pub fn handle_event(&self, event: SessionEvent) {
-        if self.connection.get_untracked().is_catching_up() {
-            match event {
-                SessionEvent::HistoryComplete => {
-                    let buffer = self.history_buffer.get_untracked();
-                    self.history_buffer.set(Vec::new());
-                    self.connection.set(ConnectionState::Connected);
+    /// A [`Reset`](ServerMessage::Reset) (fork) clears the UI and re-enters
+    /// catch-up: the server re-replays the new active branch, which arrives as
+    /// a fresh batch of `Entry` envelopes followed by another `HistoryComplete`.
+    ///
+    /// In live mode, each `Entry` is dispatched immediately.
+    pub fn handle_subscribed(&self, msg: ServerMessage) {
+        match msg {
+            ServerMessage::Reset { .. } => {
+                // A fork happened — clear state and re-enter catch-up.  The
+                // server re-replays the new active branch next.
+                self.messages.set(Vec::new());
+                self.history_buffer.set(Vec::new());
+                self.streaming_text.set(String::new());
+                self.streaming_seq.set(None);
+                self.turn_state.set(TurnState::Idle);
+                self.context_usage.set(None);
+                self.connection.set(ConnectionState::CatchingUp);
+            }
+            ServerMessage::HistoryComplete => {
+                let buffer = self.history_buffer.get_untracked();
+                self.history_buffer.set(Vec::new());
+                self.connection.set(ConnectionState::Connected);
 
-                    // Pre-form all messages from the buffered events
-                    // without touching a single reactive signal.
-                    let start_id = self.next_message_id.get_untracked();
-                    let result = Self::build_messages(&buffer, start_id, 0);
-                    self.next_message_id.set(result.next_id);
-                    self.seq_counter.set(result.next_seq);
+                // Pre-form all messages from the buffered entries
+                // without touching a single reactive signal.
+                let start_id = self.next_message_id.get_untracked();
+                let result = Self::build_messages(&buffer, start_id);
+                self.next_message_id.set(result.next_id);
 
-                    // Apply everything in one shot.
-                    if let Some(name) = result.session_name {
-                        self.current_session.set(Some(name));
-                    }
-                    self.btn_state.set(if result.running {
-                        BtnState::Running
-                    } else {
-                        BtnState::Idle
-                    });
-                    self.turn_state.set(result.turn_state);
-                    self.streaming_text.set(String::new());
-                    self.messages.set(result.messages);
-                    self.context_usage.set(result.context_usage);
-
-                    // Session is now loaded — refresh the sidebar.
-                    log::info!("HistoryComplete — refreshing session list");
-                    let s = self.clone();
-                    leptos::task::spawn_local(async move {
-                        s.fetch_sessions().await;
-                    });
+                // Apply everything in one shot.
+                if let Some(name) = result.session_name {
+                    self.current_session.set(Some(name));
                 }
-                other => {
-                    self.history_buffer.update(|buf| buf.push(other));
+                self.btn_state.set(if result.running {
+                    BtnState::Running
+                } else {
+                    BtnState::Idle
+                });
+                self.turn_state.set(result.turn_state);
+                self.streaming_text.set(String::new());
+                self.messages.set(result.messages);
+                self.context_usage.set(result.context_usage);
+
+                // Session is now loaded — refresh the sidebar.
+                log::info!("HistoryComplete — refreshing session list");
+                let s = self.clone();
+                leptos::task::spawn_local(async move {
+                    s.fetch_sessions().await;
+                });
+            }
+            ServerMessage::Entry(entry) => {
+                if self.connection.get_untracked().is_catching_up() {
+                    self.history_buffer.update(|buf| buf.push(entry));
+                } else {
+                    self.dispatch(entry);
                 }
             }
-        } else {
-            self.dispatch(event);
         }
     }
 
     // ── History pre-forming (pure, no signals) ────────────────────
 
-    /// Convert a sequence of `SessionEvent`s into a flat `Vec<UiMessage>`,
+    /// Convert a sequence of `LogEntry` envelopes into a flat `Vec<UiMessage>`,
     /// plus the final session name, running state, and turn state.
     ///
     /// Pure function — no reactive side effects.  `AssistantText` chunks
@@ -599,27 +622,23 @@ impl AppState {
     /// by a content event — this lets the caller initialise the live FSM
     /// correctly.
     ///
-    /// `start_seq` is the transaction-log seq of the first event in
-    /// `events`; the returned `next_seq` is one past the last.  Both let
-    /// the caller keep [`AppState::seq_counter`] in sync with the server.
-    fn build_messages(events: &[SessionEvent], start_id: usize, start_seq: u64) -> BuildResult {
-        let mut messages: Vec<UiMessage> = Vec::with_capacity(events.len());
+    /// Each entry's real `seq` (from the envelope) is used — not a counted
+    /// value — so overlay/compaction targeting stays correct even on a forked
+    /// branch whose seqs are non-contiguous.
+    fn build_messages(entries: &[LogEntry], start_id: usize) -> BuildResult {
+        let mut messages: Vec<UiMessage> = Vec::with_capacity(entries.len());
         let mut session_name: Option<String> = None;
         let mut running = false;
         let mut streaming: String = String::new();
         // Seq of the first `AssistantText` chunk in the pending stream.
         let mut streaming_seq: Option<u64> = None;
         let mut next_id = start_id;
-        let mut seq = start_seq;
         let mut turn = TurnState::Idle;
         let mut context_usage: Option<(usize, usize)> = None;
 
-        for event in events {
-            // Every event the client receives was appended to the server's
-            // transaction log with a contiguous seq — assign it here.
-            let event_seq = seq;
-            seq += 1;
-            match event {
+        for entry in entries {
+            let event_seq = entry.seq;
+            match &entry.event {
                 SessionEvent::SessionInfo { name } => {
                     session_name = Some(name.clone());
                 }
@@ -789,13 +808,13 @@ impl AppState {
                 // ── metadata events (no UI) ──
                 SessionEvent::ContextSnapshot { .. } | SessionEvent::ModelChanged { .. } => {}
                 SessionEvent::HistoryComplete => {
-                    // Should never appear in the buffer — the caller
-                    // intercepts it before buffering.
+                    // Never appears in an envelope — the subscriber yields it
+                    // as a bare `ServerMessage::HistoryComplete`.
                 }
             }
         }
 
-        // Trailing streaming text (shouldn't normally happen, but be safe).
+        // Trailing streaming text (shouldn't regularly happen, but be safe).
         flush_streaming_to(
             &mut messages,
             &mut streaming,
@@ -809,7 +828,6 @@ impl AppState {
             running,
             turn_state: turn,
             next_id,
-            next_seq: seq,
             context_usage,
         }
     }
@@ -821,11 +839,11 @@ impl AppState {
     /// Only called for live events (after `HistoryComplete`).
     /// An exhaustive match ensures every new event variant added to
     /// `goop-shared` produces a compile error here until handled.
-    fn dispatch(&self, event: SessionEvent) {
-        // Assign this event its transaction-log seq (mirroring the server's
-        // contiguous-from-zero counter) before any arm uses it.
-        let seq = self.seq_counter.get_untracked();
-        self.seq_counter.set(seq + 1);
+    fn dispatch(&self, entry: LogEntry) {
+        // The real transaction-log seq from the envelope — not a counted
+        // value.  This stays correct on a forked branch whose seqs are
+        // non-contiguous (the counter hack is gone).
+        let seq = entry.seq;
 
         let next_id = || {
             let id = self.next_message_id.get_untracked();
@@ -850,7 +868,7 @@ impl AppState {
             }
         };
 
-        match event {
+        match entry.event {
             SessionEvent::SessionInfo { name } => {
                 self.current_session.set(Some(name));
             }
@@ -1031,7 +1049,7 @@ impl AppState {
             // ── metadata events (no UI) ──
             SessionEvent::ContextSnapshot { .. } | SessionEvent::ModelChanged { .. } => {}
             SessionEvent::HistoryComplete => {
-                // Handled in handle_event() — a no-op here.
+                // Handled in handle_subscribed() — a no-op here.
             }
         }
     }
