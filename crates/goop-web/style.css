@@ -297,7 +297,6 @@ main {
 }
 
 .msg.user {
-  align-self: flex-end;
   background: var(--blue-dim);
   color: #fff;
   border-bottom-right-radius: 4px;
@@ -305,7 +304,6 @@ main {
 }
 
 .msg.assistant {
-  align-self: flex-start;
   background: var(--surface2);
   border-bottom-left-radius: 4px;
   border: 1px solid var(--border);
@@ -350,13 +348,11 @@ main {
 }
 
 .msg.tool {
-  align-self: flex-start;
   background: var(--surface);
   border: 1px solid var(--border);
   border-left: 3px solid var(--cyan);
   font-family: var(--mono);
   font-size: 13px;
-  max-width: 85%;
   cursor: pointer;
   user-select: none;
   transition: border-color 0.2s;
@@ -564,33 +560,61 @@ main {
   display: none !important;
 }
 
+/* ── message wrapper (bubble + actions row) ──────────────────── */
+/*
+   The three action-bearing variants (UserPrompt, AssistantFinal,
+   ToolCall) are wrapped so the action row can sit *outside* the chat
+   bubble — against the page background for better contrast, rather
+   than inside the bubble's tinted surface.  The wrapper inherits the
+   flex alignment and max-width the bubble used to own; the bubble
+   fills the wrapper (max-width: none).
+*/
+.msg-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.msg-wrap > .msg {
+  max-width: none;
+}
+.msg-wrap.user {
+  align-self: flex-end;
+  max-width: 78%;
+}
+.msg-wrap.assistant {
+  align-self: flex-start;
+  max-width: 78%;
+}
+.msg-wrap.tool {
+  align-self: flex-start;
+  max-width: 85%;
+}
+
 /* ── message action buttons (edit / delete) ──────────────────── */
 /*
-   Actions sit in a row *below* the message content (the OpenWebUI
-   placement), not overlaid on top.  The row is always in the DOM but
-   `opacity: 0`; `:hover` on the parent `.msg` reveals it.  On touch
+   Actions sit in a row *below* the bubble, outside it (against the
+   page background for contrast).  The row is always in the DOM but
+   `opacity: 0`; `:hover` on the `.msg-wrap` reveals it.  On touch
    devices a tap on the message triggers `:hover` (browsers fire
    `mouseover` on touch), so the pattern doubles as tap-to-reveal —
-   no JS needed.  The `.confirming` class forces the row visible so the
-   inline delete-confirm prompt is always shown.
+   no JS needed.  The `.confirming` class forces the row visible so
+   the inline delete-confirm prompt is always shown.
 */
 .msg-actions {
   display: flex;
-  margin-top: 4px;
   opacity: 0;
   transition: opacity 0.15s;
 }
-.msg:hover .msg-actions,
-.msg.editing .msg-actions,
-.msg.confirming .msg-actions {
+.msg-wrap:hover .msg-actions,
+.msg-wrap.confirming .msg-actions {
   opacity: 1;
 }
 /* User messages are right-aligned bubbles — actions align right. */
-.msg.user .msg-actions {
+.msg-wrap.user .msg-actions {
   justify-content: flex-end;
 }
-.msg.assistant .msg-actions,
-.msg.tool .msg-actions {
+.msg-wrap.assistant .msg-actions,
+.msg-wrap.tool .msg-actions {
   justify-content: flex-start;
 }
 

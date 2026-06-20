@@ -117,33 +117,34 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             let actions_hidden = move || editing.get() || deleted.get() || running.get();
 
             view! {
-                <div
-                    class="msg user"
-                    class:deleted=deleted
-                    class:edited=move || edit_sig.get().is_some()
-                    class:editing=editing
-                    class:confirming=confirm_delete
-                >
-                    <div class="msg-display" class:hidden=editing>
-                        {move || {
-                            let e = edit_sig.get();
-                            match e {
-                                Some(e) if !e.show_original.get() => e.replacement.clone(),
-                                _ => content.clone(),
-                            }
-                        }}
-                        {edit_badge(edit_sig)}
-                    </div>
-                    <div class="msg-edit" class:hidden=move || !editing.get()>
-                        <textarea
-                            class="msg-edit-area"
-                            node_ref=textarea_ref
-                            on:input=on_input
-                            rows="1"
-                        ></textarea>
-                        <div class="msg-edit-actions">
-                            <button class="msg-edit-btn save" on:click=save_edit>"Save"</button>
-                            <button class="msg-edit-btn cancel" on:click=cancel_edit>"Cancel"</button>
+                <div class="msg-wrap user" class:confirming=confirm_delete>
+                    <div
+                        class="msg user"
+                        class:deleted=deleted
+                        class:edited=move || edit_sig.get().is_some()
+                        class:editing=editing
+                    >
+                        <div class="msg-display" class:hidden=editing>
+                            {move || {
+                                let e = edit_sig.get();
+                                match e {
+                                    Some(e) if !e.show_original.get() => e.replacement.clone(),
+                                    _ => content.clone(),
+                                }
+                            }}
+                            {edit_badge(edit_sig)}
+                        </div>
+                        <div class="msg-edit" class:hidden=move || !editing.get()>
+                            <textarea
+                                class="msg-edit-area"
+                                node_ref=textarea_ref
+                                on:input=on_input
+                                rows="1"
+                            ></textarea>
+                            <div class="msg-edit-actions">
+                                <button class="msg-edit-btn save" on:click=save_edit>"Save"</button>
+                                <button class="msg-edit-btn cancel" on:click=cancel_edit>"Cancel"</button>
+                            </div>
                         </div>
                     </div>
                     {message_actions(
@@ -246,27 +247,28 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             let actions_hidden = move || editing.get() || deleted.get() || running.get();
 
             view! {
-                <div
-                    class="msg assistant rendered"
-                    class:deleted=deleted
-                    class:edited=move || edit_sig.get().is_some()
-                    class:editing=editing
-                    class:confirming=confirm_delete
-                >
-                    <div class="msg-display" class:hidden=editing>
-                        <div class="rendered-inner" inner_html=html></div>
-                        {edit_badge(edit_sig)}
-                    </div>
-                    <div class="msg-edit" class:hidden=move || !editing.get()>
-                        <textarea
-                            class="msg-edit-area"
-                            node_ref=textarea_ref
-                            on:input=on_input
-                            rows="1"
-                        ></textarea>
-                        <div class="msg-edit-actions">
-                            <button class="msg-edit-btn save" on:click=save_edit>"Save"</button>
-                            <button class="msg-edit-btn cancel" on:click=cancel_edit>"Cancel"</button>
+                <div class="msg-wrap assistant" class:confirming=confirm_delete>
+                    <div
+                        class="msg assistant rendered"
+                        class:deleted=deleted
+                        class:edited=move || edit_sig.get().is_some()
+                        class:editing=editing
+                    >
+                        <div class="msg-display" class:hidden=editing>
+                            <div class="rendered-inner" inner_html=html></div>
+                            {edit_badge(edit_sig)}
+                        </div>
+                        <div class="msg-edit" class:hidden=move || !editing.get()>
+                            <textarea
+                                class="msg-edit-area"
+                                node_ref=textarea_ref
+                                on:input=on_input
+                                rows="1"
+                            ></textarea>
+                            <div class="msg-edit-actions">
+                                <button class="msg-edit-btn save" on:click=save_edit>"Save"</button>
+                                <button class="msg-edit-btn cancel" on:click=cancel_edit>"Cancel"</button>
+                            </div>
                         </div>
                     </div>
                     {message_actions(
@@ -321,42 +323,43 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             let actions_hidden = move || deleted.get() || running.get();
 
             view! {
-                <div
-                    class="msg tool tool-call"
-                    class:open=expanded
-                    class:deleted=deleted
-                    class:confirming=confirm_delete
-                >
-                    <div class="tool-header" on:click=toggle>
-                        <span class="arrow">"▸"</span>
-                        {move || {
-                            let e = call_edit.get();
-                            match e {
-                                Some(e) if !e.show_original.get() => view! {
-                                    <div class="info">
-                                        <div class="name edited-replacement">{e.replacement.clone()}</div>
-                                    </div>
+                <div class="msg-wrap tool" class:confirming=confirm_delete>
+                    <div
+                        class="msg tool tool-call"
+                        class:open=expanded
+                        class:deleted=deleted
+                    >
+                        <div class="tool-header" on:click=toggle>
+                            <span class="arrow">"▸"</span>
+                            {move || {
+                                let e = call_edit.get();
+                                match e {
+                                    Some(e) if !e.show_original.get() => view! {
+                                        <div class="info">
+                                            <div class="name edited-replacement">{e.replacement.clone()}</div>
+                                        </div>
+                                    }
+                                        .into_any(),
+                                    _ => render_tool_info(&name_for_view, &args_for_view),
                                 }
-                                    .into_any(),
-                                _ => render_tool_info(&name_for_view, &args_for_view),
-                            }
-                        }}
-                        {edit_badge(edit)}
-                    </div>
-                    <div class="tool-body">
-                        {move || {
-                            let re = result_edit_sig.get();
-                            let text = match re {
-                                Some(re) if !re.show_original.get() => re.replacement,
-                                _ => result_sig.get().unwrap_or_default(),
-                            };
-                            if text.is_empty() {
-                                String::new()
-                            } else {
-                                truncate(&text, 500)
-                            }
-                        }}
-                        {edit_badge(result_edit_sig)}
+                            }}
+                            {edit_badge(edit)}
+                        </div>
+                        <div class="tool-body">
+                            {move || {
+                                let re = result_edit_sig.get();
+                                let text = match re {
+                                    Some(re) if !re.show_original.get() => re.replacement,
+                                    _ => result_sig.get().unwrap_or_default(),
+                                };
+                                if text.is_empty() {
+                                    String::new()
+                                } else {
+                                    truncate(&text, 500)
+                                }
+                            }}
+                            {edit_badge(result_edit_sig)}
+                        </div>
                     </div>
                     {delete_only_actions(
                         actions_hidden,
