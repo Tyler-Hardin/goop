@@ -18,7 +18,7 @@
 | 6 — Config | ✅ done | Stale compaction descriptions fixed (template + `config.rs` doc comments + AGENTS.md config example). `[tool_summarization]` section + `GOOP_TOOL_SUMMARIZATION*` env vars documented in template and AGENTS.md. `CompactionMode` kept (not replaced with `auto_compact_threshold` — see note below). |
 | 7 — Web UI tree view | ✅ done | `CompactedGroup` / `ToolSummaryGroup` collapsible tree nodes; per-message `seq` tracked locally (counting received events); `Edited`/`Deleted` overlays rendered (✎ badge + show-original toggle; faded strikethrough). See "As built" below. |
 | 8 — Edit/delete overlays | ✅ done | `ClientMessage::Edit`/`Delete` + `Session::edit`/`delete` (deletes auto-emit both halves of a tool pair). Replay applies `Edited`/`Deleted` overlays (previously ignored): tool targets resolve to tool-call id via the log → content-granularity surgery; text targets replace the whole `VisibleItem` (assistant tool calls preserved when editing narration). Web UI: hover-revealed ✎/✕ action buttons on `UserPrompt`/`AssistantFinal`/`ToolCall`; inline `<textarea>` edit mode with Save/Cancel. 8 replay tests added. |
-| 9 — Forking | ⬜ future | |
+| 9 — Forking | ✅ done | |
 | 10 — Manual range compaction | ⬜ future | |
 | 11 — Terminal | ⬜ planned | |
 | 12 — Tests & migration | ⬜ planned | |
@@ -1428,12 +1428,55 @@ happened:
 > avoids the Leptos `FnOnce`-in-`Fn` trap (event-handler closures are moved
 > directly into `on:click`, not inside a `move ||` that runs many times).
 
-### Phase 9: Forking (future)  ⬜ future
+### Phase 9: Forking  ✅ done
 - Add `active_tip` to `<name>.state.toml`.
 - Implement fork on edit-and-regenerate: new `UserPrompt` with `parent` set to
   the fork point; update active tip.
 - UI: branch indicator `< 1/2 >` at branch points; branch switching.
 - Terminal: linear display of active branch only.
+
+> **As built:** `TransactionLog` tracks `active_tip` (the seq of the latest
+> entry on the active branch); `append()` uses it as the parent, and
+> `set_active_tip()` moves it to a fork point so the next append branches.
+> `active_tip` defaults to "last entry" (linear), so basic forking needs no
+> persistence — the newest branch's entries are always appended last.  A
+> non-default tip is persisted in `<name>.state.toml` only for viewing older
+> branches (future UI); `Session::new` applies it on resume.
+>
+> **Replay is branch-aware:** `collect_branch(active_tip, log)` walks parent
+> pointers from the tip to the root, returning the active branch in
+> chronological order.  Sibling branches (old forks) are excluded.
+> `replay_visible` / `replay_log` now take `active_tip`.
+>
+> **Wire protocol — `ServerMessage`:** the server streams
+> `ServerMessage` (`Entry(LogEntry)` | `HistoryComplete` | `Reset { tip }`)
+> instead of bare `SessionEvent`.  Sending the full envelope gives the client
+> the real `seq` (so overlay/compaction targeting works even on a forked
+> branch whose seqs are non-contiguous — the fragile client-side seq-counter
+> is eliminated) and the `parent` (the conversation-tree edge).  `Reset` is
+> broadcast on fork, *before* the new turn's events are appended;
+> `SessionSubscriber` re-snapshots the active branch up to the fork point and
+> re-replays it, so clients clear and re-enter catch-up without reconnecting.
+>
+> **`ClientMessage::Fork { target, content }`** + `Session::fork`:
+> `fork()` computes the fork point (target's parent) and queues the prompt
+> with that fork point.  `drain_queue` sets the active tip, broadcasts
+> `Reset`, then appends the `UserPrompt` + runs the turn — atomic w.r.t.
+> other queued prompts.
+>
+> **Web UI:** editing a user prompt now forks (edit-and-regenerate, like
+> ChatGPT) instead of overlaying.  The save button reads "↻ Save &
+> regenerate".  The old branch's response disappears; the new branch replays.
+> (Editing an `AssistantFinal` or `ToolCall` still overlays in place —
+> "writing into the LLM's mind" — without regenerating.)
+>
+> **Terminal:** renders a "↻ forked — regenerating from here" notice on
+> `Reset` and skips the post-fork history re-replay (the linear terminal
+> can't un-print the old branch).
+>
+> **Branch switching UI (`< 1/2 >`):** deferred — the log format fully
+> supports it (parent pointers, `active_tip` persistence), but the client UI
+> for enumerating/viewing sibling branches is a separate effort.
 
 ### Phase 10: Manual range compaction (future)  ⬜ future
 - Add `ClientMessage::CompactRange { covers: Vec<u64> }`.
