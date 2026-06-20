@@ -231,19 +231,21 @@ pub fn MessageLog() -> impl IntoView {
             // recreating the entire list.  This prevents the CSS fadeIn
             // animation from re-triggering on every existing message.
             //
-            // In LLM view, deleted messages are filtered out — the agent
-            // doesn't see them, so neither should the user in that mode.
+            // **Chat view** (default): `CompactedGroup`/`ToolSummaryGroup`
+            // are flattened into their original children — the user sees the
+            // full conversation as if compaction never happened.
             //
-            // In select mode, messages are enumerated so clicking sets the
-            // range start/end for manual compaction.
+            // **LLM view** (👁): groups are kept as-is (summaries replace
+            // covered messages), and deleted messages are filtered out —
+            // this shows exactly what the agent sees.
+            //
+            // In select mode (chat-view-only), messages are enumerated so
+            // clicking sets the range start/end for manual compaction.
             <For
                 each=move || {
                     let msgs = state.messages.get();
-                    let filtered: Vec<UiMessage> = if llm_view.get() {
-                        msgs.into_iter().filter(|m| !m.is_deleted()).collect()
-                    } else {
-                        msgs
-                    };
+                    let filtered: Vec<UiMessage> =
+                        crate::state::displayed_messages(&msgs, llm_view.get());
                     filtered.into_iter().enumerate().collect::<Vec<_>>()
                 }
                 key=|(_, msg): &(usize, UiMessage)| msg.id()

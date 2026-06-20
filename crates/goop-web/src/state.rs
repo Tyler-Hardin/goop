@@ -574,10 +574,12 @@ impl AppState {
     /// range and sends them as `covers`.  The server summarizes them and
     /// appends a `Compacted { manual: true }` event.  See §2.11.
     ///
-    /// **Important:** the selection indices come from the **displayed**
-    /// message list, which may be filtered (LLM view hides deleted
-    /// messages).  We must apply the same filter here so the indices line
-    /// up — otherwise `covers` points at the wrong messages.
+    /// The selection indices come from the **displayed** message list, which
+    /// differs by view: chat view flattens groups (original messages
+    /// inline), LLM view keeps groups as-is (summaries visible).  We must
+    /// match the same projection here so the indices line up.
+    /// Compacting an already-compacted summary is valid — it creates a
+    /// deeper rolling summary.
     pub fn compact_selected(&self) {
         let start = self.selection_start.get_untracked();
         let end = self.selection_end.get_untracked();
@@ -585,11 +587,8 @@ impl AppState {
             return;
         };
         let llm_view = self.llm_view.get_untracked();
-        let covers: Vec<u64> = self
-            .messages
-            .get_untracked()
+        let covers: Vec<u64> = displayed_messages(&self.messages.get_untracked(), llm_view)
             .iter()
-            .filter(|m| !llm_view || !m.is_deleted())
             .enumerate()
             .filter(|(i, _)| *i >= s && *i <= e)
             .filter_map(|(_, m)| m.agent_seq())
@@ -1288,6 +1287,48 @@ fn flatten_args(arguments: &serde_json::Value) -> Vec<(String, String)> {
 // These operate on `&mut [UiMessage]` (or `&mut Vec<UiMessage>`) so they
 // can be shared by the pure `build_messages` path and the signal-backed
 // `dispatch` path (which calls them inside `self.messages.update(..)`).
+
+/// The message list as displayed in the current view.
+///
+/// **Chat view** (`llm_view = false`): groups are flattened — the user sees
+/// the full conversation as if compaction never happened.
+///
+/// **LLM view** (`llm_view = true`): groups are kept (summaries visible),
+/// and deleted messages are filtered out — this is exactly what the agent
+/// sees.  Selecting a `CompactedGroup` here and compacting it again is
+/// valid; it creates a deeper rolling summary.
+pub fn displayed_messages(msgs: &[UiMessage], llm_view: bool) -> Vec<UiMessage> {
+    if llm_view {
+        msgs.iter().filter(|m| !m.is_deleted()).cloned().collect()
+    } else {
+        flatten_for_chat(msgs)
+    }
+}
+
+/// Flatten `CompactedGroup`/`ToolSummaryGroup` into their children for the
+/// chat view.
+///
+/// The chat view shows the original messages as if compaction and tool-pair
+/// summarization never happened — groups are transparent.  The LLM view
+/// (toggled by 👁) shows the summaries instead; see `MessageLog`.
+///
+/// Recurses into nested `CompactedGroup`s (recursive/rolling summaries form
+/// a tree) so every original message is revealed.
+pub fn flatten_for_chat(msgs: &[UiMessage]) -> Vec<UiMessage> {
+    let mut flat = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        match m {
+            UiMessage::CompactedGroup { children, .. } => {
+                flat.extend(flatten_for_chat(children));
+            }
+            UiMessage::ToolSummaryGroup { child, .. } => {
+                flat.extend(flatten_for_chat(std::slice::from_ref(child)));
+            }
+            _ => flat.push(m.clone()),
+        }
+    }
+    flat
+}
 
 /// Whether a message's originating event seq is in `covers`.  A `ToolCall`
 /// matches on either its call seq or its result seq (both are agent-visible
