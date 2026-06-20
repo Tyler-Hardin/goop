@@ -300,6 +300,17 @@ The web UI shows a session sidebar for switching between sessions.
   off)**. Env: `GOOP_TOOL_SUMMARIZATION*`. A separate `AnyAgent` is built via
   `build_summarizer()` when `model` is set; otherwise the session's main agent
   is used. The most-recent turn's tool calls are protected from summarization.
+- **Manual range compaction** (`src/session.rs` + `src/memory/compaction.rs`)
+  — the user can manually select a range of messages in the web UI and
+  compact them into a summary.  `ClientMessage::CompactRange { covers }`
+  triggers `Session::compact_range`, which collects the covered
+  agent-visible messages (`covered_messages` pure helper in
+  `memory/compaction.rs`), calls `AnyAgent::summarize`, and appends a
+  `Compacted { manual: true, .. }` event.  Replay is unchanged — `covers`
+  is an arbitrary `Vec<u64>`, so manual and auto compaction use the same
+  path.  The web UI uses a select mode (header ⊟ toggle → per-message
+  checkboxes → `SelectBar` footer with ✦ Compact / ✕ Done).  See §2.11 of
+  the redesign doc.
 - **Context snapshots** (`src/session.rs`) — before each turn the session
   emits `ContextSnapshot { seqs, model }`, recording which events formed
   the LLM's context. Replay skips it (audit-only metadata).

@@ -19,7 +19,7 @@
 | 7 — Web UI tree view | ✅ done | `CompactedGroup` / `ToolSummaryGroup` collapsible tree nodes; per-message `seq` tracked locally (counting received events); `Edited`/`Deleted` overlays rendered (✎ badge + show-original toggle; faded strikethrough). See "As built" below. |
 | 8 — Edit/delete overlays | ✅ done | `ClientMessage::Edit`/`Delete` + `Session::edit`/`delete` (deletes auto-emit both halves of a tool pair). Replay applies `Edited`/`Deleted` overlays (previously ignored): tool targets resolve to tool-call id via the log → content-granularity surgery; text targets replace the whole `VisibleItem` (assistant tool calls preserved when editing narration). Web UI: hover-revealed ✎/✕ action buttons on `UserPrompt`/`AssistantFinal`/`ToolCall`; inline `<textarea>` edit mode with Save/Cancel. 8 replay tests added. |
 | 9 — Forking | ✅ done | |
-| 10 — Manual range compaction | ⬜ future | |
+| 10 — Manual range compaction | ✅ done | `ClientMessage::CompactRange { covers }` + `Session::compact_range`; `covered_messages` pure helper in `memory/compaction.rs` (+3 tests). Replay unchanged (already generic). Web UI: header ⊟ toggle → select mode with per-message checkboxes → `SelectBar` footer with ✦ Compact / ✕ Done. |
 | 11 — Terminal | ✅ done | `Compacted`/`ToolSummarized` inline notices; `TurnEnded` reasons (incl. cancel-repopulate); fork `Reset` notice; `Edited`/`Deleted` inline notices. History replay handles new event types via `ServerMessage::Entry`. See "As built" below. |
 | 12 — Tests & migration | ✅ mostly | 45 tests in `src/memory/` (25 replay + 10 `TransactionLog` + 10 compaction decision logic). Compaction decisions extracted to `memory/compaction.rs` for testability without a mock LLM. Remaining: end-to-end integration test (needs mock `AnyAgent`). See "As built" below. |
 
@@ -833,7 +833,7 @@ edge cases.
 This is more powerful than goose — goose can hide messages (visibility flags)
 but can't edit their content.  Our overlay model supports both.
 
-### 2.11 Manual range compaction — future extensibility
+### 2.11 Manual range compaction
 
 The design makes manual range compaction a natural extension, not a redesign.
 `Compacted.covers` is an arbitrary `Vec<u64>`, not a prefix marker.
@@ -843,14 +843,14 @@ selected range `[seq 12..seq 34]` is just a different `covers` value — same
 event type, same replay logic, same UI rendering.  The `manual` flag lets the
 UI label it differently.
 
-What manual compaction would require to add later:
+This was borne out by the implementation (Phase 10):
 
-| Piece | Work |
-|-------|------|
-| `ClientMessage` variant | New `CompactRange { covers: Vec<u64> }` (or `from`/`to` seqs) |
-| Server handler | Collect agent-visible messages in range, call LLM summarization, append `Compacted { manual: true, .. }` — same code path as auto-compaction |
-| Replay logic | **No change** — already generic |
-| UI rendering | **No change** — already generic; just add range-selection UX (shift-click / drag-select) |
+| Piece | Work | Status |
+|-------|------|--------|
+| `ClientMessage` variant | `CompactRange { covers: Vec<u64> }` | ✅ done |
+| Server handler | `Session::compact_range` — `covered_messages` filter → `AnyAgent::summarize` → `Compacted { manual: true }` | ✅ done |
+| Replay logic | **No change** — already generic | ✅ confirmed |
+| UI rendering | **No change** — `CompactedGroup` already handles `manual`; select-mode UX added | ✅ done |
 
 ### 2.12 Configurable tool-call summarization
 
@@ -1480,11 +1480,41 @@ happened:
 > supports it (parent pointers, `active_tip` persistence), but the client UI
 > for enumerating/viewing sibling branches is a separate effort.
 
-### Phase 10: Manual range compaction (future)  ⬜ future
+### Phase 10: Manual range compaction  ✅ done
 - Add `ClientMessage::CompactRange { covers: Vec<u64> }`.
 - Server handler: collect agent-visible messages in range, call LLM
   summarization, append `Compacted { manual: true, .. }`.
 - UI: range selection (shift-click / drag-select).
+
+> **As built:** `ClientMessage::CompactRange { covers }` + `Session::compact_range()`.
+> The server handler mirrors `maybe_compact` but with an explicit `covers`
+> list and `manual = true` — same `AnyAgent::summarize` call, same
+> `Compacted` event, same replay path.  A pure `covered_messages(items,
+> covers)` helper in `memory/compaction.rs` filters agent-visible items to
+> the selected seqs (3 unit tests: non-contiguous seqs, no matches, order
+> preservation).
+>
+> **Replay logic** — no change, as predicted in §2.11.  `Compacted.covers`
+> is an arbitrary `Vec<u64>`; `manual = true` only affects the UI label
+> ("✦ manual compaction" vs "✦ compacted"), which was already wired in
+> Phase 7.
+>
+> **Web UI** — a select mode rather than shift-click/drag-select (simpler,
+> works on touch).  A ⊟ button in the header (hidden while the LLM is
+> running) toggles select mode.  In select mode:
+> - Each agent-visible message shows a checkbox on its left (positioned
+>   outside the bubble with `left: -28px`).  Non-agent-visible messages
+>   (Thinking, FinalResponse, etc.) don't get a checkbox — `agent_seq()`
+>   gates it.
+> - The input bar is replaced by a `SelectBar` footer: "N selected" +
+>   "✦ Compact" (disabled until ≥ 2 selected) + "✕ Done" (exits without
+>   compacting).
+> - Selected messages get a blue border highlight.
+> - Clicking "✦ Compact" sends `CompactRange { covers }`, exits select
+>   mode, and the `Compacted` event comes back as a live event, rendered
+>   by the existing `CompactedGroup` tree node (Phase 7).
+>
+> Select mode is cleared on fork (`Reset`) and on session switch.
 
 ### Phase 11: Terminal  ✅ done
 - Render `Compacted`/`ToolSummarized` events as inline notices.
