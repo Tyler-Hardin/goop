@@ -228,6 +228,17 @@ impl UiMessage {
             | UiMessage::Cancelled { .. } => None,
         }
     }
+
+    /// Whether this message has been deleted (hidden from the agent's view
+    /// by a `Deleted` overlay).  Used to filter messages in LLM view.
+    pub fn is_deleted(&self) -> bool {
+        match self {
+            UiMessage::UserPrompt { deleted, .. }
+            | UiMessage::AssistantFinal { deleted, .. }
+            | UiMessage::ToolCall { deleted, .. } => deleted.get_untracked(),
+            _ => false,
+        }
+    }
 }
 
 /// Global reactive state for the web UI.
@@ -306,6 +317,12 @@ pub struct AppState {
     pub select_mode: RwSignal<bool>,
     /// Seqs of messages selected for manual compaction (in select mode).
     pub selected_seqs: RwSignal<HashSet<u64>>,
+
+    /// "LLM view" — when `true`, the message log shows exactly what the
+    /// agent sees: compaction summaries as plain messages (no tree nodes),
+    /// deleted messages hidden, tool summaries flattened.  Toggled by the
+    /// 👁 button in the header.
+    pub llm_view: RwSignal<bool>,
 }
 
 /// Result of pre-forming buffered history entries into UI state.
@@ -344,6 +361,7 @@ impl AppState {
             reconnect_attempt: RwSignal::new(0),
             select_mode: RwSignal::new(false),
             selected_seqs: RwSignal::new(HashSet::new()),
+            llm_view: RwSignal::new(false),
         }
     }
 

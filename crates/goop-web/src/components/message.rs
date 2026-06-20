@@ -42,6 +42,7 @@ use crate::state::{AppState, EditOverlay, UiMessage};
 pub fn Message(msg: UiMessage) -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState missing");
     let running = state.running;
+    let llm_view = state.llm_view;
 
     match msg {
         UiMessage::UserPrompt {
@@ -121,7 +122,8 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                 confirm_delete.set(false);
             };
 
-            let actions_hidden = move || editing.get() || deleted.get() || running.get();
+            let actions_hidden =
+                move || editing.get() || deleted.get() || running.get() || llm_view.get();
 
             view! {
                 <div class="msg-wrap user" class:confirming=confirm_delete>
@@ -251,7 +253,8 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                 confirm_delete.set(false);
             };
 
-            let actions_hidden = move || editing.get() || deleted.get() || running.get();
+            let actions_hidden =
+                move || editing.get() || deleted.get() || running.get() || llm_view.get();
 
             view! {
                 <div class="msg-wrap assistant" class:confirming=confirm_delete>
@@ -327,7 +330,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                 confirm_delete.set(false);
             };
 
-            let actions_hidden = move || deleted.get() || running.get();
+            let actions_hidden = move || deleted.get() || running.get() || llm_view.get();
 
             view! {
                 <div class="msg-wrap tool" class:confirming=confirm_delete>
@@ -403,8 +406,26 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             expanded,
             ..
         } => {
-            let toggle = move |_| expanded.update(|v| *v = !*v);
             let summary_html = render_markdown(&summary);
+
+            // LLM view: render the summary as a plain message — exactly what
+            // the agent sees.  No tree node, no expand arrow, no children.
+            if state.llm_view.get_untracked() {
+                let label = if manual {
+                    "✦ manual summary"
+                } else {
+                    "✦ summary"
+                };
+                return view! {
+                    <div class="msg llm-summary">
+                        <div class="llm-summary-label">{label}</div>
+                        <div class="rendered-inner" inner_html=summary_html></div>
+                    </div>
+                }
+                .into_any();
+            }
+
+            let toggle = move |_| expanded.update(|v| *v = !*v);
             let count = children.len();
             let label = if manual {
                 "✦ manual compaction"
@@ -439,8 +460,20 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             expanded,
             ..
         } => {
-            let toggle = move |_| expanded.update(|v| *v = !*v);
             let summary_html = render_markdown(&summary);
+
+            // LLM view: render the summary as a plain message.
+            if state.llm_view.get_untracked() {
+                return view! {
+                    <div class="msg llm-summary">
+                        <div class="llm-summary-label">"◇ tool summary"</div>
+                        <div class="rendered-inner" inner_html=summary_html></div>
+                    </div>
+                }
+                .into_any();
+            }
+
+            let toggle = move |_| expanded.update(|v| *v = !*v);
             view! {
                 <div class="msg group tool-summary" class:open=expanded>
                     <div class="group-header" on:click=toggle>

@@ -758,6 +758,52 @@ main.select-mode {
   background: rgba(100, 149, 237, 0.12);
 }
 
+/* ── LLM view button ─────────────────────────────── */
+
+.llm-view-btn {
+  background: none;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 4px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.llm-view-btn:hover {
+  background: var(--surface2);
+  color: var(--fg);
+}
+.llm-view-btn.active {
+  color: var(--blue);
+  background: rgba(100, 149, 237, 0.12);
+}
+
+/* ── LLM view summary messages ───────────────────── */
+
+/*
+   In LLM view, compaction summaries and tool summaries render as plain
+   messages — exactly what the agent sees.  A small label distinguishes
+   them from regular user/assistant messages.
+*/
+.msg.llm-summary {
+  align-self: flex-start;
+  max-width: 85%;
+  padding: 10px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.llm-summary-label {
+  font-size: 11px;
+  color: var(--dim2);
+  font-family: var(--mono);
+  margin-bottom: 4px;
+}
+
 /* ── select bar (replaces input bar in select mode) ──────────── */
 
 .select-bar {

@@ -213,18 +213,35 @@ pub fn MessageLog() -> impl IntoView {
         }
     };
 
-    // Capture select_mode before `state` is moved into the <For> closure.
+    // Capture signals before `state` is moved into the <For> closure.
     let select_mode = state.select_mode;
+    let llm_view = state.llm_view;
 
     view! {
-        <main id="log" node_ref=scroll_ref on:scroll=on_scroll class:select-mode=move || select_mode.get()>
+        <main
+            id="log"
+            node_ref=scroll_ref
+            on:scroll=on_scroll
+            class:select-mode=move || select_mode.get()
+            class:llm-view=move || llm_view.get()
+        >
             // Messages from state, rendered with stable keys via <For>.
             // Each message has a unique `id` — Leptos tracks items by key,
             // so adding a new message only inserts one DOM node instead of
             // recreating the entire list.  This prevents the CSS fadeIn
             // animation from re-triggering on every existing message.
+            //
+            // In LLM view, deleted messages are filtered out — the agent
+            // doesn't see them, so neither should the user in that mode.
             <For
-                each=move || state.messages.get()
+                each=move || {
+                    let msgs = state.messages.get();
+                    if llm_view.get() {
+                        msgs.into_iter().filter(|m| !m.is_deleted()).collect()
+                    } else {
+                        msgs
+                    }
+                }
                 key=|msg| msg.id()
                 children=move |msg| {
                     let st = state.clone();
