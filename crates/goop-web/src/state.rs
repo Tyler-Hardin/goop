@@ -1,4 +1,6 @@
-use goop_shared::{ClientMessage, SessionEvent, TurnEndReason};
+use std::collections::HashSet;
+
+use goop_shared::{ClientMessage, EditContent, SessionEvent, TurnEndReason};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -85,6 +87,17 @@ impl TurnState {
     }
 }
 
+/// Edit-overlay state for a message whose content was replaced by an
+/// [`SessionEvent::Edited`] event.  The original is preserved so the UI can
+/// toggle between the edited and original views ("show original").
+#[derive(Clone, Debug)]
+pub(crate) struct EditOverlay {
+    /// The replacement content (what the agent now sees), as a display string.
+    pub replacement: String,
+    /// `true` while the UI is showing the original instead of the replacement.
+    pub show_original: RwSignal<bool>,
+}
+
 /// UI-facing message type.  Derived from `SessionEvent` by the dispatch
 /// function — keeps raw event shapes out of the component tree.
 ///
@@ -92,21 +105,38 @@ impl TurnState {
 /// track individual messages across re-renders.  Without stable keys,
 /// every `messages` signal update recreates all DOM nodes, retriggering
 /// CSS animations (flash).
+///
+/// Agent-visible variants (those that correspond to something the LLM sees)
+/// carry a `seq` — the transaction-log sequence number of the originating
+/// event.  This lets later overlay events ([`SessionEvent::Edited`],
+/// [`SessionEvent::Deleted`]) and compaction
+/// ([`SessionEvent::Compacted`] `covers`) target them.  The seq is tracked
+/// locally by counting received events (see [`AppState::seq_counter`]).
 #[derive(Clone, Debug)]
 pub enum UiMessage {
     UserPrompt {
         id: usize,
+        seq: u64,
         content: String,
+        deleted: RwSignal<bool>,
+        edit: RwSignal<Option<EditOverlay>>,
     },
     Thinking {
         id: usize,
     },
     AssistantFinal {
         id: usize,
+        seq: u64,
         raw: String,
+        deleted: RwSignal<bool>,
+        edit: RwSignal<Option<EditOverlay>>,
     },
     ToolCall {
         id: usize,
+        seq: u64,
+        /// Logical tool-call id (pairs the call with its `ToolResult` and is
+        /// the target of [`ToolSummarized`](SessionEvent::ToolSummarized)).
+        tool_id: String,
         name: String,
         args: Vec<(String, String)>,
         /// Populated when the corresponding `ToolResult` arrives.
@@ -118,7 +148,15 @@ pub enum UiMessage {
         /// by-value `result` field would never update in the DOM.  A signal
         /// updates the view reactively regardless of `<For>` reconciliation.
         result: RwSignal<Option<String>>,
+        /// Seq of the `ToolResult` event, for overlay targeting.  Set when
+        /// the result arrives.
+        result_seq: RwSignal<Option<u64>>,
         expanded: RwSignal<bool>,
+        deleted: RwSignal<bool>,
+        /// Edit overlay for the call's name/args.
+        edit: RwSignal<Option<EditOverlay>>,
+        /// Edit overlay for the result content.
+        result_edit: RwSignal<Option<EditOverlay>>,
     },
     FinalResponse {
         id: usize,
@@ -130,12 +168,28 @@ pub enum UiMessage {
     Cancelled {
         id: usize,
     },
-    /// A rolling LLM summary replaced some earlier messages.  Shown as a
-    /// one-line notice so compaction is visible in the web UI.
-    Compacted {
+    /// A rolling LLM summary that replaced earlier messages.  Collapsed by
+    /// default (showing the summary); click to expand and see the originals.
+    /// `children` may contain nested groups (recursive summaries) or
+    /// [`ToolSummaryGroup`](UiMessage::ToolSummaryGroup)s.
+    CompactedGroup {
         id: usize,
-        count: usize,
+        seq: u64,
+        summary: String,
         model: String,
+        manual: bool,
+        children: Vec<UiMessage>,
+        expanded: RwSignal<bool>,
+    },
+    /// A single tool call+result pair summarized into a short summary.
+    /// Collapsed by default; expand to see the original pair.
+    ToolSummaryGroup {
+        id: usize,
+        seq: u64,
+        summary: String,
+        model: String,
+        child: Box<UiMessage>,
+        expanded: RwSignal<bool>,
     },
 }
 
@@ -150,7 +204,24 @@ impl UiMessage {
             UiMessage::FinalResponse { id } => *id,
             UiMessage::Error { id, .. } => *id,
             UiMessage::Cancelled { id } => *id,
-            UiMessage::Compacted { id, .. } => *id,
+            UiMessage::CompactedGroup { id, .. } => *id,
+            UiMessage::ToolSummaryGroup { id, .. } => *id,
+        }
+    }
+
+    /// The transaction-log seq of the originating event, if this message is
+    /// agent-visible (and thus targetable by overlays / compaction `covers`).
+    fn agent_seq(&self) -> Option<u64> {
+        match self {
+            UiMessage::UserPrompt { seq, .. }
+            | UiMessage::AssistantFinal { seq, .. }
+            | UiMessage::ToolCall { seq, .. }
+            | UiMessage::CompactedGroup { seq, .. }
+            | UiMessage::ToolSummaryGroup { seq, .. } => Some(*seq),
+            UiMessage::Thinking { .. }
+            | UiMessage::FinalResponse { .. }
+            | UiMessage::Error { .. }
+            | UiMessage::Cancelled { .. } => None,
         }
     }
 }
@@ -175,6 +246,20 @@ pub struct AppState {
     /// Streaming text buffer — accumulated on each `AssistantText` event,
     /// flushed to a `UiMessage::AssistantFinal` on `TurnEnded`.
     pub streaming_text: RwSignal<String>,
+    /// Seq of the first `AssistantText` chunk in the current stream.  The
+    /// server merges consecutive `AssistantText` events into one
+    /// agent-visible item whose seq is the *first* chunk's; we track it
+    /// here so the flushed `AssistantFinal` carries the right seq.
+    pub(crate) streaming_seq: RwSignal<Option<u64>>,
+    /// Running count of events received, matching the server's transaction-
+    /// log seq.  Every event the client receives went through
+    /// [`Session::emit`](goop_server::Session) (append to the log with a
+    /// contiguous seq), so counting received events reproduces the server's
+    /// seq assignment.  Reset to 0 on connect; advanced once per event in
+    /// [`build_messages`](Self::build_messages) (history) and
+    /// [`dispatch`](Self::dispatch) (live).  If a live-only event (not
+    /// appended to the log) is ever added, this counter must skip it.
+    pub(crate) seq_counter: RwSignal<u64>,
     /// Turn-level state machine.  When `Thinking`, a `UiMessage::Thinking`
     /// is present at the end of `messages` and the animated dot is shown.
     /// Replaces the former `thinking: bool` + `remove_last_thinking()`
@@ -228,6 +313,7 @@ struct BuildResult {
     running: bool,
     turn_state: TurnState,
     next_id: usize,
+    next_seq: u64,
     context_usage: Option<(usize, usize)>,
 }
 
@@ -245,6 +331,8 @@ impl AppState {
             connection: RwSignal::new(ConnectionState::Disconnected),
             ws: RwSignal::new(None),
             streaming_text: RwSignal::new(String::new()),
+            streaming_seq: RwSignal::new(None),
+            seq_counter: RwSignal::new(0),
             turn_state: RwSignal::new(TurnState::Idle),
             sidebar_open: RwSignal::new(false),
             input_text: RwSignal::new(String::new()),
@@ -435,8 +523,9 @@ impl AppState {
                     // Pre-form all messages from the buffered events
                     // without touching a single reactive signal.
                     let start_id = self.next_message_id.get_untracked();
-                    let result = Self::build_messages(&buffer, start_id);
+                    let result = Self::build_messages(&buffer, start_id, 0);
                     self.next_message_id.set(result.next_id);
+                    self.seq_counter.set(result.next_seq);
 
                     // Apply everything in one shot.
                     if let Some(name) = result.session_name {
@@ -479,16 +568,27 @@ impl AppState {
     /// whether the last message is a `Thinking` that was never followed
     /// by a content event — this lets the caller initialise the live FSM
     /// correctly.
-    fn build_messages(events: &[SessionEvent], start_id: usize) -> BuildResult {
+    ///
+    /// `start_seq` is the transaction-log seq of the first event in
+    /// `events`; the returned `next_seq` is one past the last.  Both let
+    /// the caller keep [`AppState::seq_counter`] in sync with the server.
+    fn build_messages(events: &[SessionEvent], start_id: usize, start_seq: u64) -> BuildResult {
         let mut messages: Vec<UiMessage> = Vec::with_capacity(events.len());
         let mut session_name: Option<String> = None;
         let mut running = false;
         let mut streaming: String = String::new();
+        // Seq of the first `AssistantText` chunk in the pending stream.
+        let mut streaming_seq: Option<u64> = None;
         let mut next_id = start_id;
+        let mut seq = start_seq;
         let mut turn = TurnState::Idle;
         let mut context_usage: Option<(usize, usize)> = None;
 
         for event in events {
+            // Every event the client receives was appended to the server's
+            // transaction log with a contiguous seq — assign it here.
+            let event_seq = seq;
+            seq += 1;
             match event {
                 SessionEvent::SessionInfo { name } => {
                     session_name = Some(name.clone());
@@ -498,7 +598,10 @@ impl AppState {
                     turn = TurnState::Active;
                     messages.push(UiMessage::UserPrompt {
                         id: next_id,
+                        seq: event_seq,
                         content: content.clone(),
+                        deleted: RwSignal::new(false),
+                        edit: RwSignal::new(None),
                     });
                     next_id += 1;
                 }
@@ -513,56 +616,93 @@ impl AppState {
                 }
                 SessionEvent::AssistantText(chunk) => {
                     leave_thinking(&mut messages, &mut turn);
+                    if streaming.is_empty() {
+                        streaming_seq = Some(event_seq);
+                    }
                     streaming.push_str(chunk);
                 }
                 SessionEvent::ToolCall {
-                    name, arguments, ..
+                    id: tool_id,
+                    name,
+                    arguments,
                 } => {
                     leave_thinking(&mut messages, &mut turn);
-                    flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
+                    flush_streaming_to(
+                        &mut messages,
+                        &mut streaming,
+                        &mut streaming_seq,
+                        &mut next_id,
+                    );
                     let args = flatten_args(arguments);
-                    let expanded = RwSignal::new(false);
-                    let result = RwSignal::new(None);
                     messages.push(UiMessage::ToolCall {
                         id: next_id,
+                        seq: event_seq,
+                        tool_id: tool_id.clone(),
                         name: name.clone(),
                         args,
-                        result,
-                        expanded,
+                        result: RwSignal::new(None),
+                        result_seq: RwSignal::new(None),
+                        expanded: RwSignal::new(false),
+                        deleted: RwSignal::new(false),
+                        edit: RwSignal::new(None),
+                        result_edit: RwSignal::new(None),
                     });
                     next_id += 1;
                 }
-                SessionEvent::ToolResult { content, .. } => {
+                SessionEvent::ToolResult { id, content } => {
                     // ToolResult can arrive while still in Thinking state
                     // (server emits Thinking after ToolResult).  But in
                     // the history buffer ToolResult always follows
                     // ToolCall, which already left thinking.
-                    flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
+                    flush_streaming_to(
+                        &mut messages,
+                        &mut streaming,
+                        &mut streaming_seq,
+                        &mut next_id,
+                    );
                     // Attach result to the most-recent ToolCall without a
                     // result (same logic as the live dispatch path).
-                    if let Some(UiMessage::ToolCall { result: r, .. }) = messages.last_mut()
+                    if let Some(UiMessage::ToolCall {
+                        result: r,
+                        result_seq: rs,
+                        ..
+                    }) = messages.last_mut()
                         && r.get_untracked().is_none()
                     {
                         r.set(Some(content.clone()));
+                        rs.set(Some(event_seq));
                     }
+                    // Mark the tool id as consumed (no separate UiMessage).
+                    let _ = id;
                 }
                 SessionEvent::TurnEnded { reason } => {
                     running = false;
                     leave_thinking(&mut messages, &mut turn);
                     match reason {
                         TurnEndReason::Completed | TurnEndReason::StreamEnded => {
-                            flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
+                            flush_streaming_to(
+                                &mut messages,
+                                &mut streaming,
+                                &mut streaming_seq,
+                                &mut next_id,
+                            );
                             messages.push(UiMessage::FinalResponse { id: next_id });
                             next_id += 1;
                         }
                         TurnEndReason::Cancelled { .. } => {
                             streaming.clear();
+                            streaming_seq = None;
                             messages.push(UiMessage::Cancelled { id: next_id });
                             next_id += 1;
                         }
                         reason @ (TurnEndReason::MaxTurnsExceeded { .. }
                         | TurnEndReason::Error { .. }) => {
-                            flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
+                            flush_streaming_to(
+                                &mut messages,
+                                &mut streaming,
+                                &mut streaming_seq,
+                                &mut next_id,
+                            );
                             let msg = reason.error_message().unwrap_or_default();
                             messages.push(UiMessage::Error { id: next_id, msg });
                             next_id += 1;
@@ -578,20 +718,46 @@ impl AppState {
                 }
                 // ── compaction ──
                 // A rolling LLM summary replaced some earlier messages.
-                SessionEvent::Compacted { covers, model, .. } => {
-                    messages.push(UiMessage::Compacted {
-                        id: next_id,
-                        count: covers.len(),
-                        model: model.clone(),
-                    });
+                // Group them (and everything after, up to this point) into a
+                // collapsible `CompactedGroup`.
+                SessionEvent::Compacted {
+                    summary,
+                    model,
+                    covers,
+                    manual,
+                } => {
+                    apply_compaction(
+                        &mut messages,
+                        next_id,
+                        event_seq,
+                        summary,
+                        model,
+                        *manual,
+                        covers,
+                    );
                     next_id += 1;
                 }
-                // ── overlay / metadata events (no UI yet) ──
-                SessionEvent::ToolSummarized { .. }
-                | SessionEvent::ContextSnapshot { .. }
-                | SessionEvent::ModelChanged { .. }
-                | SessionEvent::Edited { .. }
-                | SessionEvent::Deleted { .. } => {}
+                // ── tool-pair summarization ──
+                SessionEvent::ToolSummarized {
+                    id: tool_id,
+                    summary,
+                    model,
+                } => {
+                    apply_tool_summary(&mut messages, next_id, event_seq, tool_id, summary, model);
+                    next_id += 1;
+                }
+                // ── overlay events ──
+                SessionEvent::Edited {
+                    target,
+                    replacement,
+                } => {
+                    apply_edit(&mut messages, *target, replacement);
+                }
+                SessionEvent::Deleted { target } => {
+                    apply_delete(&mut messages, *target);
+                }
+                // ── metadata events (no UI) ──
+                SessionEvent::ContextSnapshot { .. } | SessionEvent::ModelChanged { .. } => {}
                 SessionEvent::HistoryComplete => {
                     // Should never appear in the buffer — the caller
                     // intercepts it before buffering.
@@ -600,7 +766,12 @@ impl AppState {
         }
 
         // Trailing streaming text (shouldn't normally happen, but be safe).
-        flush_streaming_to(&mut messages, &mut streaming, &mut next_id);
+        flush_streaming_to(
+            &mut messages,
+            &mut streaming,
+            &mut streaming_seq,
+            &mut next_id,
+        );
 
         BuildResult {
             messages,
@@ -608,6 +779,7 @@ impl AppState {
             running,
             turn_state: turn,
             next_id,
+            next_seq: seq,
             context_usage,
         }
     }
@@ -620,6 +792,11 @@ impl AppState {
     /// An exhaustive match ensures every new event variant added to
     /// `goop-shared` produces a compile error here until handled.
     fn dispatch(&self, event: SessionEvent) {
+        // Assign this event its transaction-log seq (mirroring the server's
+        // contiguous-from-zero counter) before any arm uses it.
+        let seq = self.seq_counter.get_untracked();
+        self.seq_counter.set(seq + 1);
+
         let next_id = || {
             let id = self.next_message_id.get_untracked();
             self.next_message_id.set(id + 1);
@@ -651,8 +828,15 @@ impl AppState {
                 self.btn_state.set(BtnState::Running);
                 self.turn_state.set(TurnState::Active);
                 let id = next_id();
-                self.messages
-                    .update(|ms| ms.push(UiMessage::UserPrompt { id, content }));
+                self.messages.update(|ms| {
+                    ms.push(UiMessage::UserPrompt {
+                        id,
+                        seq,
+                        content,
+                        deleted: RwSignal::new(false),
+                        edit: RwSignal::new(None),
+                    });
+                });
             }
             SessionEvent::Thinking => {
                 // The server emits Thinking at the start of each turn
@@ -665,28 +849,38 @@ impl AppState {
             }
             SessionEvent::AssistantText(chunk) => {
                 leave_thinking_signal(self);
+                // Record the first chunk's seq for the eventual AssistantFinal.
+                if self.streaming_text.get_untracked().is_empty() {
+                    self.streaming_seq.set(Some(seq));
+                }
                 self.streaming_text.update(|s| s.push_str(&chunk));
             }
             SessionEvent::ToolCall {
-                name, arguments, ..
+                id: tool_id,
+                name,
+                arguments,
             } => {
                 leave_thinking_signal(self);
                 self.flush_streaming();
                 let args = flatten_args(&arguments);
-                let expanded = RwSignal::new(false);
-                let result = RwSignal::new(None);
                 let id = next_id();
                 self.messages.update(|ms| {
                     ms.push(UiMessage::ToolCall {
                         id,
+                        seq,
+                        tool_id,
                         name,
                         args,
-                        result,
-                        expanded,
+                        result: RwSignal::new(None),
+                        result_seq: RwSignal::new(None),
+                        expanded: RwSignal::new(false),
+                        deleted: RwSignal::new(false),
+                        edit: RwSignal::new(None),
+                        result_edit: RwSignal::new(None),
                     });
                 });
             }
-            SessionEvent::ToolResult { content, .. } => {
+            SessionEvent::ToolResult { id, content } => {
                 // ToolResult doesn't change the turn state — the server
                 // follows it with a Thinking event that will push a new
                 // placeholder.
@@ -700,14 +894,20 @@ impl AppState {
                 // calls (though the server emits them one at a time).
                 self.messages.update(|ms| {
                     for msg in ms.iter_mut().rev() {
-                        if let UiMessage::ToolCall { result: r, .. } = msg
+                        if let UiMessage::ToolCall {
+                            result: r,
+                            result_seq: rs,
+                            ..
+                        } = msg
                             && r.get_untracked().is_none()
                         {
                             r.set(Some(content));
+                            rs.set(Some(seq));
                             return;
                         }
                     }
                 });
+                let _ = id;
             }
             SessionEvent::TurnEnded { reason } => {
                 self.btn_state.update(|s| *s = BtnState::on_llm_done(*s));
@@ -715,11 +915,20 @@ impl AppState {
                 match reason {
                     TurnEndReason::Completed | TurnEndReason::StreamEnded => {
                         let raw = self.streaming_text.get_untracked();
+                        let raw_seq = self.streaming_seq.get_untracked();
                         self.streaming_text.set(String::new());
+                        self.streaming_seq.set(None);
                         if !raw.is_empty() {
                             let id = next_id();
-                            self.messages
-                                .update(|ms| ms.push(UiMessage::AssistantFinal { id, raw }));
+                            self.messages.update(|ms| {
+                                ms.push(UiMessage::AssistantFinal {
+                                    id,
+                                    seq: raw_seq.unwrap_or(0),
+                                    raw,
+                                    deleted: RwSignal::new(false),
+                                    edit: RwSignal::new(None),
+                                });
+                            });
                         }
                         let id = next_id();
                         self.messages
@@ -727,6 +936,7 @@ impl AppState {
                     }
                     TurnEndReason::Cancelled { .. } => {
                         self.streaming_text.set(String::new());
+                        self.streaming_seq.set(None);
                         let id = next_id();
                         self.messages
                             .update(|ms| ms.push(UiMessage::Cancelled { id }));
@@ -749,23 +959,47 @@ impl AppState {
                 self.context_usage.set(Some((used, limit)));
             }
             // ── compaction ──
-            // A rolling LLM summary replaced some earlier messages.
-            SessionEvent::Compacted { covers, model, .. } => {
+            // A rolling LLM summary replaced some earlier messages.  Group
+            // them (and everything after, up to now) into a collapsible
+            // `CompactedGroup`.
+            SessionEvent::Compacted {
+                summary,
+                model,
+                covers,
+                manual,
+            } => {
                 let id = next_id();
                 self.messages.update(|ms| {
-                    ms.push(UiMessage::Compacted {
-                        id,
-                        count: covers.len(),
-                        model,
-                    })
+                    apply_compaction(ms, id, seq, &summary, &model, manual, &covers);
                 });
             }
-            // ── overlay / metadata events (no UI yet) ──
-            SessionEvent::ToolSummarized { .. }
-            | SessionEvent::ContextSnapshot { .. }
-            | SessionEvent::ModelChanged { .. }
-            | SessionEvent::Edited { .. }
-            | SessionEvent::Deleted { .. } => {}
+            // ── tool-pair summarization ──
+            SessionEvent::ToolSummarized {
+                id: tool_id,
+                summary,
+                model,
+            } => {
+                let id = next_id();
+                self.messages.update(|ms| {
+                    apply_tool_summary(ms, id, seq, &tool_id, &summary, &model);
+                });
+            }
+            // ── overlay events ──
+            SessionEvent::Edited {
+                target,
+                replacement,
+            } => {
+                self.messages.update(|ms| {
+                    apply_edit(ms, target, &replacement);
+                });
+            }
+            SessionEvent::Deleted { target } => {
+                self.messages.update(|ms| {
+                    apply_delete(ms, target);
+                });
+            }
+            // ── metadata events (no UI) ──
+            SessionEvent::ContextSnapshot { .. } | SessionEvent::ModelChanged { .. } => {}
             SessionEvent::HistoryComplete => {
                 // Handled in handle_event() — a no-op here.
             }
@@ -777,11 +1011,20 @@ impl AppState {
     fn flush_streaming(&self) {
         let text = self.streaming_text.get_untracked();
         if !text.is_empty() {
+            let seq = self.streaming_seq.get_untracked().unwrap_or(0);
             self.streaming_text.set(String::new());
+            self.streaming_seq.set(None);
             let id = self.next_message_id.get_untracked();
             self.next_message_id.set(id + 1);
-            self.messages
-                .update(|ms| ms.push(UiMessage::AssistantFinal { id, raw: text }));
+            self.messages.update(|ms| {
+                ms.push(UiMessage::AssistantFinal {
+                    id,
+                    seq,
+                    raw: text,
+                    deleted: RwSignal::new(false),
+                    edit: RwSignal::new(None),
+                });
+            });
         }
     }
 }
@@ -804,13 +1047,25 @@ fn leave_thinking(messages: &mut Vec<UiMessage>, turn: &mut TurnState) {
 }
 
 /// Flush accumulated streaming text into the message vec as an
-/// `AssistantFinal`.  Clears `streaming`.  Increments `next_id`.
-fn flush_streaming_to(messages: &mut Vec<UiMessage>, streaming: &mut String, next_id: &mut usize) {
+/// `AssistantFinal`.  Clears `streaming` and `streaming_seq`.  Increments
+/// `next_id`.  The `AssistantFinal`'s seq is the *first* chunk's seq
+/// (matching how the server merges consecutive `AssistantText` events into
+/// one agent-visible item).
+fn flush_streaming_to(
+    messages: &mut Vec<UiMessage>,
+    streaming: &mut String,
+    streaming_seq: &mut Option<u64>,
+    next_id: &mut usize,
+) {
     if !streaming.is_empty() {
         messages.push(UiMessage::AssistantFinal {
             id: *next_id,
+            seq: streaming_seq.unwrap_or(0),
             raw: std::mem::take(streaming),
+            deleted: RwSignal::new(false),
+            edit: RwSignal::new(None),
         });
+        *streaming_seq = None;
         *next_id += 1;
     }
 }
@@ -829,5 +1084,221 @@ fn flatten_args(arguments: &serde_json::Value) -> Vec<(String, String)> {
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+// ── compaction & overlay helpers ────────────────────────────────────
+//
+// These operate on `&mut [UiMessage]` (or `&mut Vec<UiMessage>`) so they
+// can be shared by the pure `build_messages` path and the signal-backed
+// `dispatch` path (which calls them inside `self.messages.update(..)`).
+
+/// Whether a message's originating event seq is in `covers`.  A `ToolCall`
+/// matches on either its call seq or its result seq (both are agent-visible
+/// and thus both appear in `Compacted.covers`).
+fn message_in_covers(msg: &UiMessage, covers: &HashSet<u64>) -> bool {
+    match msg {
+        UiMessage::ToolCall {
+            seq, result_seq, ..
+        } => {
+            covers.contains(seq)
+                || result_seq
+                    .get_untracked()
+                    .is_some_and(|rs| covers.contains(&rs))
+        }
+        m => m.agent_seq().is_some_and(|s| covers.contains(&s)),
+    }
+}
+
+/// Group messages covered by a `Compacted` event into a collapsible
+/// [`UiMessage::CompactedGroup`].
+///
+/// Finds the first top-level message whose seq is in `covers` and groups
+/// from there to the end of the list.  For auto-compaction (the only kind
+/// today) `covers` spans the entire agent-visible prefix, so this groups
+/// everything — including trailing UI-only markers (Thinking,
+/// FinalResponse) that belong to the compacted turns.  Existing groups
+/// (from earlier compactions or tool summaries) become children, giving
+/// nested/recursive trees naturally.
+fn apply_compaction(
+    messages: &mut Vec<UiMessage>,
+    id: usize,
+    seq: u64,
+    summary: &str,
+    model: &str,
+    manual: bool,
+    covers: &[u64],
+) {
+    let cover_set: HashSet<u64> = covers.iter().copied().collect();
+    let Some(start) = messages
+        .iter()
+        .position(|m| message_in_covers(m, &cover_set))
+    else {
+        // Nothing covered — defence in depth (shouldn't happen: the server
+        // only emits Compacted when there are ≥ 2 agent-visible items).
+        return;
+    };
+    let children: Vec<UiMessage> = messages.drain(start..).collect();
+    messages.push(UiMessage::CompactedGroup {
+        id,
+        seq,
+        summary: summary.to_string(),
+        model: model.to_string(),
+        manual,
+        children,
+        expanded: RwSignal::new(false),
+    });
+}
+
+/// Wrap the `ToolCall` whose logical id matches `tool_id` in a
+/// [`UiMessage::ToolSummaryGroup`].  Searches top-level messages and
+/// recurses into `CompactedGroup` children (a pair can survive inside a
+/// not-yet-compacted group).  Returns `true` if found and wrapped.
+fn apply_tool_summary(
+    messages: &mut [UiMessage],
+    id: usize,
+    seq: u64,
+    tool_id: &str,
+    summary: &str,
+    model: &str,
+) -> bool {
+    for msg in messages.iter_mut() {
+        if matches!(msg, UiMessage::ToolCall { tool_id: t, .. } if t.as_str() == tool_id) {
+            // Take the ToolCall out and put the group in its place.  The
+            // sentinel is immediately overwritten, so its value is irrelevant.
+            let child = std::mem::replace(msg, UiMessage::Thinking { id: 0 });
+            *msg = UiMessage::ToolSummaryGroup {
+                id,
+                seq,
+                summary: summary.to_string(),
+                model: model.to_string(),
+                child: Box::new(child),
+                expanded: RwSignal::new(false),
+            };
+            return true;
+        }
+        if let UiMessage::CompactedGroup { children, .. } = msg
+            && apply_tool_summary(children, id, seq, tool_id, summary, model)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `target` matches this message's originating seq (call or result
+/// seq for a `ToolCall`).
+fn message_matches_target(msg: &UiMessage, target: u64) -> bool {
+    match msg {
+        UiMessage::UserPrompt { seq, .. } | UiMessage::AssistantFinal { seq, .. } => *seq == target,
+        UiMessage::ToolCall {
+            seq, result_seq, ..
+        } => *seq == target || result_seq.get_untracked() == Some(target),
+        _ => false,
+    }
+}
+
+/// Apply an `Edited` overlay to the message whose seq is `target`.
+/// Recurses into group children.  Returns `true` if found.
+fn apply_edit(messages: &mut [UiMessage], target: u64, replacement: &EditContent) -> bool {
+    for msg in messages.iter_mut() {
+        if message_matches_target(msg, target) {
+            apply_edit_to_message(msg, replacement);
+            return true;
+        }
+        let found = match msg {
+            UiMessage::CompactedGroup { children, .. } => apply_edit(children, target, replacement),
+            UiMessage::ToolSummaryGroup { child, .. } => {
+                apply_edit(std::slice::from_mut(child.as_mut()), target, replacement)
+            }
+            _ => false,
+        };
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Apply an `Edited` overlay to a single message, based on the replacement
+/// content type.  The original content stays in the message's fields; the
+/// overlay holds the replacement so the UI can toggle between them.
+fn apply_edit_to_message(msg: &mut UiMessage, replacement: &EditContent) {
+    match (msg, replacement) {
+        (UiMessage::UserPrompt { edit, .. }, EditContent::Text(text)) => {
+            edit.set(Some(EditOverlay::new(text.clone())));
+        }
+        (UiMessage::AssistantFinal { edit, .. }, EditContent::Text(text)) => {
+            edit.set(Some(EditOverlay::new(text.clone())));
+        }
+        (UiMessage::ToolCall { edit, .. }, EditContent::ToolCall { name, arguments }) => {
+            let args = flatten_args(arguments);
+            edit.set(Some(EditOverlay::new(format_tool_call_display(
+                name, &args,
+            ))));
+        }
+        (UiMessage::ToolCall { result_edit, .. }, EditContent::ToolResult { content }) => {
+            result_edit.set(Some(EditOverlay::new(content.clone())));
+        }
+        // Mismatched replacement type for the target variant — no-op
+        // (defence in depth; the server targets the right type).
+        _ => {}
+    }
+}
+
+/// Mark the message whose seq is `target` as deleted.  Recurses into group
+/// children.  Returns `true` if found.
+fn apply_delete(messages: &mut [UiMessage], target: u64) -> bool {
+    for msg in messages.iter_mut() {
+        if message_matches_target(msg, target) {
+            set_deleted(msg);
+            return true;
+        }
+        let found = match msg {
+            UiMessage::CompactedGroup { children, .. } => apply_delete(children, target),
+            UiMessage::ToolSummaryGroup { child, .. } => {
+                apply_delete(std::slice::from_mut(child.as_mut()), target)
+            }
+            _ => false,
+        };
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Set the `deleted` flag on an editable message.  No-op for variants
+/// without a `deleted` flag (groups — editing/deleting a summary is a
+/// future concern; see Phase 8).
+fn set_deleted(msg: &mut UiMessage) {
+    match msg {
+        UiMessage::UserPrompt { deleted, .. }
+        | UiMessage::AssistantFinal { deleted, .. }
+        | UiMessage::ToolCall { deleted, .. } => deleted.set(true),
+        _ => {}
+    }
+}
+
+/// Format a tool call (name + args) as a display string for an edit overlay.
+fn format_tool_call_display(name: &str, args: &[(String, String)]) -> String {
+    let args_str = args
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if args_str.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}\n{args_str}")
+    }
+}
+
+impl EditOverlay {
+    fn new(replacement: String) -> Self {
+        Self {
+            replacement,
+            show_original: RwSignal::new(false),
+        }
     }
 }

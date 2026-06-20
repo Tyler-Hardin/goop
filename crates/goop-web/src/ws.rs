@@ -25,6 +25,9 @@ pub fn connect(state: &AppState, session_name: String) {
     // the server sends HistoryComplete, then flushed in one batch.
     state.history_buffer.set(Vec::new());
     state.connection.set(ConnectionState::CatchingUp);
+    // Reset the seq counter — the next session's events start at seq 0.
+    state.seq_counter.set(0);
+    state.streaming_seq.set(None);
     // Clear the context-usage bar so the previous session's value
     // doesn't linger until history replay completes.
     state.context_usage.set(None);

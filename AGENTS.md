@@ -165,6 +165,34 @@ The web UI shows a session sidebar for switching between sessions.
   After `HistoryComplete`, the initial live state is derived from the last
   message in the batch, so the FSM is always in sync with the message list.
 
+  **Compaction tree view** (`state.rs`, `components/message.rs`) — Phase 7 of
+  the compaction redesign.  `Compacted` and `ToolSummarized` events no longer
+  render as one-line notices; they wrap their covered messages in collapsible
+  `UiMessage::CompactedGroup` / `ToolSummaryGroup` tree nodes (faint outline,
+  `▸` arrow, summary header, children hidden by default).  Nesting is
+  structural: a later `Compacted` groups an earlier `CompactedGroup` as a
+  child, so recursive summaries form a tree with no special-casing.
+  `apply_compaction` groups from the first `covers`-matched message to the
+  end of the list (correct for auto-compaction's full-prefix `covers`);
+  `apply_tool_summary` targets by tool-call `id` (now stored on
+  `UiMessage::ToolCall`), recursing into group children.
+
+  **Per-message seq** (`state.rs`) — every agent-visible `UiMessage` carries
+  the transaction-log `seq` of its originating event.  The web client
+  reproduces the server's contiguous-from-zero seq assignment by counting
+  received events (`AppState::seq_counter`, reset on connect, advanced once
+  per event in `build_messages` and `dispatch`).  This is what lets
+  `Compacted.covers` and `Edited`/`Deleted` `target` (both seqs) resolve to
+  the right message.  The invariant holds because every event the client
+  receives went through `Session::emit` (append → contiguous seq); a future
+  live-only event not appended to the log would need to skip the counter.
+  `Edited`/`Deleted` overlays (`apply_edit`/`apply_delete`) search the
+  message tree recursively; edits set an `EditOverlay` signal (replacement +
+  show-original `✎` toggle), deletes set a `deleted` flag (faded
+  strikethrough).  No overlay events are emitted yet (Phase 8), so this
+  rendering is dormant but ready — and like all lazily-populated `UiMessage`
+  state, the overlays are `RwSignal`s (the `<For>`-keyed constraint above).
+
 - **Tools** (`src/tools/`) — each tool implements `rig::tool::Tool` on a
   struct that holds an `Arc<SessionState>`.  Tools are organised by group:
   `file.rs` (read, write, replace, read_html, cd), `shell.rs` (shell),
@@ -246,6 +274,22 @@ The web UI shows a session sidebar for switching between sessions.
   Env: `GOOP_COMPACTION`. Summarization is a one-shot, tool-less,
   memory-less completion (`AnyAgent::summarize`) with an embedded system
   prompt. A failed summarization is logged and skipped (full history kept).
+- **Tool-pair summarization** (`src/session.rs` + `src/memory/replay.rs`) —
+  tier-1 compaction: verbose individual tool call+result pairs are summarized
+  by an LLM into `ToolSummarized { id, summary, model }` events, reclaiming
+  tokens incrementally without a full context rewrite. `maybe_summarize_tool_pairs()`
+  runs between prompts in `drain_queue` (alongside `maybe_compact`), using a
+  snapshot → summarize (outside lock) → revalidate → commit lifecycle.
+  Replay applies `ToolSummarized` via `apply_tool_summary()` — content-granularity
+  surgery that splices the target call/result out of merged messages (reusing
+  the `drop_orphaned_tool_pairs` rebuild pattern), since replay merges
+  consecutive calls into one assistant `VisibleItem` and consecutive results
+  into one user `VisibleItem`. Targets by tool-call `id` (stable across
+  merging), not `seq`. Config: `[tool_summarization]` in config.toml
+  (`enabled`, `model`, `min_tokens`, `trigger_tool_count`); **opt-in (default
+  off)**. Env: `GOOP_TOOL_SUMMARIZATION*`. A separate `AnyAgent` is built via
+  `build_summarizer()` when `model` is set; otherwise the session's main agent
+  is used. The most-recent turn's tool calls are protected from summarization.
 - **Context snapshots** (`src/session.rs`) — before each turn the session
   emits `ContextSnapshot { seqs, model }`, recording which events formed
   the LLM's context. Replay skips it (audit-only metadata).
@@ -297,12 +341,17 @@ Tera at runtime, embedded via `include_str!` at compile time):
 # goop configuration — ~/.config/goop/config.toml
 #
 # Environment variable overrides this file:
-#   GOOP_MODEL             — model in provider/model format
-#   GOOP_OLLAMA_BASE_URL   — Ollama API base URL (default: http://localhost:11434)
+#   GOOP_MODEL                        — model in provider/model format
+#   GOOP_OLLAMA_BASE_URL              — Ollama API base URL (default: http://localhost:11434)
+#   GOOP_COMPACTION                   — compaction budget (integer or "80%")
+#   GOOP_TOOL_SUMMARIZATION           — enable tool-pair summarization ("true" or "1")
+#   GOOP_TOOL_SUMMARIZATION_MODEL     — model for tool-pair summaries (provider/model format)
+#   GOOP_TOOL_SUMMARIZATION_MIN_TOKENS — min tokens for a pair to be worth summarizing
+#   GOOP_TOOL_SUMMARIZATION_TRIGGER    — tool-call count that triggers summarization
 
 # LLM model in litellm-style provider/model format.
 # Provider is the first segment, model is everything after.
-# Supported providers: deepseek | openai | openrouter | groq | ollama | anthropic
+# Supported providers: deepseek | openai | openrouter | groq | ollama | anthropic | zai
 model = "deepseek/deepseek-v4-pro"
 
 # Maximum tokens per response.
@@ -311,26 +360,40 @@ max_tokens = 100000
 # Maximum tool-calling turns per prompt (safety limit).
 default_max_turns = 100
 
+# When the agent-visible conversation exceeds a token budget, the entire
+# prefix is summarized by an LLM into a rolling summary before the next
+# turn.  Accepts an integer (absolute tokens) or "80%" (percentage of
+# the model's context window).  Uncomment to enable.
+# compaction = "75%"
+
 # Tool groups enabled for the agent.
 # Available: file_ops, shell, ssh, web_fetch, computer_use
 enabled_tool_groups = ["file_ops", "shell", "ssh", "web_fetch"]
 
-# Token budget for context compaction — when the conversation exceeds this
-# many tokens, older messages are evicted and replaced with a rolling text
-# summary.  Remove or comment out to disable (unlimited context).
-# compaction_token_budget = 64000
-
 # Base URL for the Ollama API.  Only used when provider is ollama.
 # Uncomment and set if Ollama runs on a nonstandard port or remote host.
 # ollama_base_url = "http://localhost:11434"
+
+# Verbose tool call+result pairs are individually summarized by an LLM,
+# reclaiming tokens without a full context compaction.  Independent of
+# the compaction budget above.  Uncomment to enable.
+# [tool_summarization]
+# enabled = true
+# model = "deepseek/deepseek-v4-flash"   # omit → session's main model
+# min_tokens = 2000                      # only summarize verbose pairs
+# trigger_tool_count = 15                # omit → default (15)
 ```
 
 Environment variables override the config file:
 - `GOOP_MODEL` — model in `provider/model` format (e.g. `openai/gpt-4o`, `openrouter/openai/gpt-4o`)
 - `GOOP_OLLAMA_BASE_URL` — Ollama API base URL (overrides the `ollama_base_url` config field)
-- `GOOP_COMPACTION_TOKEN_BUDGET` — token budget for context compaction
+- `GOOP_COMPACTION` — compaction budget (integer or `"80%"`)
+- `GOOP_TOOL_SUMMARIZATION` — enable tool-pair summarization (`"true"` or `"1"`)
+- `GOOP_TOOL_SUMMARIZATION_MODEL` — model for tool-pair summaries (provider/model format)
+- `GOOP_TOOL_SUMMARIZATION_MIN_TOKENS` — minimum tokens for a pair to be worth summarizing
+- `GOOP_TOOL_SUMMARIZATION_TRIGGER` — tool-call count that triggers summarization
 - Provider-specific API keys: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`,
-  `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`
+  `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `ZAI_API_KEY`
   (Ollama reads `OLLAMA_API_KEY` for authentication when behind a proxy;
   Ollama base URL can also be set via the provider-level `OLLAMA_API_BASE_URL`
   env var, but `GOOP_OLLAMA_BASE_URL` and the config field take precedence)

@@ -2,9 +2,26 @@
 
 ## Status
 
-- **Goop working tree:** clean, on `master` (4083ccb)
-- **Goose reference:** clean, on `main` (5dcd3ff34)
+- **Goop working tree:** clean, on `master` (`914ddbf`)
+- **Goose reference:** clean, on `main` (`5dcd3ff34`)
 - **Backwards compat:** breaking changes OK (pre-alpha, unreleased)
+
+### Phase progress
+
+| Phase | Status | Notes / commit |
+|-------|--------|----------------|
+| 1 — Log entry envelope & event enrichment | ✅ done | `ec6a275` — `LogEntry`, `TurnEnded`, tool-call `id`s. `seq`/`next_seq` later folded into the encapsulated `TransactionLog` (`a5f257b` → `914ddbf`). |
+| 2 — Log-replay memory | ✅ done | `0186ce7` — `LogReplayMemory` (`load`=replay, `append`=no-op); turn-buffering + orphan safety net. |
+| 3 — Context snapshots & model identity | ✅ mostly | `c776200` — `ContextSnapshot` emitted per turn. `ModelChanged` is defined but **not yet emitted** (no model-switch path exists). |
+| 4 — LLM summarization | ✅ done | `30aa655` — `maybe_compact` + `AnyAgent::summarize`. Simplified from the outline: no progressive-stripping fallback (on error, keep full history and retry next prompt); most-recent user message preserved implicitly (rig appends the in-progress prompt). UI surfaced in `bd4118a`. |
+| 5 — Tool-pair summarization | ✅ done | `apply_tool_summary` replay surgery; `maybe_summarize_tool_pairs` summarizer (snapshot→summarize→revalidate); `ToolSummarizationConfig` (top-level `[tool_summarization]`, not nested under `[compaction]`); terminal + web UI notices. Config: `[tool_summarization]` (env vars: `GOOP_TOOL_SUMMARIZATION*`). Default off. |
+| 6 — Config | ✅ done | Stale compaction descriptions fixed (template + `config.rs` doc comments + AGENTS.md config example). `[tool_summarization]` section + `GOOP_TOOL_SUMMARIZATION*` env vars documented in template and AGENTS.md. `CompactionMode` kept (not replaced with `auto_compact_threshold` — see note below). |
+| 7 — Web UI tree view | ✅ done | `CompactedGroup` / `ToolSummaryGroup` collapsible tree nodes; per-message `seq` tracked locally (counting received events); `Edited`/`Deleted` overlays rendered (✎ badge + show-original toggle; faded strikethrough). See "As built" below. |
+| 8 — Edit/delete overlays | ⬜ planned | |
+| 9 — Forking | ⬜ future | |
+| 10 — Manual range compaction | ⬜ future | |
+| 11 — Terminal | ⬜ planned | |
+| 12 — Tests & migration | ⬜ planned | |
 
 ---
 
@@ -1043,7 +1060,7 @@ shown as inline notices.  This matches goose's terminal behavior.
 
 ## 4. Implementation Outline
 
-### Phase 1: Log entry envelope & event enrichment
+### Phase 1: Log entry envelope & event enrichment  ✅ done
 - Define `LogEntry { seq, parent, ts, event }` in `goop-shared`.
 - Add `seq: u64` monotonic counter in `Session` (assigned at append time).
 - Write `parent: Some(seq - 1)` always (linear; tree-walk ready for forks).
@@ -1056,7 +1073,10 @@ shown as inline notices.  This matches goose's terminal behavior.
 - Eliminate `<name>.messages.jsonl`; consolidate to `<name>.jsonl`.
 - Implement tree-walk `collect_branch()` (linear for now).
 
-### Phase 2: Log-replay memory
+> **As built:** `seq`/`next_seq` were later folded into the encapsulated
+> `TransactionLog` (§2.2a) — see commits `a5f257b` → `914ddbf`.
+
+### Phase 2: Log-replay memory  ✅ done
 - Rewrite `FileConversationMemory` as a log-replay memory:
   `load()` replays the log → `Vec<Message>`; `append()` = no-op.
 - Implement event → `Message` reconstruction (including tool-call ID pairing).
@@ -1069,14 +1089,19 @@ shown as inline notices.  This matches goose's terminal behavior.
 - Eliminate `preserve_committed_turns()` (events already in log; `TurnEnded`
   reason controls visibility).
 
-### Phase 3: Context snapshots & model identity
+### Phase 3: Context snapshots & model identity  ✅ done (ContextSnapshot)
 - Emit `ContextSnapshot { seqs, model }` before each LLM call (in `run_one`).
 - The snapshot records the current agent-visible seqs (post-compaction,
   post-overlay) and the model that is about to see them.
 - Emit `ModelChanged { from, to }` when the session's effective model changes
   (config edit + restart, or future `/model` command).
 
-### Phase 4: LLM summarization
+> **As built:** `ContextSnapshot` is emitted per turn. `ModelChanged` is
+> defined but **not yet emitted** — there is no model-switch path to trigger
+> it. It will be wired up when a `/model` command (or config-edit-+-restart
+> detection) lands.
+
+### Phase 4: LLM summarization  ✅ done
 - Add `AnyAgent::summarize()` method using rig's `completion_request()` API.
 - Write the compaction system prompt template (embedded at compile time).
 - Implement full-conversation compaction: threshold check before each prompt,
@@ -1084,18 +1109,238 @@ shown as inline notices.  This matches goose's terminal behavior.
 - Implement progressive tool-response stripping fallback.
 - Preserve most-recent user message (re-add after summary).
 
-### Phase 5: Tool-pair summarization
+> **As built:** `maybe_compact()` runs in `drain_queue` before each prompt
+> (`session.rs`). Two simplifications from the outline: (1) no progressive
+> tool-response stripping — on a summarization error it logs and keeps the
+> full history, retrying next prompt; (2) the most-recent user message is
+> preserved implicitly (rig appends the in-progress prompt itself), not by an
+> explicit re-add. UI surfacing landed in `bd4118a`.
+
+### Phase 5: Tool-pair summarization  ✅ done
+
+Fine-grained summarization of individual tool call+result pairs — tier 1 of
+the two-tier strategy (§2.6).  Where Phase 4's full compaction rolls up the
+*entire* agent-visible prefix into one rolling summary, tool-pair
+summarization replaces *individual* verbose tool results (big file reads, long
+shell output, search dumps) with short summaries, reclaiming tokens
+incrementally without a full context rewrite.
+
+The `ToolSummarized { id, summary, model }` event variant already exists (added
+in Phase 1) but is currently a **no-op in replay**: `replay_visible` routes it
+to `Replay::feed`, whose catch-all arm ignores it.  Phase 5 makes it
+functional — the summarizer appends real `ToolSummarized` events, and replay
+applies them.
+
 - Add config section (`[compaction.tool_summarization]`).
-- Implement `maybe_summarize_tool_pairs()` background task (like goose).
+- Implement `maybe_summarize_tool_pairs()` (between prompts in `drain_queue`).
 - Append `ToolSummarized` events; protect current-turn tool calls.
 - Configurable model + trigger.
 
-### Phase 6: Config
-- Replace `CompactionMode` with `auto_compact_threshold` (f64).
+#### 5.1 The merging problem — why this isn't a trivial `retain`
+
+Full compaction (`Compacted.covers`) targets agent-visible items *by seq* and a
+simple `retain` suffices, because each covered item is a whole `VisibleItem`.
+Tool-pair summarization can't work that way, because **replay merges
+consecutive content into single messages** (see `Replay` in `replay.rs`):
+
+- Consecutive assistant tool calls accumulate into **one** assistant
+  `VisibleItem` (`flush_assistant`), keyed by the *first* call's seq.
+- Consecutive tool results accumulate into **one** user `VisibleItem`
+  (`flush_results`), keyed by the *first* result's seq.
+
+So a single tool call (id `A`) lives *inside* an assistant message that may
+also hold calls `B`, `C`; its result lives *inside* a user message that may
+also hold results `B`, `C`.  There is no `VisibleItem` whose seq is "the
+call-A item" to `retain` away.  Removing pair `A` therefore requires
+**content-granularity surgery**: split the assistant message, drop call `A`,
+re-pack the rest; split the user message, drop result `A`, re-pack; insert the
+summary.
+
+`drop_orphaned_tool_pairs` already implements exactly this pattern (it walks
+the `OneOrMany` content, retains the non-orphan items, and rebuilds the
+messages).  Phase 5's `ToolSummarized` handler reuses the same technique.
+
+`ToolSummarized` targets by tool-call **`id`** (not seq) precisely because the
+id is the one stable handle that survives merging — it is carried *inside* the
+`RigToolCall` / `RigToolResult` content.  An id-based scan is O(n) per event
+but stops at the first match per half, so it's effectively O(1) in practice
+(the same reasoning as the live `ToolResult`-routing scan in `state.rs`).
+
+#### 5.2 Replay changes
+
+In `replay_visible`, `ToolSummarized` is promoted out of the `Replay::feed`
+catch-all into a top-level arm (alongside `Compacted`), because it operates on
+the *committed* visible set, not the buffered turn:
+
+```rust
+SessionEvent::ToolSummarized { id, summary, .. } => {
+    apply_tool_summary(&mut visible, id, summary, entry.seq);
+}
+```
+
+`apply_tool_summary` mirrors `drop_orphaned_tool_pairs`'s rebuild loop but for
+a single id: find the assistant message holding a `ToolCall` with that id and
+the user message holding the matching `ToolResult`, splice each out of its
+message, and insert a single `VisibleItem { seq: entry.seq, msg:
+Message::user(summary) }` at the call's former position.  If only one half is
+present (the other was already compacted/deleted), drop the present half too —
+the orphan net would catch it anyway, but doing it here keeps the intermediate
+state valid.  If neither half is present, the event is a no-op (defence in
+depth).
+
+**Ordering with `Compacted`:** both are applied in seq order during the single
+pass, so a `Compacted` whose `covers` includes a prior `ToolSummarized` summary
+removes it correctly (the summary is an agent-visible item like any other), and
+a `ToolSummarized` whose pair was already swept by an earlier `Compacted` is a
+no-op (the call/result are gone).  No special-casing.
+
+#### 5.3 The summarizer
+
+`maybe_summarize_tool_pairs()` runs **between prompts** in `drain_queue`
+(alongside `maybe_compact`), not as a free-running task.  This sidesteps the
+hardest concurrency issues — no appends while a turn is streaming, no need to
+coordinate with `run_one`'s cancel path.  "Background" here means *off the
+streaming turn path*, not a detached loop; the serialized prompt queue is the
+natural seam.  This is the use case the `TransactionLog` encapsulation (§2.2a)
+was designed for.
+
+**Lifecycle (the log lock is held only for the fast steps):**
+
+1. **Snapshot (under the log lock).**  Acquire the log, call
+   `agent_visible_items()`, and select candidate pairs: tool calls/results
+   whose *combined* token count (`memory.count_tokens`) exceeds a threshold (a
+   big file read or long shell output) and that are **not** part of the
+   most-recent committed turn (protect in-progress / just-finished work the LLM
+   may still reference).  Record each candidate's `(id, [assistant-call msg,
+   user-result msg])`.  Drop the lock.
+2. **Summarize (outside the lock).**  For each candidate, call
+   `agent.summarize(messages, TOOL_PAIR_SYSTEM_PROMPT)` — a one-shot completion
+   of just `[assistant(call), user(result)]`.  This is the slow step; holding
+   the log lock here would block every `emit` and every `load`.
+3. **Commit (under the log lock).**  Re-acquire the lock and **re-validate**
+   each candidate: the conversation may have advanced since the snapshot — a
+   later turn may have completed, a `Compacted` may have covered the pair, or a
+   `Deleted` overlay may have removed it.  Re-run `agent_visible_items()` and
+   confirm the id is still present and still agent-visible; skip if not.  For
+   survivors, `emit(SessionEvent::ToolSummarized { id, summary, model })` one
+   at a time.
+
+This snapshot → summarize → revalidate pattern is *why* `next_seq` lives inside
+`TransactionLog`: the summarizer never assigns seqs itself, so even if a
+summarizer and a streaming turn overlapped, every `append` is atomic and
+`seq order == file order == parent order`.  The §2.2a invariant holds by
+construction.
+
+**Trigger & batch size.**  Like goose, summarize the *oldest* qualifying batch
+per invocation (default 10 pairs), not the whole backlog — bounds latency and
+cost before the next turn.  Triggered when the agent-visible tool-call count
+exceeds a configurable cutoff (§5.4).
+
+**Model.**  Configurable — a fast/cheap model for summaries, falling back to
+the session's main model.  Reuses `AnyAgent::summarize`, but on a *separate*
+`AnyAgent` built from the configured summarization model (the session's main
+agent need not be the summarizer).
+
+#### 5.4 Config
+
+Grounded in the existing `Config` / `CompactionMode` types.  Add a nested
+struct — tool-pair summarization is independent of the full-compaction budget
+and can be on while full compaction is off:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolSummarizationConfig {
+    pub enabled: bool,
+    /// Model in provider/model format.  None → session's main model.
+    pub model: Option<String>,
+    /// Summarize a pair only when its call+result exceeds this many tokens.
+    pub min_tokens: Option<usize>,
+    /// Start summarizing when the agent-visible tool-call count exceeds this.
+    /// None → auto-scaled from the model's context window (like goose).
+    pub trigger_tool_count: Option<usize>,
+}
+```
+
+```toml
+[compaction.tool_summarization]
+enabled = true
+# model = "deepseek/deepseek-v4-flash"   # omit → session's main model
+# min_tokens = 2000                      # only summarize verbose pairs
+# trigger_tool_count = 15                # omit → auto-scaled
+```
+
+Env: `GOOP_TOOL_SUMMARIZATION`, `GOOP_TOOL_SUMMARIZATION_MODEL`,
+`GOOP_TOOL_SUMMARIZATION_MIN_TOKENS`, `GOOP_TOOL_SUMMARIZATION_TRIGGER`.
+
+Session overrides via `SessionConfig` follow the existing `Option<…>` "defer to
+global" pattern (see `SessionConfig::merge`).
+
+Default: **off** (opt-in), matching Phase 4's compaction default and the
+project's conservative-defaults stance.  (Note: this config work overlaps
+Phase 6 — the `[compaction.tool_summarization]` section can land here or be
+folded into Phase 6; either way the struct above is the shape.)
+
+#### 5.5 Interaction with full compaction (Phase 4)
+
+The two tiers compose without special cases:
+
+- Tool-pair summaries are agent-visible `User` messages, so a later full
+  compaction's `covers` naturally includes them — the rolling summary
+  summarizes `[…, tool-summary, …]` just like any other content.
+- Full compaction removes covered items by seq; a tool pair already swept by a
+  `Compacted` is gone from the visible set, so a `ToolSummarized` for it is a
+  no-op on replay.
+- Running both: tool-pair summarization trims the verbose middles
+  incrementally; full compaction fires when the *whole* prefix still exceeds
+  the budget.  Neither needs to know about the other.
+
+#### 5.6 UI & terminal
+
+Both already have `ToolSummarized { .. } => {}` no-op arms (web `state.rs`,
+terminal `terminal.rs`).  Phase 5 lights them up minimally — full tree/outline
+rendering is Phase 7; Phase 5 just needs *something* so the user sees it
+happened:
+
+- **Terminal:** an inline notice, e.g. `· tool summary: read (1.2k → 80 tok)`.
+- **Web:** a `UiMessage::ToolSummarized`, or fold a "summarized" state into the
+  existing tool-call bubble.  (The `<For>`-keyed stable-rendering constraint
+  from AGENTS.md applies — any lazily-populated field must be a signal.)
+
+#### 5.7 Tests
+
+- Replay: a `ToolSummarized` replaces its call+result pair with the summary.
+- Replay: a pair sharing a merged message with other calls/results removes
+  *only its own half* (content-granularity — the siblings survive).
+- Replay: a `ToolSummarized` for an already-`Compacted` pair is a no-op;
+  ordering with `Compacted` is seq-correct.
+- Replay: a `ToolSummarized` for a missing id is a no-op (defence in depth).
+- Summarizer: snapshot → summarize → revalidate skips pairs that vanished
+  between snapshot and commit (mock the LLM, advance the log, assert no event
+  for the vanished pair).
+- Summarizer: protects the most-recent turn's tool calls.
+- Config: parse `[compaction.tool_summarization]` with all field combos; env
+  overrides; session overrides merge.
+
+### Phase 6: Config  ✅ done
+- ~~Replace `CompactionMode` with `auto_compact_threshold` (f64).~~
 - Add `[compaction.tool_summarization]` section.
 - Update env vars and default config template.
 
-### Phase 7: Web UI tree view
+> **As built:** `CompactionMode` (Tokens / Percent) was kept — it's more
+> flexible than the proposed `auto_compact_threshold` (f64) and the note in
+> the plan already flagged this as moot.  Tool-pair summarization landed as a
+> top-level `[tool_summarization]` section (not `[compaction.tool_summarization]`)
+> in Phase 5 — nesting it under `compaction` would require restructuring the
+> scalar `compaction` field into a table.  Phase 6's actual work was fixing
+> stale documentation: the default config template and `config.rs` doc comments
+> still described the *old* compaction approach (mechanical text rollup, "no
+> extra LLM call"), and the AGENTS.md config example used the removed
+> `compaction_token_budget` field name and `GOOP_COMPACTION_TOKEN_BUDGET` env
+> var.  All are now updated to describe LLM summarization, the `compaction`
+> field, the `[tool_summarization]` section, and the `GOOP_TOOL_SUMMARIZATION*`
+> env vars.
+
+### Phase 7: Web UI tree view  ✅ done
 - Update `build_messages()` and `dispatch()` to produce tree/group structure.
 - Add `UiMessage` variant or grouping wrapper for compaction boundaries.
 - Render faint outlines + `>` toggle arrows via CSS.
@@ -1103,31 +1348,70 @@ shown as inline notices.  This matches goose's terminal behavior.
 - Render edits (`✎` indicator, show-original affordance) and deletes
   (faded/struck-through).
 
-### Phase 8: Edit/delete overlays
+> **As built:** `Compacted` and `ToolSummarized` events no longer render as
+> one-line notices — they wrap their covered messages in collapsible
+> `UiMessage::CompactedGroup` / `ToolSummaryGroup` tree nodes (faint outline,
+> `▸` arrow, summary header, children hidden by default).  Nesting is
+> structural: a later `Compacted` groups an earlier `CompactedGroup` (and
+> any `ToolSummaryGroup`s) as a child, so recursive summaries form a tree
+> with no special-casing.
+>
+> **Seq tracking.** Each agent-visible `UiMessage` carries the transaction-log
+> `seq` of its originating event.  The web client reproduces the server's
+> contiguous-from-zero seq assignment by counting received events
+> (`AppState::seq_counter`, reset on connect, advanced once per event in
+> `build_messages` and `dispatch`).  This lets `Compacted.covers` (seqs) and
+> `Edited`/`Deleted` `target` (seq) resolve to the right message.  The
+> invariant holds because every event the client receives went through
+> `Session::emit` (append to the log with a contiguous seq); a future
+> live-only event not appended to the log would require skipping the counter.
+>
+> **Compaction grouping** groups from the first covered message to the end of
+> the list (`apply_compaction`).  For auto-compaction (the only kind today)
+> `covers` spans the entire agent-visible prefix, so this groups everything —
+> including trailing UI-only markers (Thinking, FinalResponse) that belong to
+> the compacted turns.  `ToolSummarized` targets by tool-call `id` (now stored
+> on `UiMessage::ToolCall`), recursing into `CompactedGroup` children.
+>
+> **Edits/deletes** (`apply_edit` / `apply_delete`) search the message tree
+> recursively (including group children) for the target seq.  Edits set an
+> `EditOverlay` signal (replacement + show-original toggle) on
+> `UserPrompt`/`AssistantFinal`/`ToolCall`; the `✎` badge toggles between the
+> replacement and the original.  Deletes set a `deleted` flag → faded
+> strikethrough.  No `Edited`/`Deleted` events are emitted yet (Phase 8), so
+> this rendering is dormant but ready.
+>
+> **`<For>` constraint.** Group children render via a nested `<For>` keyed by
+> `id`.  Because `<For>` does not re-run a child view for an unchanged key,
+> all lazily-populated state on `UiMessage` variants (edit overlays, deleted
+> flags, tool results) is stored as `RwSignal`s — the established pattern
+> (see AGENTS.md "ToolCall fields must be signals").
+
+### Phase 8: Edit/delete overlays  ⬜ planned
 - Add `ClientMessage` variants for edit/delete requests.
 - Server handler: append `Edited`/`Deleted` events (deletes emit both halves
   of a tool pair).
 - UI: edit affordance on messages; delete button; range selection (future).
 
-### Phase 9: Forking (future)
+### Phase 9: Forking (future)  ⬜ future
 - Add `active_tip` to `<name>.state.toml`.
 - Implement fork on edit-and-regenerate: new `UserPrompt` with `parent` set to
   the fork point; update active tip.
 - UI: branch indicator `< 1/2 >` at branch points; branch switching.
 - Terminal: linear display of active branch only.
 
-### Phase 10: Manual range compaction (future)
+### Phase 10: Manual range compaction (future)  ⬜ future
 - Add `ClientMessage::CompactRange { covers: Vec<u64> }`.
 - Server handler: collect agent-visible messages in range, call LLM
   summarization, append `Compacted { manual: true, .. }`.
 - UI: range selection (shift-click / drag-select).
 
-### Phase 11: Terminal
+### Phase 11: Terminal  ⬜ planned
 - Render `Compacted`/`ToolSummarized` events as inline notices.
 - Render edits/deletes as inline notices.
 - Update history replay to handle new event types.
 
-### Phase 12: Tests & migration
+### Phase 12: Tests & migration  ⬜ planned
 - Unit tests for log replay → agent-visible messages (all overlay types).
 - Unit tests for compaction (mock LLM, like goose's `MockProvider`).
 - Unit tests for overlapping/nested compaction (`covers` includes prior
