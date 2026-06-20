@@ -573,17 +573,23 @@ impl AppState {
     /// select mode.  Collects the seqs of agent-visible messages in the
     /// range and sends them as `covers`.  The server summarizes them and
     /// appends a `Compacted { manual: true }` event.  See §2.11.
+    ///
+    /// **Important:** the selection indices come from the **displayed**
+    /// message list, which may be filtered (LLM view hides deleted
+    /// messages).  We must apply the same filter here so the indices line
+    /// up — otherwise `covers` points at the wrong messages.
     pub fn compact_selected(&self) {
         let start = self.selection_start.get_untracked();
         let end = self.selection_end.get_untracked();
         let Some((s, e)) = start.zip(end) else {
             return;
         };
-        // Collect seqs of agent-visible messages in the range.
+        let llm_view = self.llm_view.get_untracked();
         let covers: Vec<u64> = self
             .messages
             .get_untracked()
             .iter()
+            .filter(|m| !llm_view || !m.is_deleted())
             .enumerate()
             .filter(|(i, _)| *i >= s && *i <= e)
             .filter_map(|(_, m)| m.agent_seq())
