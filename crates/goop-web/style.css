@@ -564,20 +564,51 @@ main {
   display: none !important;
 }
 
+/* ── message action buttons (edit / delete) ──────────────────── */
+/*
+   Actions sit in a row *below* the message content (the OpenWebUI
+   placement), not overlaid on top.  The row is always in the DOM but
+   `opacity: 0`; `:hover` on the parent `.msg` reveals it.  On touch
+   devices a tap on the message triggers `:hover` (browsers fire
+   `mouseover` on touch), so the pattern doubles as tap-to-reveal —
+   no JS needed.  The `.confirming` class forces the row visible so the
+   inline delete-confirm prompt is always shown.
+*/
 .msg-actions {
-  position: absolute;
-  top: 3px;
-  right: 4px;
   display: flex;
-  gap: 1px;
+  margin-top: 4px;
   opacity: 0;
   transition: opacity 0.15s;
-  z-index: 1;
 }
 .msg:hover .msg-actions,
-.msg.editing .msg-actions {
+.msg.editing .msg-actions,
+.msg.confirming .msg-actions {
   opacity: 1;
 }
+/* User messages are right-aligned bubbles — actions align right. */
+.msg.user .msg-actions {
+  justify-content: flex-end;
+}
+.msg.assistant .msg-actions,
+.msg.tool .msg-actions {
+  justify-content: flex-start;
+}
+
+.actions-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.actions-row.confirm {
+  gap: 4px;
+}
+.confirm-text {
+  font-size: 11px;
+  color: var(--red);
+  font-family: var(--mono);
+  margin-right: 2px;
+}
+
 .msg-action {
   background: none;
   border: none;
@@ -595,14 +626,15 @@ main {
   background: var(--surface2);
   color: var(--fg);
 }
-.msg-action.delete:hover {
+.msg-action.delete:hover,
+.msg-action.confirm {
   color: var(--red);
 }
-/* On touch devices there's no hover — keep actions faintly visible. */
-@media (hover: none) {
-  .msg-actions {
-    opacity: 0.5;
-  }
+.msg-action.confirm:hover {
+  background: rgba(242, 98, 90, 0.12);
+}
+.msg-action.cancel:hover {
+  color: var(--fg);
 }
 
 /* ── inline edit mode ────────────────────────────── */

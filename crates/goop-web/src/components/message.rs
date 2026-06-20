@@ -9,23 +9,35 @@ use crate::state::{AppState, EditOverlay, UiMessage};
 
 /// Render a single `UiMessage` variant.
 ///
-/// Editable variants (`UserPrompt`, `AssistantFinal`, `ToolCall`) carry hover-
-/// revealed action buttons (✎ edit, ✕ delete).  Editing a text message swaps
-/// its content for an inline `<textarea>`; saving sends a `ClientMessage::Edit`
-/// which the server echoes back as an `Edited` overlay event, setting an
-/// [`EditOverlay`] that the [`edit_badge`] toggle controls.  Deleting sends a
-/// `ClientMessage::Delete`; the server appends a `Deleted` overlay (and, for a
-/// tool call/result, one for the matching half) which comes back and sets the
-/// `deleted` flag.
+/// Editable variants (`UserPrompt`, `AssistantFinal`, `ToolCall`) carry action
+/// buttons (✎ edit, ✕ delete) in a row **below** the message content — not
+/// overlaid on top (the OpenWebUI placement).  The row is always in the DOM
+/// but `opacity: 0` by default; `:hover` on the message reveals it.  On touch
+/// devices a tap on the message triggers `:hover` (browsers fire `mouseover`
+/// on touch), so the pattern doubles as tap-to-reveal — no JS needed.
 ///
-/// Actions are hidden while the LLM is running (`state.running`) and on already-
-/// deleted messages — editing the agent's memory mid-turn is confusing, and a
-/// deleted message has nothing to edit.
+/// Deleting is a **two-step inline confirm**: clicking ✕ replaces the row
+/// with "Delete? ✓ ✕".  This prevents accidental deletes on mobile, where a
+/// single tap could otherwise fire immediately.  The confirm state lives in a
+/// local `RwSignal` that persists for the message's lifetime (the `<For>`
+/// cache keeps the component instance alive across re-renders).
 ///
-/// **Always-render pattern:** both the display and edit views are always in the
-/// DOM, toggled via `class:hidden`.  This avoids the Leptos `FnOnce`-in-`Fn`
-/// trap: event-handler closures are moved directly into `on:click` / `on:input`
-/// (once), not inside a `move ||` reactive closure that runs many times.
+/// Editing a text message swaps its content for an inline `<textarea>`;
+/// saving sends a `ClientMessage::Edit` which the server echoes back as an
+/// `Edited` overlay event, setting an [`EditOverlay`] that the [`edit_badge`]
+/// toggle controls.  Deleting sends a `ClientMessage::Delete`; the server
+/// appends a `Deleted` overlay (and, for a tool call/result, one for the
+/// matching half) which comes back and sets the `deleted` flag.
+///
+/// Actions are hidden while the LLM is running (`state.running`) and on
+/// already-deleted messages — editing the agent's memory mid-turn is
+/// confusing, and a deleted message has nothing to edit.
+///
+/// **Always-render pattern:** display, edit, and both action states are
+/// always in the DOM, toggled via `class:hidden`.  This avoids the Leptos
+/// `FnOnce`-in-`Fn` trap: event-handler closures are moved directly into
+/// `on:click` / `on:input` (once), not inside a `move ||` reactive closure
+/// that runs many times.
 #[component]
 pub fn Message(msg: UiMessage) -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState missing");
@@ -40,6 +52,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             ..
         } => {
             let editing = RwSignal::new(false);
+            let confirm_delete = RwSignal::new(false);
             let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
             let edit_sig = edit;
             let state_edit = state.clone();
@@ -47,22 +60,20 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             // Clone for start_edit before `content` is moved into the view.
             let content_for_edit = content.clone();
 
-            let start_edit = {
-                move |evt: ev::MouseEvent| {
-                    evt.stop_propagation();
-                    if running.get() {
-                        return;
-                    }
-                    let text = {
-                        let e = edit_sig.get();
-                        match e {
-                            Some(e) if !e.show_original.get() => e.replacement.clone(),
-                            _ => content_for_edit.clone(),
-                        }
-                    };
-                    editing.set(true);
-                    focus_and_fill_textarea(&textarea_ref, &text);
+            let start_edit = move |evt: ev::MouseEvent| {
+                evt.stop_propagation();
+                if running.get() {
+                    return;
                 }
+                let text = {
+                    let e = edit_sig.get();
+                    match e {
+                        Some(e) if !e.show_original.get() => e.replacement.clone(),
+                        _ => content_for_edit.clone(),
+                    }
+                };
+                editing.set(true);
+                focus_and_fill_textarea(&textarea_ref, &text);
             };
 
             let save_edit = move |evt: ev::MouseEvent| {
@@ -87,10 +98,23 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                 }
             };
 
-            let do_delete = move |evt: ev::MouseEvent| {
+            let request_delete = move |evt: ev::MouseEvent| {
                 evt.stop_propagation();
+                confirm_delete.set(true);
+            };
+
+            let confirm_delete_action = move |evt: ev::MouseEvent| {
+                evt.stop_propagation();
+                confirm_delete.set(false);
                 state_del.delete_message(seq);
             };
+
+            let cancel_delete = move |evt: ev::MouseEvent| {
+                evt.stop_propagation();
+                confirm_delete.set(false);
+            };
+
+            let actions_hidden = move || editing.get() || deleted.get() || running.get();
 
             view! {
                 <div
@@ -98,6 +122,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                     class:deleted=deleted
                     class:edited=move || edit_sig.get().is_some()
                     class:editing=editing
+                    class:confirming=confirm_delete
                 >
                     <div class="msg-display" class:hidden=editing>
                         {move || {
@@ -121,10 +146,14 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                             <button class="msg-edit-btn cancel" on:click=cancel_edit>"Cancel"</button>
                         </div>
                     </div>
-                    <div class="msg-actions" class:hidden=move || editing.get() || deleted.get() || running.get()>
-                        <button class="msg-action edit" title="Edit" on:click=start_edit>"✎"</button>
-                        <button class="msg-action delete" title="Delete" on:click=do_delete>"✕"</button>
-                    </div>
+                    {message_actions(
+                        actions_hidden,
+                        confirm_delete,
+                        start_edit,
+                        request_delete,
+                        confirm_delete_action,
+                        cancel_delete,
+                    )}
                 </div>
             }
                 .into_any()
@@ -143,6 +172,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             ..
         } => {
             let editing = RwSignal::new(false);
+            let confirm_delete = RwSignal::new(false);
             let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
             let edit_sig = edit;
             let state_edit = state.clone();
@@ -159,22 +189,20 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
 
             let html = move || render_markdown(&display_raw());
 
-            let start_edit = {
-                move |evt: ev::MouseEvent| {
-                    evt.stop_propagation();
-                    if running.get() {
-                        return;
-                    }
-                    let text = {
-                        let e = edit_sig.get();
-                        match e {
-                            Some(e) if !e.show_original.get() => e.replacement.clone(),
-                            _ => raw_for_edit.clone(),
-                        }
-                    };
-                    editing.set(true);
-                    focus_and_fill_textarea(&textarea_ref, &text);
+            let start_edit = move |evt: ev::MouseEvent| {
+                evt.stop_propagation();
+                if running.get() {
+                    return;
                 }
+                let text = {
+                    let e = edit_sig.get();
+                    match e {
+                        Some(e) if !e.show_original.get() => e.replacement.clone(),
+                        _ => raw_for_edit.clone(),
+                    }
+                };
+                editing.set(true);
+                focus_and_fill_textarea(&textarea_ref, &text);
             };
 
             let save_edit = move |evt: ev::MouseEvent| {
@@ -199,10 +227,23 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                 }
             };
 
-            let do_delete = move |evt: ev::MouseEvent| {
+            let request_delete = move |evt: ev::MouseEvent| {
                 evt.stop_propagation();
+                confirm_delete.set(true);
+            };
+
+            let confirm_delete_action = move |evt: ev::MouseEvent| {
+                evt.stop_propagation();
+                confirm_delete.set(false);
                 state_del.delete_message(seq);
             };
+
+            let cancel_delete = move |evt: ev::MouseEvent| {
+                evt.stop_propagation();
+                confirm_delete.set(false);
+            };
+
+            let actions_hidden = move || editing.get() || deleted.get() || running.get();
 
             view! {
                 <div
@@ -210,6 +251,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                     class:deleted=deleted
                     class:edited=move || edit_sig.get().is_some()
                     class:editing=editing
+                    class:confirming=confirm_delete
                 >
                     <div class="msg-display" class:hidden=editing>
                         <div class="rendered-inner" inner_html=html></div>
@@ -227,10 +269,14 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                             <button class="msg-edit-btn cancel" on:click=cancel_edit>"Cancel"</button>
                         </div>
                     </div>
-                    <div class="msg-actions" class:hidden=move || editing.get() || deleted.get() || running.get()>
-                        <button class="msg-action edit" title="Edit" on:click=start_edit>"✎"</button>
-                        <button class="msg-action delete" title="Delete" on:click=do_delete>"✕"</button>
-                    </div>
+                    {message_actions(
+                        actions_hidden,
+                        confirm_delete,
+                        start_edit,
+                        request_delete,
+                        confirm_delete_action,
+                        cancel_delete,
+                    )}
                 </div>
             }
                 .into_any()
@@ -248,6 +294,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             ..
         } => {
             let toggle = move |_| expanded.update(|v| *v = !*v);
+            let confirm_delete = RwSignal::new(false);
             let name_for_view = name.clone();
             let args_for_view = args.clone();
             let call_edit = edit;
@@ -255,13 +302,31 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             let result_edit_sig = result_edit;
             let state_del = state.clone();
 
-            let do_delete = move |evt: ev::MouseEvent| {
+            let request_delete = move |evt: ev::MouseEvent| {
                 evt.stop_propagation();
+                confirm_delete.set(true);
+            };
+
+            let confirm_delete_action = move |evt: ev::MouseEvent| {
+                evt.stop_propagation();
+                confirm_delete.set(false);
                 state_del.delete_message(seq);
             };
 
+            let cancel_delete = move |evt: ev::MouseEvent| {
+                evt.stop_propagation();
+                confirm_delete.set(false);
+            };
+
+            let actions_hidden = move || deleted.get() || running.get();
+
             view! {
-                <div class="msg tool tool-call" class:open=expanded class:deleted=deleted>
+                <div
+                    class="msg tool tool-call"
+                    class:open=expanded
+                    class:deleted=deleted
+                    class:confirming=confirm_delete
+                >
                     <div class="tool-header" on:click=toggle>
                         <span class="arrow">"▸"</span>
                         {move || {
@@ -293,9 +358,13 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                         }}
                         {edit_badge(result_edit_sig)}
                     </div>
-                    <div class="msg-actions" class:hidden=move || deleted.get() || running.get()>
-                        <button class="msg-action delete" title="Delete" on:click=do_delete>"✕"</button>
-                    </div>
+                    {delete_only_actions(
+                        actions_hidden,
+                        confirm_delete,
+                        request_delete,
+                        confirm_delete_action,
+                        cancel_delete,
+                    )}
                 </div>
             }
                 .into_any()
@@ -379,6 +448,66 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                 .into_any()
         }
     }
+}
+
+/// The action row for messages that support both edit and delete
+/// (`UserPrompt`, `AssistantFinal`).  Two states are always in the DOM,
+/// toggled by `class:hidden`:
+///
+/// - **Normal:** ✎ edit + ✕ delete-request
+/// - **Confirm:** "Delete?" + ✓ confirm + ✕ cancel
+///
+/// The row is `opacity: 0` by default (CSS `.msg-actions`) and revealed by
+/// `:hover` on the parent `.msg` (which on touch devices is triggered by a
+/// tap).  The `.confirming` class on the parent forces opacity 1 so the
+/// confirm prompt is always visible.
+#[allow(clippy::too_many_arguments)]
+fn message_actions(
+    hidden: impl Fn() -> bool + Send + Sync + 'static,
+    confirm_delete: RwSignal<bool>,
+    start_edit: impl Fn(ev::MouseEvent) + Send + Sync + 'static,
+    request_delete: impl Fn(ev::MouseEvent) + Send + Sync + 'static,
+    confirm_delete_action: impl Fn(ev::MouseEvent) + Send + Sync + 'static,
+    cancel_delete: impl Fn(ev::MouseEvent) + Send + Sync + 'static,
+) -> AnyView {
+    view! {
+        <div class="msg-actions" class:hidden=hidden>
+            <div class="actions-row" class:hidden=confirm_delete>
+                <button class="msg-action edit" title="Edit" on:click=start_edit>"✎"</button>
+                <button class="msg-action delete" title="Delete" on:click=request_delete>"✕"</button>
+            </div>
+            <div class="actions-row confirm" class:hidden=move || !confirm_delete.get()>
+                <span class="confirm-text">"Delete?"</span>
+                <button class="msg-action confirm" title="Confirm delete" on:click=confirm_delete_action>"✓"</button>
+                <button class="msg-action cancel" title="Cancel" on:click=cancel_delete>"✕"</button>
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
+/// The action row for messages that support delete only (`ToolCall`).  Same
+/// two-state confirm pattern as [`message_actions`], minus the edit button.
+fn delete_only_actions(
+    hidden: impl Fn() -> bool + Send + Sync + 'static,
+    confirm_delete: RwSignal<bool>,
+    request_delete: impl Fn(ev::MouseEvent) + Send + Sync + 'static,
+    confirm_delete_action: impl Fn(ev::MouseEvent) + Send + Sync + 'static,
+    cancel_delete: impl Fn(ev::MouseEvent) + Send + Sync + 'static,
+) -> AnyView {
+    view! {
+        <div class="msg-actions" class:hidden=hidden>
+            <div class="actions-row" class:hidden=confirm_delete>
+                <button class="msg-action delete" title="Delete" on:click=request_delete>"✕"</button>
+            </div>
+            <div class="actions-row confirm" class:hidden=move || !confirm_delete.get()>
+                <span class="confirm-text">"Delete?"</span>
+                <button class="msg-action confirm" title="Confirm delete" on:click=confirm_delete_action>"✓"</button>
+                <button class="msg-action cancel" title="Cancel" on:click=cancel_delete>"✕"</button>
+            </div>
+        </div>
+    }
+    .into_any()
 }
 
 /// Render the structured name + args block of a `ToolCall` (the "original"
