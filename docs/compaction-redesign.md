@@ -2,7 +2,7 @@
 
 ## Status
 
-- **Goop working tree:** clean, on `master` (`914ddbf`)
+- **Goop working tree:** on `master` (`12a9111`)
 - **Goose reference:** clean, on `main` (`5dcd3ff34`)
 - **Backwards compat:** breaking changes OK (pre-alpha, unreleased)
 
@@ -20,8 +20,8 @@
 | 8 — Edit/delete overlays | ✅ done | `ClientMessage::Edit`/`Delete` + `Session::edit`/`delete` (deletes auto-emit both halves of a tool pair). Replay applies `Edited`/`Deleted` overlays (previously ignored): tool targets resolve to tool-call id via the log → content-granularity surgery; text targets replace the whole `VisibleItem` (assistant tool calls preserved when editing narration). Web UI: hover-revealed ✎/✕ action buttons on `UserPrompt`/`AssistantFinal`/`ToolCall`; inline `<textarea>` edit mode with Save/Cancel. 8 replay tests added. |
 | 9 — Forking | ✅ done | |
 | 10 — Manual range compaction | ⬜ future | |
-| 11 — Terminal | ⬜ planned | |
-| 12 — Tests & migration | ⬜ planned | |
+| 11 — Terminal | ✅ done | `Compacted`/`ToolSummarized` inline notices; `TurnEnded` reasons (incl. cancel-repopulate); fork `Reset` notice; `Edited`/`Deleted` inline notices. History replay handles new event types via `ServerMessage::Entry`. See "As built" below. |
+| 12 — Tests & migration | ✅ mostly | 35 tests in `src/memory/` (replay projection + `TransactionLog` migration/serde/fork). Remaining: mock-LLM summarizer tests, end-to-end compaction integration test. See "As built" below. |
 
 ---
 
@@ -917,9 +917,11 @@ compaction boundaries.  The `<For>` component renders groups; CSS provides the
 faint outline and toggle arrow.
 
 **Terminal:** the terminal is a linear REPL and cannot easily show a tree.
-Compaction events are rendered as inline notices ("Context compacted — N
-messages summarized").  Tool summaries are shown inline.  Edits/deletes are
-shown as inline notices.  This matches goose's terminal behavior.
+Compaction events are rendered as inline notices (`✦ compacted N messages
+into a summary · <model>`).  Tool summaries are shown inline
+(`◇ summarized tool call <id> · <model>`).  Edits/deletes are shown as inline
+notices (`✎ edited …` / `✕ deleted …`).  This matches goose's terminal
+behavior.
 
 ### 2.14 What gets removed / replaced
 
@@ -1484,20 +1486,93 @@ happened:
   summarization, append `Compacted { manual: true, .. }`.
 - UI: range selection (shift-click / drag-select).
 
-### Phase 11: Terminal  ⬜ planned
+### Phase 11: Terminal  ✅ done
 - Render `Compacted`/`ToolSummarized` events as inline notices.
 - Render edits/deletes as inline notices.
 - Update history replay to handle new event types.
 
-### Phase 12: Tests & migration  ⬜ planned
-- Unit tests for log replay → agent-visible messages (all overlay types).
-- Unit tests for compaction (mock LLM, like goose's `MockProvider`).
-- Unit tests for overlapping/nested compaction (`covers` includes prior
+> **As built:** the terminal's single render loop (`terminal.rs`) handles
+> every new event type.  `Compacted` prints a dim
+> `✦ compacted N messages into a summary · <model>` notice; `ToolSummarized`
+> prints `◇ summarized tool call <id> · <model>`.  `TurnEnded` drives the
+> streamdown flush/reset and, on `Cancelled { prompt: Some(_) }`, repopulates
+> the readline input for editing (the cancel-with-no-work recovery path) —
+> other reasons print an `error:` line or nothing (`Completed`/`StreamEnded`).
+> Forks print a `↻ forked — regenerating from here` notice on
+> `ServerMessage::Reset` and skip the post-fork history re-replay (the linear
+> terminal can't un-print the old branch).  `Edited`/`Deleted` print dim
+> `✎ edited <kind> #<seq>` / `✕ deleted message #<seq>` notices — these
+> overlays are initiated from the web UI, so the terminal only signals that
+> something changed (it can't un-render the old content).  `ContextSnapshot`/
+> `ModelChanged` remain no-ops (audit-only metadata, not user-actionable in a
+> linear REPL).
+>
+> History replay needs no special handling: the server streams
+> `ServerMessage::Entry(LogEntry)` envelopes (Phase 9), so every event type
+> — including the new ones — flows through the same render path as live
+> events.  There is no separate "replay renderer"; catch-up and live are
+> identical, separated only by the `HistoryComplete` sentinel (which the
+> terminal ignores, since it doesn't batch-render).
+
+### Phase 12: Tests & migration  ✅ mostly
+
+- ✅ Unit tests for log replay → agent-visible messages (all overlay types).
+- ⬜ Unit tests for compaction (mock LLM, like goose's `MockProvider`).
+- ✅ Unit tests for overlapping/nested compaction (`covers` includes prior
   summaries).
-- Unit tests for edit/delete (last-wins, orphan safety net).
-- Unit tests for turn-end reasons: every `TurnEndReason` variant produces
+- ✅ Unit tests for edit/delete (last-wins, orphan safety net).
+- ✅ Unit tests for turn-end reasons: every `TurnEndReason` variant produces
   correct agent-visibility (cancel-with-prompt drops the turn; cancel-without-
   prompt keeps it; MaxTurns/Error keep committed work; StreamEnded keeps all).
-- Integration test: compaction preserves conversation continuity.
-- Since backwards compat is broken, old `.messages.jsonl` files are ignored
+- ⬜ Integration test: compaction preserves conversation continuity.
+- ✅ Since backwards compat is broken, old `.messages.jsonl` files are ignored
   (the events log is the source of truth; sessions resume from events).
+
+> **As built:** the **pure replay projection** (`replay.rs`) is thoroughly
+> tested — 25 tests covering:
+>
+> - **Turns:** completed turn; trailing open turn dropped; cancel-with-no-work
+>   drops the turn; cancel-with-work keeps committed tool turns and drops the
+>   in-flight call (orphan net); multi-step tool-turn pairing.
+> - **Compaction:** `Compacted` replaces its covered items; **nested/
+>   overlapping** compaction where the second `covers` includes the first
+>   summary's seq removes it (no lingering duplicate — the §2.5 invariant).
+> - **Tool summaries:** `ToolSummarized` replaces its pair; preserves sibling
+>   calls in a merged message; is a no-op after the pair was already
+>   `Compacted`; is a no-op for a missing id.
+> - **Overlays:** delete removes a user prompt; delete removes a tool pair
+>   (both halves); delete one of merged parallel calls (orphan net drops the
+>   result); edit a user prompt; edit assistant text while keeping its tool
+>   calls; edit a tool result; delete a missing target is a no-op;
+>   edit-then-delete (delete wins).
+> - **Metadata:** `ContextSnapshot`/`Thinking` never leak into the agent view.
+> - **Forking:** `collect_branch` linear returns all; fork excludes the
+>   sibling branch; replay shows only the new branch; replaying the old tip
+>   shows only the old branch; a fork preserves the shared prefix.
+>
+> The **`TransactionLog`** (`transaction_log.rs`) has 10 tests: `open()`
+> injects a `SessionInfo` root for new sessions and leaves existing ones
+> alone; `append()` assigns monotonic seqs and chains parents; `set_active_tip`
+> + `append` forks (end-to-end flow verifies the active branch excludes the
+> old turn); legacy bare-event migration; envelope-seq preservation across
+> reload; mixed legacy+envelope files; migration of removed variants
+> (`FinalResponse`/`Error`/`Cancelled` → `TurnEnded`) and un-id'd tool calls
+> (order-paired synthetic ids); `LogEntry` serde round-trip.
+>
+> **Still pending:**
+>
+> - **Mock-LLM summarizer tests.** The *summarizer* logic itself —
+>   `maybe_compact` / `maybe_summarize_tool_pairs` in `session.rs` — has no
+>   unit tests.  `session.rs` has no test module at all.  Testing it requires
+>   a mock `AnyAgent` whose `summarize()` returns canned text, so the
+>   snapshot → summarize → revalidate → commit lifecycle (and the
+>   "protect the most-recent turn" / "skip vanished pairs" guards from
+>   Phase 5) can be exercised without a real provider.  No such mock exists
+>   yet — `AnyAgent` wraps rig's concrete provider types, and rig has no
+>   built-in test provider.
+> - **End-to-end compaction integration test.** The replay tests cover the
+>   projection in isolation (given a log with a `Compacted` event, replay
+>   produces the right messages).  Nothing yet asserts the *full* path —
+>   a session that actually exceeds its budget, calls the LLM, appends a
+>   `Compacted`, and continues with the LLM seeing the summary on the next
+>   turn.  This depends on the same mock-LLM prerequisite.
