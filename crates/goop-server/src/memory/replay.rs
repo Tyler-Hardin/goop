@@ -12,7 +12,7 @@ use rig::message::{
     ToolResultContent, UserContent,
 };
 
-use crate::events::{LogEntry, SessionEvent, TurnEndReason};
+use crate::events::{EditContent, LogEntry, SessionEvent, TurnEndReason};
 
 /// One item in the agent-visible set, tagged with the `seq` of the event
 /// that produced it.  The seq is used by later phases for overlay
@@ -89,6 +89,31 @@ pub(crate) fn replay_visible(log: &[LogEntry]) -> Vec<VisibleItem> {
             // See §5.1–5.2 of the redesign doc.
             SessionEvent::ToolSummarized { id, summary, .. } => {
                 apply_tool_summary(&mut visible, id, summary.clone(), entry.seq);
+            }
+
+            // ── overlay events: edit/delete prior agent-visible content ──
+            // These modify the *committed* visible set (not the buffered
+            // turn), so they're top-level arms rather than going through
+            // `Replay::feed`.  Overlays arrive after their target's turn has
+            // been committed, so the target is always in `visible` by the
+            // time the overlay is processed.  See §2.10 of the redesign doc.
+            //
+            // Tool calls/results are targeted by seq, but replay merges
+            // consecutive calls/results into single messages (losing
+            // individual seqs).  So for tool targets we look up the event's
+            // `id` in the log and do content-granularity surgery by id — the
+            // same technique `apply_tool_summary` uses.  Text-bearing targets
+            // (UserPrompt, AssistantText, Compacted, ToolSummarized) keep
+            // their seq as the VisibleItem's seq, so a whole-item replace
+            // suffices.
+            SessionEvent::Edited {
+                target,
+                replacement,
+            } => {
+                apply_edit(&mut visible, log, *target, replacement);
+            }
+            SessionEvent::Deleted { target } => {
+                apply_delete(&mut visible, log, *target);
             }
 
             _ => replay.feed(entry),
@@ -415,6 +440,213 @@ fn apply_tool_summary(visible: &mut Vec<VisibleItem>, id: &str, summary: String,
     }
 
     *visible = rebuilt;
+}
+
+// ── edit/delete overlay application ──────────────────────────────────
+//
+// `Edited`/`Deleted` modify the committed agent-visible set.  Tool calls and
+// results are targeted by seq, but replay merges consecutive calls/results
+// into single messages — so individual seqs are lost inside a merged message.
+// We resolve this by looking up the target event's tool-call `id` in the log
+// and operating at content granularity (by id), reusing the rebuild pattern
+// from `apply_tool_summary`/`drop_orphaned_tool_pairs`.  Text-bearing targets
+// keep their seq as the VisibleItem's seq, so a whole-item replace works.
+
+/// Find the event payload at `target` seq in the log.
+fn log_event_at(log: &[LogEntry], target: u64) -> Option<&SessionEvent> {
+    log.iter().find(|e| e.seq == target).map(|e| &e.event)
+}
+
+/// Apply a `Deleted` overlay: hide `target` from the agent-visible set.
+///
+/// For a `ToolCall`/`ToolResult` target, the matching content is spliced out
+/// of its (possibly merged) message by id; a message left empty is dropped.
+/// The server emits a `Deleted` for *both* halves of a tool pair, so each
+/// half is removed independently — the [`drop_orphaned_tool_pairs`] safety net
+/// catches any edge case.  For any other target (UserPrompt, AssistantText,
+/// Compacted, ToolSummarized) the whole `VisibleItem` whose seq matches is
+/// removed.
+fn apply_delete(visible: &mut Vec<VisibleItem>, log: &[LogEntry], target: u64) {
+    let Some(event) = log_event_at(log, target) else {
+        return; // target not in the log — no-op (defence in depth).
+    };
+    match event {
+        SessionEvent::ToolCall { id, .. } => remove_tool_call_by_id(visible, id),
+        SessionEvent::ToolResult { id, .. } => remove_tool_result_by_id(visible, id),
+        _ => visible.retain(|i| i.seq != target),
+    }
+}
+
+/// Apply an `Edited` overlay: replace `target`'s content with `replacement`.
+///
+/// Tool-call/result edits splice the replacement into the (possibly merged)
+/// message by id, preserving the id and any sibling content.  Text edits
+/// replace the whole `VisibleItem` whose seq matches (UserPrompt/Compacted/
+/// ToolSummarized → new user text; AssistantText → assistant text replaced,
+/// tool calls kept).  A mismatched replacement type for the target is a
+/// no-op (defence in depth; the server targets the right type).
+fn apply_edit(
+    visible: &mut [VisibleItem],
+    log: &[LogEntry],
+    target: u64,
+    replacement: &EditContent,
+) {
+    // Tool targets need the id from the log (the replacement for a ToolCall
+    // carries new name/args but not the id — the id is the call's identity
+    // and stays the same).
+    if let Some(event) = log_event_at(log, target) {
+        match (event, replacement) {
+            (SessionEvent::ToolCall { id, .. }, EditContent::ToolCall { name, arguments }) => {
+                replace_tool_call_by_id(visible, id, name, arguments);
+                return;
+            }
+            (SessionEvent::ToolResult { id, .. }, EditContent::ToolResult { content }) => {
+                replace_tool_result_by_id(visible, id, content);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Text replacement — operates on the whole VisibleItem whose seq matches.
+    let EditContent::Text(text) = replacement else {
+        return;
+    };
+    let Some(item) = visible.iter_mut().find(|i| i.seq == target) else {
+        return; // target not currently visible (already deleted/compacted).
+    };
+    let text = text.clone();
+    // Take ownership of the old message so we can move its content out,
+    // then assign the rebuilt message back.
+    let old = std::mem::replace(&mut item.msg, Message::user(String::new()));
+    item.msg = match old {
+        // UserPrompt / Compacted / ToolSummarized are plain user text.
+        Message::User { .. } => Message::user(text),
+        Message::Assistant { content, id } => {
+            // Keep tool calls; replace all text with the single new chunk.
+            // (An assistant message merges text + calls; editing the text
+            // updates the narration while leaving the calls intact.)
+            let mut items: Vec<AssistantContent> = content
+                .into_iter()
+                .filter(|c| matches!(c, AssistantContent::ToolCall(_)))
+                .collect();
+            if !text.is_empty() {
+                items.insert(0, AssistantContent::Text(MessageText::new(text)));
+            }
+            match OneOrMany::many(items) {
+                Ok(oom) => Message::Assistant { id, content: oom },
+                // All content was text (now empty) — preserve the assistant
+                // role with an empty text chunk.
+                Err(_) => Message::Assistant {
+                    id,
+                    content: OneOrMany::one(AssistantContent::Text(
+                        MessageText::new(String::new()),
+                    )),
+                },
+            }
+        }
+        other => other, // ToolResult-only user messages etc. — leave as-is.
+    };
+}
+
+/// Remove the `ToolCall` with `id` from any assistant message.  A message
+/// left with no content is dropped.  Operates at content granularity so
+/// sibling calls/text in a merged message survive.
+fn remove_tool_call_by_id(visible: &mut Vec<VisibleItem>, id: &str) {
+    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len());
+    for item in visible.drain(..) {
+        match item.msg {
+            Message::Assistant {
+                id: msg_id,
+                content,
+            } => {
+                let items: Vec<AssistantContent> = content
+                    .into_iter()
+                    .filter(|c| !matches!(c, AssistantContent::ToolCall(tc) if tc.id == id))
+                    .collect();
+                if let Ok(oom) = OneOrMany::many(items) {
+                    rebuilt.push(VisibleItem {
+                        seq: item.seq,
+                        msg: Message::Assistant {
+                            id: msg_id,
+                            content: oom,
+                        },
+                    });
+                }
+                // else: every content item was the target call → dropped.
+            }
+            other => rebuilt.push(VisibleItem {
+                seq: item.seq,
+                msg: other,
+            }),
+        }
+    }
+    *visible = rebuilt;
+}
+
+/// Remove the `ToolResult` with `id` from any user message.  A message left
+/// with no content is dropped.  See [`remove_tool_call_by_id`].
+fn remove_tool_result_by_id(visible: &mut Vec<VisibleItem>, id: &str) {
+    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len());
+    for item in visible.drain(..) {
+        match item.msg {
+            Message::User { content } => {
+                let items: Vec<UserContent> = content
+                    .into_iter()
+                    .filter(|c| !matches!(c, UserContent::ToolResult(tr) if tr.id == id))
+                    .collect();
+                if let Ok(oom) = OneOrMany::many(items) {
+                    rebuilt.push(VisibleItem {
+                        seq: item.seq,
+                        msg: Message::User { content: oom },
+                    });
+                }
+            }
+            other => rebuilt.push(VisibleItem {
+                seq: item.seq,
+                msg: other,
+            }),
+        }
+    }
+    *visible = rebuilt;
+}
+
+/// Replace the `ToolCall` with `id` (keeping the id) with new name/arguments.
+fn replace_tool_call_by_id(
+    visible: &mut [VisibleItem],
+    id: &str,
+    name: &str,
+    arguments: &serde_json::Value,
+) {
+    for item in visible.iter_mut() {
+        if let Message::Assistant { content, .. } = &mut item.msg {
+            for c in content.iter_mut() {
+                if let AssistantContent::ToolCall(tc) = c
+                    && tc.id == id
+                {
+                    tc.function = ToolFunction::new(name.to_string(), arguments.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Replace the content of the `ToolResult` with `id`.
+fn replace_tool_result_by_id(visible: &mut [VisibleItem], id: &str, content: &str) {
+    let new_content = OneOrMany::one(ToolResultContent::Text(MessageText::new(
+        content.to_string(),
+    )));
+    for item in visible.iter_mut() {
+        if let Message::User { content } = &mut item.msg {
+            for c in content.iter_mut() {
+                if let UserContent::ToolResult(tr) = c
+                    && tr.id == id
+                {
+                    tr.content = new_content.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Extract a single tool call and its matching result from the visible items
@@ -1066,5 +1298,413 @@ mod tests {
         assert_eq!(items[0].seq, 0);
         assert_eq!(items[1].seq, 1);
         assert_eq!(items[2].seq, 2);
+    }
+
+    // ── Edited / Deleted overlay tests ─────────────────────────────
+
+    /// Extract the concatenated text of a `Message::User` (ignoring tool
+    /// results), for assertions.
+    fn user_text(m: &Message) -> Option<String> {
+        match m {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Extract the content of the first `ToolResult` in a `Message::User`.
+    fn tool_result_text(m: &Message, id: &str) -> Option<String> {
+        let Message::User { content } = m else {
+            return None;
+        };
+        for c in content.iter() {
+            if let UserContent::ToolResult(tr) = c
+                && tr.id == id
+            {
+                return Some(
+                    tr.content
+                        .iter()
+                        .filter_map(|c| match c {
+                            ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                );
+            }
+        }
+        None
+    }
+
+    /// A `Deleted` overlay removes a user prompt from the agent-visible set.
+    #[test]
+    fn replay_deleted_removes_user_prompt() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "first".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::UserPrompt {
+                    content: "second".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                3,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // delete the first prompt
+            entry(4, SessionEvent::Deleted { target: 0 }),
+        ];
+        let items = replay_visible(&log);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].seq, 2);
+        assert_eq!(user_text(&items[0].msg).as_deref(), Some("second"));
+    }
+
+    /// Deleting a tool call removes both halves of the pair (the server emits
+    /// a `Deleted` for the call seq and the result seq).
+    #[test]
+    fn replay_deleted_removes_tool_pair() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "q".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "data".into(),
+                },
+            ),
+            entry(3, SessionEvent::AssistantText("done".into())),
+            entry(
+                4,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // server emits both halves
+            entry(5, SessionEvent::Deleted { target: 1 }), // call
+            entry(6, SessionEvent::Deleted { target: 2 }), // result
+        ];
+        let items = replay_visible(&log);
+        // prompt (0) + assistant text (3); the call+result pair is gone.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].seq, 0);
+        assert_eq!(assistant_text(&items[1].msg).as_deref(), Some("done"));
+    }
+
+    /// Deleting one call in a merged (parallel) assistant message removes only
+    /// that call — siblings survive.  Only one `Deleted` is emitted; the
+    /// orphan safety net drops the now-unpaired result.
+    #[test]
+    fn replay_deleted_one_of_merged_calls() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "multi".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolCall {
+                    id: "b".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                3,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "ra".into(),
+                },
+            ),
+            entry(
+                4,
+                SessionEvent::ToolResult {
+                    id: "b".into(),
+                    content: "rb".into(),
+                },
+            ),
+            entry(
+                5,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // delete only call "a"; its result is dropped by the orphan net
+            entry(6, SessionEvent::Deleted { target: 1 }),
+        ];
+        let items = replay_visible(&log);
+        // prompt (0) + assistant[call b] (1) + user[result b] (3)
+        assert_eq!(items.len(), 3);
+        // The surviving assistant message has only call "b".
+        let calls = match &items[1].msg {
+            Message::Assistant { content, .. } => content
+                .iter()
+                .filter(|c| matches!(c, AssistantContent::ToolCall(_)))
+                .count(),
+            _ => panic!("expected assistant"),
+        };
+        assert_eq!(calls, 1);
+        // The surviving user message has only result "b".
+        let results = match &items[2].msg {
+            Message::User { content } => content
+                .iter()
+                .filter(|c| matches!(c, UserContent::ToolResult(_)))
+                .count(),
+            _ => panic!("expected user"),
+        };
+        assert_eq!(results, 1);
+    }
+
+    /// An `Edited` overlay replaces a user prompt's text in the agent view.
+    #[test]
+    fn replay_edited_user_prompt() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "original".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::Edited {
+                    target: 0,
+                    replacement: crate::events::EditContent::Text("rewritten".into()),
+                },
+            ),
+        ];
+        let items = replay_visible(&log);
+        assert_eq!(items.len(), 1);
+        assert_eq!(user_text(&items[0].msg).as_deref(), Some("rewritten"));
+    }
+
+    /// An `Edited` overlay replaces assistant text while keeping any tool
+    /// calls in the same merged message.
+    #[test]
+    fn replay_edited_assistant_text_keeps_calls() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "q".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(1, SessionEvent::AssistantText("narration".into())),
+            entry(
+                2,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                3,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "data".into(),
+                },
+            ),
+            entry(
+                4,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            // edit the assistant text (seq 1, first chunk of the merged msg)
+            entry(
+                5,
+                SessionEvent::Edited {
+                    target: 1,
+                    replacement: crate::events::EditContent::Text("new narration".into()),
+                },
+            ),
+        ];
+        let items = replay_visible(&log);
+        // prompt (0) + assistant[text + call a] (1) + user[result a] (3)
+        assert_eq!(items.len(), 3);
+        let (text, calls) = match &items[1].msg {
+            Message::Assistant { content, .. } => {
+                let t: String = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                let c = content
+                    .iter()
+                    .filter(|c| matches!(c, AssistantContent::ToolCall(_)))
+                    .count();
+                (t, c)
+            }
+            _ => panic!("expected assistant"),
+        };
+        assert_eq!(text, "new narration");
+        assert_eq!(calls, 1); // call "a" survived
+    }
+
+    /// An `Edited` overlay replaces a tool result's content (targeted by the
+    /// result's seq, resolved to the tool-call id for content surgery).
+    #[test]
+    fn replay_edited_tool_result() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "q".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::ToolCall {
+                    id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::ToolResult {
+                    id: "a".into(),
+                    content: "original data".into(),
+                },
+            ),
+            entry(
+                3,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            entry(
+                4,
+                SessionEvent::Edited {
+                    target: 2,
+                    replacement: crate::events::EditContent::ToolResult {
+                        content: "sanitized".into(),
+                    },
+                },
+            ),
+        ];
+        let items = replay_visible(&log);
+        // prompt (0) + assistant[call a] (1) + user[result a] (2)
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            tool_result_text(&items[2].msg, "a").as_deref(),
+            Some("sanitized")
+        );
+    }
+
+    /// A `Deleted` for a seq not in the log is a no-op (defence in depth).
+    #[test]
+    fn replay_deleted_missing_target_is_noop() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "q".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            entry(2, SessionEvent::Deleted { target: 999 }),
+        ];
+        let items = replay_visible(&log);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].seq, 0);
+    }
+
+    /// Editing then deleting the same target: delete wins (the edited item is
+    /// removed entirely).
+    #[test]
+    fn replay_edit_then_delete() {
+        let log = vec![
+            entry(
+                0,
+                SessionEvent::UserPrompt {
+                    content: "orig".into(),
+                    source: crate::events::PromptSource::Terminal,
+                },
+            ),
+            entry(
+                1,
+                SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+            entry(
+                2,
+                SessionEvent::Edited {
+                    target: 0,
+                    replacement: crate::events::EditContent::Text("edited".into()),
+                },
+            ),
+            entry(3, SessionEvent::Deleted { target: 0 }),
+        ];
+        let items = replay_visible(&log);
+        assert!(items.is_empty());
     }
 }

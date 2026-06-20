@@ -433,6 +433,15 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
                             ClientMessage::Cancel => {
                                 session.cancel().await;
                             }
+                            ClientMessage::Edit {
+                                target,
+                                replacement,
+                            } => {
+                                session.edit(target, replacement).await;
+                            }
+                            ClientMessage::Delete { target } => {
+                                session.delete(target).await;
+                            }
                         }
                     }
                 }

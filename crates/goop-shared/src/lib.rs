@@ -218,4 +218,18 @@ pub enum ClientMessage {
     /// Cancel the current prompt.
     #[serde(rename = "cancel")]
     Cancel,
+    /// Replace the content of a prior event (`target` seq) in the agent's
+    /// view.  The original stays in the log; replay uses the replacement.
+    /// See [`SessionEvent::Edited`] and [`EditContent`].
+    #[serde(rename = "edit")]
+    Edit {
+        target: u64,
+        replacement: EditContent,
+    },
+    /// Hide a prior event (`target` seq) from the agent's view.  If the
+    /// target is one half of a tool call+result pair, the server also
+    /// deletes the matching half so the agent never sees an orphaned call
+    /// or result.  See [`SessionEvent::Deleted`].
+    #[serde(rename = "delete")]
+    Delete { target: u64 },
 }

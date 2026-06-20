@@ -421,6 +421,38 @@ impl AppState {
         }
     }
 
+    /// Hide a prior event (`target` seq) from the agent's view.  The server
+    /// appends a `Deleted` overlay (and, for a tool call/result, one for the
+    /// matching half) which comes back as a live event and is applied by the
+    /// existing `apply_delete` path.
+    #[allow(dead_code)] // wired to UI affordances in the next change
+    pub fn delete_message(&self, target: u64) {
+        if let Some(ws) = self.ws.get_untracked()
+            && ws.ready_state() == web_sys::WebSocket::OPEN
+        {
+            let msg = serde_json::to_string(&ClientMessage::Delete { target }).unwrap_or_default();
+            ws.send_with_str(&msg).ok();
+        }
+    }
+
+    /// Replace a prior event's (`target` seq) content in the agent's view.
+    /// The server appends an `Edited` overlay which comes back as a live
+    /// event and is applied by the existing `apply_edit` path (setting an
+    /// `EditOverlay` so the UI shows the replacement with a ✎ toggle).
+    #[allow(dead_code)] // wired to UI affordances in the next change
+    pub fn edit_message(&self, target: u64, replacement: EditContent) {
+        if let Some(ws) = self.ws.get_untracked()
+            && ws.ready_state() == web_sys::WebSocket::OPEN
+        {
+            let msg = serde_json::to_string(&ClientMessage::Edit {
+                target,
+                replacement,
+            })
+            .unwrap_or_default();
+            ws.send_with_str(&msg).ok();
+        }
+    }
+
     /// Send raw WAV audio to the server for speech-to-text transcription.
     pub fn send_audio(&self, data: Vec<u8>) {
         if let Some(ws) = self.ws.get_untracked()

@@ -13,7 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::config::{self, Config, McpServerDef};
-use crate::events::{LogEntry, PromptSource, SessionEvent, TurnEndReason};
+use crate::events::{EditContent, LogEntry, PromptSource, SessionEvent, TurnEndReason};
 use crate::memory::{
     self, LogReplayMemory, TransactionLog, build_session_memory, prompt_history_path,
 };
@@ -344,6 +344,60 @@ impl Session {
         if let Some(tx) = self.cancel_tx.lock().await.take() {
             let _ = tx.send(());
         }
+    }
+
+    /// Edit the content of a prior event (`target` seq) in the agent's view.
+    ///
+    /// Appends an [`SessionEvent::Edited`] overlay.  The original event stays
+    /// in the log untouched; replay uses the replacement for the agent-visible
+    /// set, so the LLM sees the edited content on its next call.  This is
+    /// "writing into the LLM's mind" — see §2.10 of the redesign doc.
+    pub async fn edit(&self, target: u64, replacement: EditContent) {
+        self.emit(SessionEvent::Edited {
+            target,
+            replacement,
+        })
+        .await;
+    }
+
+    /// Hide a prior event (`target` seq) from the agent's view.
+    ///
+    /// Appends a [`SessionEvent::Deleted`] overlay.  If `target` is one half
+    /// of a tool call+result pair, the matching half is also deleted (a second
+    /// `Deleted` event) so the agent never sees an orphaned call or result —
+    /// which some provider APIs reject.  The originals stay in the log;
+    /// replay skips deleted events.
+    pub async fn delete(&self, target: u64) {
+        let other_half = self.resolve_tool_pair(target).await;
+        self.emit(SessionEvent::Deleted { target }).await;
+        if let Some(other) = other_half {
+            self.emit(SessionEvent::Deleted { target: other }).await;
+        }
+    }
+
+    /// If `target` is a `ToolCall`/`ToolResult`, find the seq of the matching
+    /// other half (the event with the same tool-call id and a different seq).
+    /// Returns `None` for non-tool events or when no match is found.
+    async fn resolve_tool_pair(&self, target: u64) -> Option<u64> {
+        let log = self.history.lock().await;
+        let entries = log.entries();
+        let target_entry = entries.iter().find(|e| e.seq == target)?;
+        let id = match &target_entry.event {
+            SessionEvent::ToolCall { id, .. } | SessionEvent::ToolResult { id, .. } => id,
+            _ => return None,
+        };
+        entries
+            .iter()
+            .find(|e| {
+                e.seq != target
+                    && matches!(
+                        &e.event,
+                        SessionEvent::ToolCall { id: eid, .. }
+                        | SessionEvent::ToolResult { id: eid, .. }
+                            if eid == id
+                    )
+            })
+            .map(|e| e.seq)
     }
 
     /// Submit audio for speech-to-text transcription.
