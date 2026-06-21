@@ -266,16 +266,19 @@ pub fn MessageLog() -> impl IntoView {
             // full conversation as if compaction never happened.
             //
             // **LLM view** (👁): groups are kept as-is (summaries replace
-            // covered messages), and deleted messages are filtered out —
-            // this shows exactly what the agent sees.
+            // covered messages), and deleted messages are filtered out.
+            // This approximates what the agent sees — the full flat
+            // projection (from `goop_shared::build_agent_view`) is stored
+            // in `state.agent_messages` for reference.
             //
             // In select mode (chat-view-only), messages are enumerated so
             // clicking sets the range start/end for manual compaction.
             <For
                 each=move || {
                     let msgs = state.messages.get();
+                    let agent_msgs = state.agent_messages.get();
                     let filtered: Vec<UiMessage> =
-                        crate::state::displayed_messages(&msgs, llm_view.get());
+                        crate::state::displayed_messages(&msgs, &agent_msgs, llm_view.get());
                     filtered.into_iter().enumerate().collect::<Vec<_>>()
                 }
                 key=|(_, msg): &(usize, UiMessage)| msg.id()

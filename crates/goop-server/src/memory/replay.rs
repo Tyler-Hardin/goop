@@ -1,10 +1,23 @@
 //! Log replay — deriving agent-visible messages from the transaction log.
 //!
 //! The transaction log records *what happened*; replay derives *what the LLM
-//! sees*.  See `docs/compaction-redesign.md` §2.4–2.5 for the full design.
+//! sees*.  The core projection logic lives in [`goop_shared::build_agent_view`]
+//! (the single source of truth).  This module is a **thin wrapper** that:
+//!
+//! 1. Calls [`goop_shared::build_agent_view`] to get individual agent-visible
+//!    items.
+//! 2. Merges consecutive items of the same role into rig `Message`s for
+//!    provider compatibility.
+//!
+//! **⚠️ Changes to interpretation logic (compaction, tool summarization,
+//! turn buffering, edit/delete, orphan cleanup) belong in
+//! [`goop_shared::build_agent_view`], not here.**
+//!
+//! See `docs/compaction-redesign.md` §2.4–2.5 for the full design.
 
 use std::collections::HashSet;
 
+use goop_shared::{AgentVisibleItem, LogEntry};
 use rig::OneOrMany;
 use rig::completion::{AssistantContent, Message};
 use rig::message::{
@@ -12,11 +25,12 @@ use rig::message::{
     ToolResultContent, UserContent,
 };
 
-use crate::events::{EditContent, LogEntry, SessionEvent, TurnEndReason};
-
 /// One item in the agent-visible set, tagged with the `seq` of the event
 /// that produced it.  The seq is used by later phases for overlay
 /// (`Edited`/`Deleted`) and compaction (`Compacted.covers`) targeting.
+///
+/// Produced by [`replay_visible`] by calling the shared
+/// [`goop_shared::build_agent_view`] and merging consecutive items.
 pub(crate) struct VisibleItem {
     pub(crate) seq: u64,
     pub(crate) msg: Message,
@@ -25,37 +39,13 @@ pub(crate) struct VisibleItem {
 /// Walk the conversation tree backward from `active_tip` to the root,
 /// returning the active branch in chronological (root→tip) order.
 ///
-/// `active_tip = None` means "the last entry" (the linear default) — every
-/// entry is on the branch, so the whole log is returned in order.  `Some(tip)`
-/// follows `parent` pointers from `tip` to the root, collecting ancestors;
-/// entries not on that chain (sibling branches) are excluded.
-///
-/// This is git's model: commits have parents, branches are tips.  See §2.9 of
-/// the redesign doc.
-///
-/// Returns owned entries (cloned) so the result can outlive the log lock —
-/// the subscriber uses it for history replay.
+/// Delegates to [`goop_shared::collect_branch`] — this re-export is kept
+/// for local callers (tests, session).
 pub(crate) fn collect_branch(active_tip: Option<u64>, log: &[LogEntry]) -> Vec<LogEntry> {
-    let Some(tip) = active_tip.or_else(|| log.last().map(|e| e.seq)) else {
-        return Vec::new();
-    };
-    // Index entries by seq for O(1) parent lookup.  (seqs are dense in the
-    // common case but may have gaps from forks/legacy migration, so a map is
-    // safer than a vec.)
-    let by_seq: std::collections::HashMap<u64, &LogEntry> =
-        log.iter().map(|e| (e.seq, e)).collect();
-    let mut branch: Vec<&LogEntry> = Vec::new();
-    let mut cur = Some(tip);
-    while let Some(seq) = cur {
-        let Some(entry) = by_seq.get(&seq) else {
-            break; // dangling parent — stop (defence in depth).
-        };
-        cur = entry.parent;
-        branch.push(entry);
-    }
-    branch.reverse(); // root → tip
-    branch.into_iter().cloned().collect()
+    goop_shared::collect_branch(log, active_tip)
 }
+
+// ── the thin wrappers ───────────────────────────────────────────────
 
 /// Replay the transaction log into the agent-visible message list.
 ///
@@ -63,120 +53,14 @@ pub(crate) fn collect_branch(active_tip: Option<u64>, log: &[LogEntry]) -> Vec<L
 /// replayed — sibling branches (old forks) are excluded.  `active_tip = None`
 /// means "last entry" (linear).
 ///
-/// **Turn buffering:** content events (`UserPrompt`, `AssistantText`,
-/// `ToolCall`, `ToolResult`) are buffered into the current turn and only
-/// committed to the visible set when a [`TurnEnded`](SessionEvent::TurnEnded)
-/// is seen.  This gives [`TurnEndReason`] its functional role:
-/// - [`Cancelled { prompt: Some(_) }`](TurnEndReason::Cancelled) drops the
-///   whole buffered turn (no work was committed).
-/// - every other reason commits the turn.
+/// Thin wrapper: calls [`goop_shared::build_agent_view`], then merges
+/// consecutive items of the same role into rig `Message`s.
 ///
-/// **Trailing turn is dropped.**  The loop does *not* flush a turn left
-/// open at the end of the log (an in-progress turn with no `TurnEnded`).
-/// That is exactly what [`ConversationMemory::load`] must return, because
-/// rig appends the current prompt itself — including the open turn would
-/// duplicate the prompt.
-///
-/// **Orphan safety net:** a `ToolCall` with no matching `ToolResult`
-/// (e.g. an in-flight tool call at the moment a turn was cancelled with
-/// work committed) is dropped by [`drop_orphaned_tool_pairs`], since some
-/// provider APIs reject an unpaired call or result.
+/// ⚠️ **Do not add interpretation logic here.**  Changes to how the agent's
+/// view is derived from the log belong in [`goop_shared::build_agent_view`].
 pub(crate) fn replay_visible(log: &[LogEntry], active_tip: Option<u64>) -> Vec<VisibleItem> {
-    let branch = collect_branch(active_tip, log);
-    replay_branch(&branch)
-}
-
-/// Replay a pre-collected branch (a slice of `LogEntry` in chronological
-/// order).  Separated from [`replay_visible`] so callers that already have a
-/// branch avoid re-walking.
-fn replay_branch(branch: &[LogEntry]) -> Vec<VisibleItem> {
-    let mut visible: Vec<VisibleItem> = Vec::new();
-    let mut replay = Replay::new();
-
-    for entry in branch {
-        match &entry.event {
-            SessionEvent::TurnEnded { reason } => {
-                // Finalise any pending assistant text/calls and tool results
-                // into the buffered turn before deciding its fate.
-                replay.flush_assistant();
-                replay.flush_results();
-                match reason {
-                    TurnEndReason::Cancelled { prompt: Some(_) } => {
-                        // No work committed — discard the whole turn.  The
-                        // prompt is handed back to the terminal for editing.
-                        replay.out.clear();
-                    }
-                    // Completed / StreamEnded / Cancelled { None } /
-                    // MaxTurnsExceeded / Error — the turn's committed work is
-                    // agent-visible.
-                    _ => visible.append(&mut replay.out),
-                }
-            }
-
-            // A compaction replaces a range of agent-visible items with a
-            // rolling summary.  `covers` references the seqs of the
-            // *current* visible items (including prior summaries), so a
-            // simple `retain` is correct even for nested compactions.
-            SessionEvent::Compacted {
-                summary, covers, ..
-            } => {
-                let cover_set: HashSet<u64> = covers.iter().copied().collect();
-                visible.retain(|i| !cover_set.contains(&i.seq));
-                visible.push(VisibleItem {
-                    seq: entry.seq,
-                    msg: Message::user(summary.clone()),
-                });
-            }
-
-            // A single tool call+result pair has been summarized.  Replaces
-            // the pair (targeted by `id`) with the summary.  Because replay
-            // merges consecutive calls/results into single messages, this
-            // requires content-granularity surgery — splicing the target
-            // call/result out of their messages and inserting the summary.
-            // See §5.1–5.2 of the redesign doc.
-            SessionEvent::ToolSummarized { id, summary, .. } => {
-                apply_tool_summary(&mut visible, id, summary.clone(), entry.seq);
-            }
-
-            // ── overlay events: edit/delete prior agent-visible content ──
-            // These modify the *committed* visible set (not the buffered
-            // turn), so they're top-level arms rather than going through
-            // `Replay::feed`.  Overlays arrive after their target's turn has
-            // been committed, so the target is always in `visible` by the
-            // time the overlay is processed.  See §2.10 of the redesign doc.
-            //
-            // Tool calls/results are targeted by seq, but replay merges
-            // consecutive calls/results into single messages (losing
-            // individual seqs).  So for tool targets we look up the event's
-            // `id` in the log and do content-granularity surgery by id — the
-            // same technique `apply_tool_summary` uses.  Text-bearing targets
-            // (UserPrompt, AssistantText, Compacted, ToolSummarized) keep
-            // their seq as the VisibleItem's seq, so a whole-item replace
-            // suffices.
-            SessionEvent::Edited {
-                target,
-                replacement,
-            } => {
-                apply_edit(&mut visible, branch, *target, replacement);
-            }
-            SessionEvent::Deleted { target } => {
-                apply_delete(&mut visible, branch, *target);
-            }
-
-            // `SystemPrompt` is session metadata, not conversation.  It falls
-            // through to `replay.feed` → `_ => {}`, so it's correctly excluded
-            // from the agent-visible message list (the preamble is already
-            // baked into the agent, not part of the message history).
-            _ => replay.feed(entry),
-        }
-    }
-
-    // NOTE: deliberately do NOT commit a trailing un-terminated turn — see
-    // the doc comment above.
-
-    drop_orphaned_tool_pairs(&mut visible);
-
-    visible
+    let items = goop_shared::build_agent_view(log, active_tip);
+    merge_consecutive(items)
 }
 
 /// Replay the log into the agent-visible [`Message`] list (the shape rig
@@ -188,517 +72,131 @@ pub(crate) fn replay_log(log: &[LogEntry], active_tip: Option<u64>) -> Vec<Messa
         .collect()
 }
 
-/// Streams log events into `out`, accumulating consecutive assistant
-/// content (text + tool calls) into a single assistant message and
-/// consecutive tool results into a single user message — mirroring rig's
-/// own message history so the replayed conversation is provider-valid.
-struct Replay {
-    /// Messages built for the current (open) turn.
-    out: Vec<VisibleItem>,
-    /// Accumulated assistant text chunks (consecutive → one message).
-    a_text: Vec<String>,
-    /// Accumulated assistant tool calls (consecutive → one message).
-    a_calls: Vec<RigToolCall>,
-    /// Seq of the first chunk contributing to the pending assistant message.
-    a_seq: Option<u64>,
-    /// Accumulated tool results (consecutive → one user message).
-    u_results: Vec<(u64, RigToolResult)>,
-}
+// ── merging consecutive items ───────────────────────────────────────
+//
+// The shared `build_agent_view` produces individual items (e.g. each
+// `AssistantText` chunk is a separate item).  This merger combines
+// consecutive assistant items (text + tool calls) into single `Message`
+// values that rig providers accept.
+//
+// Merger rules:
+//   UserText    → flush pending, push as standalone Message::User
+//   Summary     → flush pending, push as standalone Message::User
+//   AssistantText → accumulate into pending assistant
+//   ToolCall    → accumulate into pending assistant
+//   ToolResult  → flush pending assistant, accumulate into pending results
 
-impl Replay {
-    fn new() -> Self {
-        Self {
-            out: Vec::new(),
-            a_text: Vec::new(),
-            a_calls: Vec::new(),
-            a_seq: None,
-            u_results: Vec::new(),
-        }
-    }
+fn merge_consecutive(items: Vec<AgentVisibleItem>) -> Vec<VisibleItem> {
+    let mut out: Vec<VisibleItem> = Vec::with_capacity(items.len());
+    let mut a_text: Vec<String> = Vec::new();
+    let mut a_calls: Vec<RigToolCall> = Vec::new();
+    let mut a_seq: Option<u64> = None;
+    let mut u_results: Vec<(u64, RigToolResult)> = Vec::new();
 
-    /// Flush the pending assistant accumulator (text + calls) into a single
-    /// assistant message.  No-op when nothing is pending.
-    fn flush_assistant(&mut self) {
-        if self.a_text.is_empty() && self.a_calls.is_empty() {
-            self.a_seq = None;
-            return;
-        }
-        let mut items: Vec<AssistantContent> = self
-            .a_text
-            .drain(..)
-            .map(|t| AssistantContent::Text(MessageText::new(t)))
-            .collect();
-        items.extend(self.a_calls.drain(..).map(AssistantContent::ToolCall));
-        // Non-empty by the guard above.
-        let content = OneOrMany::many(items).expect("replay: non-empty assistant content");
-        self.out.push(VisibleItem {
-            seq: self.a_seq.unwrap_or(0),
-            msg: Message::Assistant { id: None, content },
-        });
-        self.a_seq = None;
-    }
-
-    /// Flush the pending tool-result accumulator into a single user message.
-    fn flush_results(&mut self) {
-        if self.u_results.is_empty() {
-            return;
-        }
-        let first_seq = self.u_results[0].0;
-        let items: Vec<UserContent> = self
-            .u_results
-            .drain(..)
-            .map(|(_, tr)| UserContent::ToolResult(tr))
-            .collect();
-        let content = OneOrMany::many(items).expect("replay: non-empty tool results");
-        self.out.push(VisibleItem {
-            seq: first_seq,
-            msg: Message::User { content },
-        });
-    }
-
-    /// Fold one log event into the current turn.
-    fn feed(&mut self, entry: &LogEntry) {
-        match &entry.event {
-            SessionEvent::UserPrompt { content, .. } => {
-                self.out.push(VisibleItem {
-                    seq: entry.seq,
-                    msg: Message::user(content.clone()),
+    for item in items {
+        match item {
+            AgentVisibleItem::UserText { seq, content } => {
+                flush_results(&mut out, &mut u_results);
+                flush_assistant(&mut out, &mut a_text, &mut a_calls, &mut a_seq);
+                out.push(VisibleItem {
+                    seq,
+                    msg: Message::user(content),
                 });
             }
-            SessionEvent::AssistantText(text) => {
-                // Assistant content cannot share a message with prior tool
-                // results — flush them first (a new assistant turn starts).
-                self.flush_results();
-                if self.a_seq.is_none() {
-                    self.a_seq = Some(entry.seq);
-                }
-                self.a_text.push(text.clone());
+            AgentVisibleItem::Summary { seq, content } => {
+                flush_results(&mut out, &mut u_results);
+                flush_assistant(&mut out, &mut a_text, &mut a_calls, &mut a_seq);
+                out.push(VisibleItem {
+                    seq,
+                    msg: Message::user(content),
+                });
             }
-            SessionEvent::ToolCall {
+            AgentVisibleItem::AssistantText { seq, content } => {
+                flush_results(&mut out, &mut u_results);
+                if a_seq.is_none() {
+                    a_seq = Some(seq);
+                }
+                a_text.push(content);
+            }
+            AgentVisibleItem::ToolCall {
+                seq,
                 id,
                 name,
                 arguments,
             } => {
-                self.flush_results();
-                if self.a_seq.is_none() {
-                    self.a_seq = Some(entry.seq);
+                flush_results(&mut out, &mut u_results);
+                if a_seq.is_none() {
+                    a_seq = Some(seq);
                 }
-                self.a_calls.push(RigToolCall::new(
-                    id.clone(),
-                    ToolFunction::new(name.clone(), arguments.clone()),
+                a_calls.push(RigToolCall::new(
+                    id,
+                    ToolFunction::new(name, arguments),
                 ));
             }
-            SessionEvent::ToolResult { id, content } => {
-                // Tool results are user-side: the pending assistant message
-                // (the call(s)) must be flushed first.
-                self.flush_assistant();
+            AgentVisibleItem::ToolResult { seq, id, content } => {
+                flush_assistant(&mut out, &mut a_text, &mut a_calls, &mut a_seq);
                 let tr = RigToolResult {
-                    id: id.clone(),
-                    call_id: None,
-                    content: OneOrMany::one(ToolResultContent::Text(MessageText::new(
-                        content.clone(),
-                    ))),
-                };
-                self.u_results.push((entry.seq, tr));
-            }
-            // Metadata / control events do not contribute messages.
-            _ => {}
-        }
-    }
-}
-
-/// Defence in depth: drop a `ToolCall` whose `ToolResult` is absent (or
-/// vice-versa).  This catches an in-flight tool call from a cancelled-with-
-/// work turn, and would catch imperfect `Deleted` overlays in later phases.
-/// Operates at content granularity so a merged assistant message that has
-/// both text and an orphaned call keeps its text.
-fn drop_orphaned_tool_pairs(visible: &mut Vec<VisibleItem>) {
-    let mut call_ids: HashSet<String> = HashSet::new();
-    let mut result_ids: HashSet<String> = HashSet::new();
-    for item in visible.iter() {
-        match &item.msg {
-            Message::Assistant { content, .. } => {
-                for c in content.iter() {
-                    if let AssistantContent::ToolCall(tc) = c {
-                        call_ids.insert(tc.id.clone());
-                    }
-                }
-            }
-            Message::User { content } => {
-                for c in content.iter() {
-                    if let UserContent::ToolResult(tr) = c {
-                        result_ids.insert(tr.id.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let orphan_calls: HashSet<&str> = call_ids
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|id| !result_ids.contains(*id))
-        .collect();
-    let orphan_results: HashSet<&str> = result_ids
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|id| !call_ids.contains(*id))
-        .collect();
-    if orphan_calls.is_empty() && orphan_results.is_empty() {
-        return;
-    }
-
-    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len());
-    for item in visible.drain(..) {
-        match item.msg {
-            Message::Assistant { id, content } => {
-                let mut items: Vec<AssistantContent> = content.into_iter().collect();
-                items.retain(|c| match c {
-                    AssistantContent::ToolCall(tc) => !orphan_calls.contains(tc.id.as_str()),
-                    _ => true,
-                });
-                if let Ok(oom) = OneOrMany::many(items) {
-                    rebuilt.push(VisibleItem {
-                        seq: item.seq,
-                        msg: Message::Assistant { id, content: oom },
-                    });
-                }
-                // else: every content item was an orphaned tool call → drop.
-            }
-            Message::User { content } => {
-                let mut items: Vec<UserContent> = content.into_iter().collect();
-                items.retain(|c| match c {
-                    UserContent::ToolResult(tr) => !orphan_results.contains(tr.id.as_str()),
-                    _ => true,
-                });
-                if let Ok(oom) = OneOrMany::many(items) {
-                    rebuilt.push(VisibleItem {
-                        seq: item.seq,
-                        msg: Message::User { content: oom },
-                    });
-                }
-            }
-            other => rebuilt.push(VisibleItem {
-                seq: item.seq,
-                msg: other,
-            }),
-        }
-    }
-    *visible = rebuilt;
-}
-
-/// Replace a single tool call+result pair (identified by `id`) with a
-/// summary message.
-///
-/// Replay merges consecutive tool calls into one assistant `VisibleItem` and
-/// consecutive results into one user `VisibleItem`, so the target call/result
-/// may be *inside* a message alongside siblings.  This function splices the
-/// target out of each message (content-granularity, like
-/// [`drop_orphaned_tool_pairs`]), drops now-empty messages, and inserts the
-/// summary at the call's former position.
-///
-/// If only one half of the pair is present (the other was already compacted
-/// or deleted), that half is dropped too — the orphan net would catch it
-/// anyway, but doing it here keeps the intermediate state valid.  If neither
-/// half is present, the event is a no-op (defence in depth).
-fn apply_tool_summary(visible: &mut Vec<VisibleItem>, id: &str, summary: String, seq: u64) {
-    // Check whether the id exists at all.
-    let has_call = visible.iter().any(|item| {
-        matches!(&item.msg, Message::Assistant { content, .. }
-            if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.id == id)))
-    });
-    let has_result = visible.iter().any(|item| {
-        matches!(&item.msg, Message::User { content }
-            if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr) if tr.id == id)))
-    });
-    if !has_call && !has_result {
-        return;
-    }
-
-    // The summary goes at the call's position (the earlier of the pair).
-    // If only the result survives (call already removed), use its position.
-    let insert_pos = visible
-        .iter()
-        .position(|item| {
-            matches!(&item.msg, Message::Assistant { content, .. }
-            if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.id == id)))
-        })
-        .or_else(|| {
-            visible.iter().position(|item| {
-                matches!(&item.msg, Message::User { content }
-            if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr) if tr.id == id)))
-            })
-        });
-
-    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len() + 1);
-    let mut inserted = false;
-
-    for (orig_idx, item) in visible.drain(..).enumerate() {
-        // Insert the summary just before the item at the target position.
-        if !inserted && insert_pos.is_some_and(|p| p == orig_idx) {
-            rebuilt.push(VisibleItem {
-                seq,
-                msg: Message::user(summary.clone()),
-            });
-            inserted = true;
-        }
-
-        match item.msg {
-            Message::Assistant {
-                id: msg_id,
-                content,
-            } => {
-                let items: Vec<AssistantContent> = content
-                    .into_iter()
-                    .filter(|c| !matches!(c, AssistantContent::ToolCall(tc) if tc.id == id))
-                    .collect();
-                if let Ok(oom) = OneOrMany::many(items) {
-                    rebuilt.push(VisibleItem {
-                        seq: item.seq,
-                        msg: Message::Assistant {
-                            id: msg_id,
-                            content: oom,
-                        },
-                    });
-                }
-                // else: every content item was the target call → dropped.
-            }
-            Message::User { content } => {
-                let items: Vec<UserContent> = content
-                    .into_iter()
-                    .filter(|c| !matches!(c, UserContent::ToolResult(tr) if tr.id == id))
-                    .collect();
-                if let Ok(oom) = OneOrMany::many(items) {
-                    rebuilt.push(VisibleItem {
-                        seq: item.seq,
-                        msg: Message::User { content: oom },
-                    });
-                }
-            }
-            other => rebuilt.push(VisibleItem {
-                seq: item.seq,
-                msg: other,
-            }),
-        }
-    }
-
-    if !inserted {
-        rebuilt.push(VisibleItem {
-            seq,
-            msg: Message::user(summary),
-        });
-    }
-
-    *visible = rebuilt;
-}
-
-// ── edit/delete overlay application ──────────────────────────────────
-//
-// `Edited`/`Deleted` modify the committed agent-visible set.  Tool calls and
-// results are targeted by seq, but replay merges consecutive calls/results
-// into single messages — so individual seqs are lost inside a merged message.
-// We resolve this by looking up the target event's tool-call `id` in the log
-// and operating at content granularity (by id), reusing the rebuild pattern
-// from `apply_tool_summary`/`drop_orphaned_tool_pairs`.  Text-bearing targets
-// keep their seq as the VisibleItem's seq, so a whole-item replace works.
-
-/// Find the event payload at `target` seq in the log.
-fn log_event_at(log: &[LogEntry], target: u64) -> Option<&SessionEvent> {
-    log.iter().find(|e| e.seq == target).map(|e| &e.event)
-}
-
-/// Apply a `Deleted` overlay: hide `target` from the agent-visible set.
-///
-/// For a `ToolCall`/`ToolResult` target, the matching content is spliced out
-/// of its (possibly merged) message by id; a message left empty is dropped.
-/// The server emits a `Deleted` for *both* halves of a tool pair, so each
-/// half is removed independently — the [`drop_orphaned_tool_pairs`] safety net
-/// catches any edge case.  For any other target (UserPrompt, AssistantText,
-/// Compacted, ToolSummarized) the whole `VisibleItem` whose seq matches is
-/// removed.
-fn apply_delete(visible: &mut Vec<VisibleItem>, log: &[LogEntry], target: u64) {
-    let Some(event) = log_event_at(log, target) else {
-        return; // target not in the log — no-op (defence in depth).
-    };
-    match event {
-        SessionEvent::ToolCall { id, .. } => remove_tool_call_by_id(visible, id),
-        SessionEvent::ToolResult { id, .. } => remove_tool_result_by_id(visible, id),
-        _ => visible.retain(|i| i.seq != target),
-    }
-}
-
-/// Apply an `Edited` overlay: replace `target`'s content with `replacement`.
-///
-/// Tool-call/result edits splice the replacement into the (possibly merged)
-/// message by id, preserving the id and any sibling content.  Text edits
-/// replace the whole `VisibleItem` whose seq matches (UserPrompt/Compacted/
-/// ToolSummarized → new user text; AssistantText → assistant text replaced,
-/// tool calls kept).  A mismatched replacement type for the target is a
-/// no-op (defence in depth; the server targets the right type).
-fn apply_edit(
-    visible: &mut [VisibleItem],
-    log: &[LogEntry],
-    target: u64,
-    replacement: &EditContent,
-) {
-    // Tool targets need the id from the log (the replacement for a ToolCall
-    // carries new name/args but not the id — the id is the call's identity
-    // and stays the same).
-    if let Some(event) = log_event_at(log, target) {
-        match (event, replacement) {
-            (SessionEvent::ToolCall { id, .. }, EditContent::ToolCall { name, arguments }) => {
-                replace_tool_call_by_id(visible, id, name, arguments);
-                return;
-            }
-            (SessionEvent::ToolResult { id, .. }, EditContent::ToolResult { content }) => {
-                replace_tool_result_by_id(visible, id, content);
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    // Text replacement — operates on the whole VisibleItem whose seq matches.
-    let EditContent::Text(text) = replacement else {
-        return;
-    };
-    let Some(item) = visible.iter_mut().find(|i| i.seq == target) else {
-        return; // target not currently visible (already deleted/compacted).
-    };
-    let text = text.clone();
-    // Take ownership of the old message so we can move its content out,
-    // then assign the rebuilt message back.
-    let old = std::mem::replace(&mut item.msg, Message::user(String::new()));
-    item.msg = match old {
-        // UserPrompt / Compacted / ToolSummarized are plain user text.
-        Message::User { .. } => Message::user(text),
-        Message::Assistant { content, id } => {
-            // Keep tool calls; replace all text with the single new chunk.
-            // (An assistant message merges text + calls; editing the text
-            // updates the narration while leaving the calls intact.)
-            let mut items: Vec<AssistantContent> = content
-                .into_iter()
-                .filter(|c| matches!(c, AssistantContent::ToolCall(_)))
-                .collect();
-            if !text.is_empty() {
-                items.insert(0, AssistantContent::Text(MessageText::new(text)));
-            }
-            match OneOrMany::many(items) {
-                Ok(oom) => Message::Assistant { id, content: oom },
-                // All content was text (now empty) — preserve the assistant
-                // role with an empty text chunk.
-                Err(_) => Message::Assistant {
                     id,
-                    content: OneOrMany::one(AssistantContent::Text(
-                        MessageText::new(String::new()),
-                    )),
-                },
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::Text(MessageText::new(content))),
+                };
+                u_results.push((seq, tr));
             }
-        }
-        other => other, // ToolResult-only user messages etc. — leave as-is.
-    };
-}
-
-/// Remove the `ToolCall` with `id` from any assistant message.  A message
-/// left with no content is dropped.  Operates at content granularity so
-/// sibling calls/text in a merged message survive.
-fn remove_tool_call_by_id(visible: &mut Vec<VisibleItem>, id: &str) {
-    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len());
-    for item in visible.drain(..) {
-        match item.msg {
-            Message::Assistant {
-                id: msg_id,
-                content,
-            } => {
-                let items: Vec<AssistantContent> = content
-                    .into_iter()
-                    .filter(|c| !matches!(c, AssistantContent::ToolCall(tc) if tc.id == id))
-                    .collect();
-                if let Ok(oom) = OneOrMany::many(items) {
-                    rebuilt.push(VisibleItem {
-                        seq: item.seq,
-                        msg: Message::Assistant {
-                            id: msg_id,
-                            content: oom,
-                        },
-                    });
-                }
-                // else: every content item was the target call → dropped.
-            }
-            other => rebuilt.push(VisibleItem {
-                seq: item.seq,
-                msg: other,
-            }),
         }
     }
-    *visible = rebuilt;
+
+    flush_results(&mut out, &mut u_results);
+    flush_assistant(&mut out, &mut a_text, &mut a_calls, &mut a_seq);
+    drop_orphaned_tool_pairs(&mut out);
+
+    out
 }
 
-/// Remove the `ToolResult` with `id` from any user message.  A message left
-/// with no content is dropped.  See [`remove_tool_call_by_id`].
-fn remove_tool_result_by_id(visible: &mut Vec<VisibleItem>, id: &str) {
-    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len());
-    for item in visible.drain(..) {
-        match item.msg {
-            Message::User { content } => {
-                let items: Vec<UserContent> = content
-                    .into_iter()
-                    .filter(|c| !matches!(c, UserContent::ToolResult(tr) if tr.id == id))
-                    .collect();
-                if let Ok(oom) = OneOrMany::many(items) {
-                    rebuilt.push(VisibleItem {
-                        seq: item.seq,
-                        msg: Message::User { content: oom },
-                    });
-                }
-            }
-            other => rebuilt.push(VisibleItem {
-                seq: item.seq,
-                msg: other,
-            }),
-        }
-    }
-    *visible = rebuilt;
-}
-
-/// Replace the `ToolCall` with `id` (keeping the id) with new name/arguments.
-fn replace_tool_call_by_id(
-    visible: &mut [VisibleItem],
-    id: &str,
-    name: &str,
-    arguments: &serde_json::Value,
+fn flush_assistant(
+    out: &mut Vec<VisibleItem>,
+    a_text: &mut Vec<String>,
+    a_calls: &mut Vec<RigToolCall>,
+    a_seq: &mut Option<u64>,
 ) {
-    for item in visible.iter_mut() {
-        if let Message::Assistant { content, .. } = &mut item.msg {
-            for c in content.iter_mut() {
-                if let AssistantContent::ToolCall(tc) = c
-                    && tc.id == id
-                {
-                    tc.function = ToolFunction::new(name.to_string(), arguments.clone());
-                }
-            }
-        }
+    if a_text.is_empty() && a_calls.is_empty() {
+        *a_seq = None;
+        return;
     }
+    let mut items: Vec<AssistantContent> = a_text
+        .drain(..)
+        .map(|t| AssistantContent::Text(MessageText::new(t)))
+        .collect();
+    items.extend(a_calls.drain(..).map(AssistantContent::ToolCall));
+    let content = OneOrMany::many(items).expect("merge: non-empty assistant content");
+    out.push(VisibleItem {
+        seq: a_seq.unwrap_or(0),
+        msg: Message::Assistant { id: None, content },
+    });
+    *a_seq = None;
 }
 
-/// Replace the content of the `ToolResult` with `id`.
-fn replace_tool_result_by_id(visible: &mut [VisibleItem], id: &str, content: &str) {
-    let new_content = OneOrMany::one(ToolResultContent::Text(MessageText::new(
-        content.to_string(),
-    )));
-    for item in visible.iter_mut() {
-        if let Message::User { content } = &mut item.msg {
-            for c in content.iter_mut() {
-                if let UserContent::ToolResult(tr) = c
-                    && tr.id == id
-                {
-                    tr.content = new_content.clone();
-                }
-            }
-        }
+fn flush_results(out: &mut Vec<VisibleItem>, u_results: &mut Vec<(u64, RigToolResult)>) {
+    if u_results.is_empty() {
+        return;
     }
+    let first_seq = u_results[0].0;
+    let items: Vec<UserContent> = u_results
+        .drain(..)
+        .map(|(_, tr)| UserContent::ToolResult(tr))
+        .collect();
+    let content = OneOrMany::many(items).expect("merge: non-empty tool results");
+    out.push(VisibleItem {
+        seq: first_seq,
+        msg: Message::User { content },
+    });
 }
+
+// ── helpers used by compaction.rs ───────────────────────────────────
+//
+// These operate on the *merged* `VisibleItem` list.  Since tool calls and
+// results may be merged into single messages, these functions do
+// content-granularity inspection — looking inside `Message::Assistant` and
+// `Message::User` for individual tool calls and results.
 
 /// Extract a single tool call and its matching result from the visible items
 /// as standalone [`Message`]s, suitable for LLM summarization input.
@@ -797,14 +295,106 @@ pub(crate) fn last_prompt_boundary(items: &[VisibleItem]) -> usize {
         .unwrap_or(items.len())
 }
 
+// ── orphan cleanup (post-merge) ─────────────────────────────────────
+
+/// Defence in depth: drop a `ToolCall` whose `ToolResult` is absent (or
+/// vice-versa).  Operates at content granularity so a merged assistant
+/// message that has both text and an orphaned call keeps its text.
+fn drop_orphaned_tool_pairs(visible: &mut Vec<VisibleItem>) {
+    let mut call_ids: HashSet<String> = HashSet::new();
+    let mut result_ids: HashSet<String> = HashSet::new();
+    for item in visible.iter() {
+        match &item.msg {
+            Message::Assistant { content, .. } => {
+                for c in content.iter() {
+                    if let AssistantContent::ToolCall(tc) = c {
+                        call_ids.insert(tc.id.clone());
+                    }
+                }
+            }
+            Message::User { content } => {
+                for c in content.iter() {
+                    if let UserContent::ToolResult(tr) = c {
+                        result_ids.insert(tr.id.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let orphan_calls: HashSet<&str> = call_ids
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|id| !result_ids.contains(*id))
+        .collect();
+    let orphan_results: HashSet<&str> = result_ids
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|id| !call_ids.contains(*id))
+        .collect();
+    if orphan_calls.is_empty() && orphan_results.is_empty() {
+        return;
+    }
+
+    let mut rebuilt: Vec<VisibleItem> = Vec::with_capacity(visible.len());
+    for item in visible.drain(..) {
+        match item.msg {
+            Message::Assistant { id, content } => {
+                let mut items: Vec<AssistantContent> = content.into_iter().collect();
+                items.retain(|c| match c {
+                    AssistantContent::ToolCall(tc) => !orphan_calls.contains(tc.id.as_str()),
+                    _ => true,
+                });
+                if let Ok(oom) = OneOrMany::many(items) {
+                    rebuilt.push(VisibleItem {
+                        seq: item.seq,
+                        msg: Message::Assistant { id, content: oom },
+                    });
+                }
+            }
+            Message::User { content } => {
+                let mut items: Vec<UserContent> = content.into_iter().collect();
+                items.retain(|c| match c {
+                    UserContent::ToolResult(tr) => !orphan_results.contains(tr.id.as_str()),
+                    _ => true,
+                });
+                if let Ok(oom) = OneOrMany::many(items) {
+                    rebuilt.push(VisibleItem {
+                        seq: item.seq,
+                        msg: Message::User { content: oom },
+                    });
+                }
+            }
+            other => rebuilt.push(VisibleItem {
+                seq: item.seq,
+                msg: other,
+            }),
+        }
+    }
+    *visible = rebuilt;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::SessionEvent;
+    use crate::events::TurnEndReason;
 
     fn entry(seq: u64, event: SessionEvent) -> LogEntry {
         LogEntry {
             seq,
             parent: if seq == 0 { None } else { Some(seq - 1) },
+            ts: chrono::Utc::now(),
+            event,
+        }
+    }
+
+    /// Build an entry with an explicit parent (for forked logs).
+    fn fork_entry(seq: u64, parent: Option<u64>, event: SessionEvent) -> LogEntry {
+        LogEntry {
+            seq,
+            parent,
             ts: chrono::Utc::now(),
             event,
         }
@@ -825,6 +415,48 @@ mod tests {
             ),
             _ => None,
         }
+    }
+
+    /// Extract the concatenated text of a `Message::User` (ignoring tool
+    /// results), for assertions.
+    fn user_text(m: &Message) -> Option<String> {
+        match m {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Extract the content of the first `ToolResult` in a `Message::User`.
+    fn tool_result_text(m: &Message, id: &str) -> Option<String> {
+        let Message::User { content } = m else {
+            return None;
+        };
+        for c in content.iter() {
+            if let UserContent::ToolResult(tr) = c
+                && tr.id == id
+            {
+                return Some(
+                    tr.content
+                        .iter()
+                        .filter_map(|c| match c {
+                            ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                );
+            }
+        }
+        None
     }
 
     /// A normal completed turn (prompt → text) replays to one user + one
@@ -884,7 +516,6 @@ mod tests {
             entry(3, SessionEvent::AssistantText("partial".into())),
         ];
         let msgs = replay_log(&log, None);
-        // Only the first turn (1 user, 0 assistant since no text) survives.
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0], Message::User { .. }));
     }
@@ -957,7 +588,6 @@ mod tests {
             ),
         ];
         let msgs = replay_log(&log, None);
-        // user prompt + (assistant call "a" + user result "a"); call "b" dropped.
         assert_eq!(msgs.len(), 3);
         assert!(matches!(msgs[0], Message::User { .. })); // prompt
         assert!(matches!(msgs[1], Message::Assistant { .. })); // call a
@@ -1012,7 +642,6 @@ mod tests {
     /// itself carries the compaction's seq.
     #[test]
     fn replay_compacted_replaces_covered_items() {
-        // turn 0: user "q" + assistant "a"
         let log = vec![
             entry(
                 0,
@@ -1028,7 +657,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // compaction covers the two items produced by that turn (seqs 0,1)
             entry(
                 3,
                 SessionEvent::Compacted {
@@ -1038,7 +666,6 @@ mod tests {
                     manual: false,
                 },
             ),
-            // a later turn stays visible
             entry(
                 4,
                 SessionEvent::UserPrompt {
@@ -1054,7 +681,6 @@ mod tests {
             ),
         ];
         let items = replay_visible(&log, None);
-        // summary (seq 3) + the later prompt (seq 4)
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].seq, 3);
         assert_eq!(items[1].seq, 4);
@@ -1063,14 +689,10 @@ mod tests {
 
     /// Overlapping/nested compaction: a later `Compacted` whose `covers`
     /// includes the seq of a *prior* `Compacted` summary must remove that
-    /// prior summary too — otherwise it would linger alongside the new one
-    /// and corrupt the agent's context.  This is the case §2.5 of the
-    /// redesign doc flags as why `covers` must reference *current
-    /// agent-visible items*, including prior summaries.
+    /// prior summary.
     #[test]
     fn replay_compacted_includes_prior_summary() {
         let log = vec![
-            // turn 0: user "q1" + assistant "a1"
             entry(
                 0,
                 SessionEvent::UserPrompt {
@@ -1085,7 +707,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // first compaction covers turn 0's two items → summary S1 (seq 3)
             entry(
                 3,
                 SessionEvent::Compacted {
@@ -1095,7 +716,6 @@ mod tests {
                     manual: false,
                 },
             ),
-            // turn 1: user "q2" + assistant "a2"
             entry(
                 4,
                 SessionEvent::UserPrompt {
@@ -1110,7 +730,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // second compaction covers S1 (seq 3) + turn 1's items → S2 (seq 7)
             entry(
                 7,
                 SessionEvent::Compacted {
@@ -1122,7 +741,6 @@ mod tests {
             ),
         ];
         let items = replay_visible(&log, None);
-        // Only the second summary survives — S1 (seq 3) is swept away.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].seq, 7);
         assert_eq!(user_text(&items[0].msg).as_deref(), Some("S2"));
@@ -1140,7 +758,6 @@ mod tests {
                     source: crate::events::PromptSource::Terminal,
                 },
             ),
-            // metadata interspersed
             entry(
                 1,
                 SessionEvent::ContextSnapshot {
@@ -1156,7 +773,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // a trailing snapshot (e.g. emitted then turn never ran) is also ignored
             entry(
                 5,
                 SessionEvent::ContextSnapshot {
@@ -1166,15 +782,13 @@ mod tests {
             ),
         ];
         let msgs = replay_log(&log, None);
-        assert_eq!(msgs.len(), 2); // user prompt + assistant text only
+        assert_eq!(msgs.len(), 2);
         assert!(matches!(msgs[0], Message::User { .. }));
         assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("hello"));
     }
 
     // ── ToolSummarized replay tests ───────────────────────────────
 
-    /// A `ToolSummarized` event replaces the targeted call+result pair with
-    /// the summary.  Sibling messages remain visible.
     #[test]
     fn replay_tool_summarized_replaces_pair() {
         let log = vec![
@@ -1207,7 +821,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // tool-pair summary replaces the call+result (ids "a")
             entry(
                 5,
                 SessionEvent::ToolSummarized {
@@ -1218,15 +831,12 @@ mod tests {
             ),
         ];
         let items = replay_visible(&log, None);
-        // prompt (seq 0) + summary (seq 5) + assistant text (seq 3)
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].seq, 0);
-        assert_eq!(items[1].seq, 5);
-        assert_eq!(items[2].seq, 3);
+        assert_eq!(items[0].seq, 0); // prompt
+        assert_eq!(items[1].seq, 5); // summary
+        assert_eq!(items[2].seq, 3); // assistant text
     }
 
-    /// When parallel tool calls share a merged assistant message, summarizing
-    /// one removes *only its own half* — siblings survive.
     #[test]
     fn replay_tool_summarized_preserves_sibling_calls() {
         let log = vec![
@@ -1237,7 +847,6 @@ mod tests {
                     source: crate::events::PromptSource::Terminal,
                 },
             ),
-            // parallel calls: a, b (merged into one assistant VisibleItem)
             entry(
                 1,
                 SessionEvent::ToolCall {
@@ -1254,7 +863,6 @@ mod tests {
                     arguments: serde_json::json!({}),
                 },
             ),
-            // parallel results: a, b (merged into one user VisibleItem)
             entry(
                 3,
                 SessionEvent::ToolResult {
@@ -1275,7 +883,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // summarize only pair "a"
             entry(
                 6,
                 SessionEvent::ToolSummarized {
@@ -1286,11 +893,9 @@ mod tests {
             ),
         ];
         let items = replay_visible(&log, None);
-        // prompt (0) + summary (6) + assistant[call b] (1) + user[result b] (3)
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].seq, 0); // prompt
         assert_eq!(items[1].seq, 6); // summary
-        // The remaining assistant message should still have call "b".
         let call_b = match &items[2].msg {
             Message::Assistant { content, .. } => content
                 .iter()
@@ -1298,8 +903,7 @@ mod tests {
                 .count(),
             _ => panic!("expected assistant"),
         };
-        assert_eq!(call_b, 1); // only call "b" remains
-        // The remaining user message should still have result "b".
+        assert_eq!(call_b, 1);
         let result_b = match &items[3].msg {
             Message::User { content } => content
                 .iter()
@@ -1310,8 +914,6 @@ mod tests {
         assert_eq!(result_b, 1);
     }
 
-    /// A `ToolSummarized` for a pair already swept by an earlier `Compacted`
-    /// is a no-op — the call/result are gone from the visible set.
     #[test]
     fn replay_tool_summarized_after_compacted_is_noop() {
         let log = vec![
@@ -1343,7 +945,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // full compaction covers everything (seqs 0,1,2)
             entry(
                 4,
                 SessionEvent::Compacted {
@@ -1353,7 +954,6 @@ mod tests {
                     manual: false,
                 },
             ),
-            // tool summary for "a" — but "a" is already gone → no-op
             entry(
                 5,
                 SessionEvent::ToolSummarized {
@@ -1364,12 +964,10 @@ mod tests {
             ),
         ];
         let items = replay_visible(&log, None);
-        // Only the compaction summary (seq 4) should remain.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].seq, 4);
     }
 
-    /// A `ToolSummarized` for a non-existent id is a no-op (defence in depth).
     #[test]
     fn replay_tool_summarized_missing_id_is_noop() {
         let log = vec![
@@ -1411,7 +1009,6 @@ mod tests {
             ),
         ];
         let items = replay_visible(&log, None);
-        // All three original items survive; the ghost summary is not added.
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].seq, 0);
         assert_eq!(items[1].seq, 1);
@@ -1420,49 +1017,6 @@ mod tests {
 
     // ── Edited / Deleted overlay tests ─────────────────────────────
 
-    /// Extract the concatenated text of a `Message::User` (ignoring tool
-    /// results), for assertions.
-    fn user_text(m: &Message) -> Option<String> {
-        match m {
-            Message::User { content } => Some(
-                content
-                    .iter()
-                    .filter_map(|c| match c {
-                        UserContent::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(""),
-            ),
-            _ => None,
-        }
-    }
-
-    /// Extract the content of the first `ToolResult` in a `Message::User`.
-    fn tool_result_text(m: &Message, id: &str) -> Option<String> {
-        let Message::User { content } = m else {
-            return None;
-        };
-        for c in content.iter() {
-            if let UserContent::ToolResult(tr) = c
-                && tr.id == id
-            {
-                return Some(
-                    tr.content
-                        .iter()
-                        .filter_map(|c| match c {
-                            ToolResultContent::Text(t) => Some(t.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(""),
-                );
-            }
-        }
-        None
-    }
-
-    /// A `Deleted` overlay removes a user prompt from the agent-visible set.
     #[test]
     fn replay_deleted_removes_user_prompt() {
         let log = vec![
@@ -1492,7 +1046,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // delete the first prompt
             entry(4, SessionEvent::Deleted { target: 0 }),
         ];
         let items = replay_visible(&log, None);
@@ -1501,8 +1054,6 @@ mod tests {
         assert_eq!(user_text(&items[0].msg).as_deref(), Some("second"));
     }
 
-    /// Deleting a tool call removes both halves of the pair (the server emits
-    /// a `Deleted` for the call seq and the result seq).
     #[test]
     fn replay_deleted_removes_tool_pair() {
         let log = vec![
@@ -1535,20 +1086,15 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // server emits both halves
-            entry(5, SessionEvent::Deleted { target: 1 }), // call
-            entry(6, SessionEvent::Deleted { target: 2 }), // result
+            entry(5, SessionEvent::Deleted { target: 1 }),
+            entry(6, SessionEvent::Deleted { target: 2 }),
         ];
         let items = replay_visible(&log, None);
-        // prompt (0) + assistant text (3); the call+result pair is gone.
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].seq, 0);
         assert_eq!(assistant_text(&items[1].msg).as_deref(), Some("done"));
     }
 
-    /// Deleting one call in a merged (parallel) assistant message removes only
-    /// that call — siblings survive.  Only one `Deleted` is emitted; the
-    /// orphan safety net drops the now-unpaired result.
     #[test]
     fn replay_deleted_one_of_merged_calls() {
         let log = vec![
@@ -1595,13 +1141,10 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // delete only call "a"; its result is dropped by the orphan net
             entry(6, SessionEvent::Deleted { target: 1 }),
         ];
         let items = replay_visible(&log, None);
-        // prompt (0) + assistant[call b] (1) + user[result b] (3)
         assert_eq!(items.len(), 3);
-        // The surviving assistant message has only call "b".
         let calls = match &items[1].msg {
             Message::Assistant { content, .. } => content
                 .iter()
@@ -1610,7 +1153,6 @@ mod tests {
             _ => panic!("expected assistant"),
         };
         assert_eq!(calls, 1);
-        // The surviving user message has only result "b".
         let results = match &items[2].msg {
             Message::User { content } => content
                 .iter()
@@ -1621,7 +1163,6 @@ mod tests {
         assert_eq!(results, 1);
     }
 
-    /// An `Edited` overlay replaces a user prompt's text in the agent view.
     #[test]
     fn replay_edited_user_prompt() {
         let log = vec![
@@ -1651,8 +1192,6 @@ mod tests {
         assert_eq!(user_text(&items[0].msg).as_deref(), Some("rewritten"));
     }
 
-    /// An `Edited` overlay replaces assistant text while keeping any tool
-    /// calls in the same merged message.
     #[test]
     fn replay_edited_assistant_text_keeps_calls() {
         let log = vec![
@@ -1685,7 +1224,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // edit the assistant text (seq 1, first chunk of the merged msg)
             entry(
                 5,
                 SessionEvent::Edited {
@@ -1695,7 +1233,6 @@ mod tests {
             ),
         ];
         let items = replay_visible(&log, None);
-        // prompt (0) + assistant[text + call a] (1) + user[result a] (3)
         assert_eq!(items.len(), 3);
         let (text, calls) = match &items[1].msg {
             Message::Assistant { content, .. } => {
@@ -1716,11 +1253,9 @@ mod tests {
             _ => panic!("expected assistant"),
         };
         assert_eq!(text, "new narration");
-        assert_eq!(calls, 1); // call "a" survived
+        assert_eq!(calls, 1);
     }
 
-    /// An `Edited` overlay replaces a tool result's content (targeted by the
-    /// result's seq, resolved to the tool-call id for content surgery).
     #[test]
     fn replay_edited_tool_result() {
         let log = vec![
@@ -1763,7 +1298,6 @@ mod tests {
             ),
         ];
         let items = replay_visible(&log, None);
-        // prompt (0) + assistant[call a] (1) + user[result a] (2)
         assert_eq!(items.len(), 3);
         assert_eq!(
             tool_result_text(&items[2].msg, "a").as_deref(),
@@ -1771,7 +1305,6 @@ mod tests {
         );
     }
 
-    /// A `Deleted` for a seq not in the log is a no-op (defence in depth).
     #[test]
     fn replay_deleted_missing_target_is_noop() {
         let log = vec![
@@ -1795,8 +1328,6 @@ mod tests {
         assert_eq!(items[0].seq, 0);
     }
 
-    /// Editing then deleting the same target: delete wins (the edited item is
-    /// removed entirely).
     #[test]
     fn replay_edit_then_delete() {
         let log = vec![
@@ -1828,19 +1359,6 @@ mod tests {
 
     // ── Forking / branching tests ────────────────────────────────────
 
-    /// Build an entry with an explicit parent (for forked logs).  The default
-    /// `entry()` helper always chains `parent = seq - 1`.
-    fn fork_entry(seq: u64, parent: Option<u64>, event: SessionEvent) -> LogEntry {
-        LogEntry {
-            seq,
-            parent,
-            ts: chrono::Utc::now(),
-            event,
-        }
-    }
-
-    /// `collect_branch` with `None` (the linear default) returns the whole log
-    /// in order.
     #[test]
     fn collect_branch_linear_returns_all() {
         let log = vec![
@@ -1862,12 +1380,8 @@ mod tests {
         );
     }
 
-    /// `collect_branch` with a fork tip walks parents, excluding the sibling
-    /// (old) branch.
     #[test]
     fn collect_branch_fork_excludes_sibling() {
-        // Trunk: 0(SessionInfo) → 1(UserPrompt A) → 2(AssistantText) → 3(TurnEnded)
-        // Fork:  4(UserPrompt A') parent=0  → 5(AssistantText) → 6(TurnEnded)
         let log = vec![
             fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
             fork_entry(
@@ -1886,7 +1400,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // fork branch
             fork_entry(
                 4,
                 Some(0),
@@ -1904,7 +1417,6 @@ mod tests {
                 },
             ),
         ];
-        // Active tip = 6 (the new branch).  Should exclude seqs 1,2,3.
         let branch = collect_branch(Some(6), &log);
         assert_eq!(
             branch.iter().map(|e| e.seq).collect::<Vec<_>>(),
@@ -1912,8 +1424,6 @@ mod tests {
         );
     }
 
-    /// Replaying the new branch shows only the new prompt + response; the old
-    /// branch is invisible to the agent.
     #[test]
     fn replay_fork_shows_new_branch_only() {
         let log = vec![
@@ -1934,7 +1444,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // fork from seq 0 (before the old prompt)
             fork_entry(
                 4,
                 Some(0),
@@ -1953,14 +1462,11 @@ mod tests {
             ),
         ];
         let msgs = replay_log(&log, Some(6));
-        // new prompt + new answer only
         assert_eq!(msgs.len(), 2);
         assert_eq!(user_text(&msgs[0]).as_deref(), Some("new prompt"));
         assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("new answer"));
     }
 
-    /// Replaying the OLD branch (active tip = 3) shows the old prompt+answer;
-    /// the fork is invisible.  This is branch switching.
     #[test]
     fn replay_old_branch_shows_old_branch_only() {
         let log = vec![
@@ -2004,13 +1510,8 @@ mod tests {
         assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("old answer"));
     }
 
-    /// A fork that shares a trunk with a prior turn: the shared prefix is
-    /// visible on both branches, only the divergent suffix differs.
     #[test]
     fn replay_fork_preserves_shared_prefix() {
-        // Trunk: 0(root) → 1(prompt1) → 2(answer1) → 3(TurnEnded)
-        //        → 4(prompt2) → 5(answer2) → 6(TurnEnded)
-        // Fork from 3 (after turn 1): 7(prompt2') → 8(answer2') → 9(TurnEnded)
         let log = vec![
             fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
             fork_entry(
@@ -2045,7 +1546,6 @@ mod tests {
                     reason: TurnEndReason::Completed,
                 },
             ),
-            // fork from 3
             fork_entry(
                 7,
                 Some(3),
@@ -2063,7 +1563,6 @@ mod tests {
                 },
             ),
         ];
-        // New branch (tip 9): p1, a1, p2', a2'.
         let msgs = replay_log(&log, Some(9));
         assert_eq!(msgs.len(), 4);
         assert_eq!(user_text(&msgs[0]).as_deref(), Some("p1"));
@@ -2073,8 +1572,7 @@ mod tests {
     }
 
     /// A `SystemPrompt` event is metadata — it must not produce an
-    /// agent-visible message during replay (the preamble is already baked
-    /// into the agent, not part of the conversation).
+    /// agent-visible message during replay.
     #[test]
     fn replay_skips_system_prompt() {
         let log = vec![
@@ -2101,7 +1599,6 @@ mod tests {
             ),
         ];
         let msgs = replay_log(&log, None);
-        // Only the user prompt + assistant text — no system prompt message.
         assert_eq!(msgs.len(), 2);
         assert!(matches!(msgs[0], Message::User { .. }));
         assert_eq!(assistant_text(&msgs[1]).as_deref(), Some("hello"));

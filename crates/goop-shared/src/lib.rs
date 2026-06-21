@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -287,4 +289,441 @@ pub enum ClientMessage {
     /// doc.
     #[serde(rename = "compact_range")]
     CompactRange { covers: Vec<u64> },
+}
+
+// ── agent-visible projection ───────────────────────────────────────
+//
+// The transaction log records *what happened*; `build_agent_view` derives
+// *what the LLM sees*.  This is the single source of truth for that
+// projection — both the server and the web UI consume it.
+
+/// One item in the agent-visible conversation, derived from the transaction
+/// log by [`build_agent_view`].
+///
+/// This is the **single shared representation** of "what the LLM sees."
+/// Both the server (which maps these to rig `Message`s, merging consecutive
+/// items) and the web UI (which wraps them in reactive `UiMessage` variants)
+/// consume this projection.
+///
+/// All changes to how the log is interpreted — compaction, tool
+/// summarization, edit/delete, turn buffering, orphan cleanup — must be
+/// made in [`build_agent_view`], not in the consumers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentVisibleItem {
+    /// A user prompt.
+    UserText { seq: u64, content: String },
+    /// A chunk of assistant text.
+    AssistantText { seq: u64, content: String },
+    /// A tool call.
+    ToolCall {
+        seq: u64,
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    /// A tool result.  Paired with its [`ToolCall`](AgentVisibleItem::ToolCall)
+    /// by `id`.
+    ToolResult { seq: u64, id: String, content: String },
+    /// A compaction or tool-pair summary that replaced earlier items.  At the
+    /// LLM API level, summaries are user-role text.
+    Summary { seq: u64, content: String },
+}
+
+impl AgentVisibleItem {
+    /// The transaction-log seq of the originating event.
+    pub fn seq(&self) -> u64 {
+        match self {
+            AgentVisibleItem::UserText { seq, .. }
+            | AgentVisibleItem::AssistantText { seq, .. }
+            | AgentVisibleItem::ToolCall { seq, .. }
+            | AgentVisibleItem::ToolResult { seq, .. }
+            | AgentVisibleItem::Summary { seq, .. } => *seq,
+        }
+    }
+}
+
+/// Walk the conversation tree backward from `active_tip` to the root,
+/// returning the active branch in chronological (root→tip) order.
+///
+/// `active_tip = None` means "the last entry" (the linear default) — every
+/// entry is on the branch, so the whole log is returned in order.  `Some(tip)`
+/// follows `parent` pointers from `tip` to the root, collecting ancestors;
+/// entries not on that chain (sibling branches) are excluded.
+///
+/// Returns owned entries (cloned) so the result can outlive the log lock.
+pub fn collect_branch(log: &[LogEntry], active_tip: Option<u64>) -> Vec<LogEntry> {
+    let Some(tip) = active_tip.or_else(|| log.last().map(|e| e.seq)) else {
+        return Vec::new();
+    };
+    let by_seq: HashMap<u64, &LogEntry> =
+        log.iter().map(|e| (e.seq, e)).collect();
+    let mut branch: Vec<&LogEntry> = Vec::new();
+    let mut cur = Some(tip);
+    while let Some(seq) = cur {
+        let Some(entry) = by_seq.get(&seq) else {
+            break;
+        };
+        cur = entry.parent;
+        branch.push(entry);
+    }
+    branch.reverse();
+    branch.into_iter().cloned().collect()
+}
+
+/// Build the agent-visible conversation from the transaction log.
+///
+/// This is the **single source of truth** for projecting the log into
+/// "what the LLM sees."  Both the server (via `replay_visible`) and the
+/// web UI (via `build_messages`) consume this function.
+///
+/// Applies, in order:
+/// 1. **Branch selection** — walks `active_tip` to collect the active branch
+/// 2. **Turn buffering** — accumulates content events until `TurnEnded`
+/// 3. **Turn commit/drop** — `Cancelled { prompt: Some }` drops the turn
+/// 4. **Compaction** — removes covered items, inserts a `Summary`
+/// 5. **Tool summarization** — replaces a call+result pair with a `Summary`
+/// 6. **Edit/Delete** — modifies or removes items
+/// 7. **Orphan cleanup** — drops unpaired tool calls/results
+///
+/// The output is a flat list of **individual items** — consecutive items are
+/// not merged.  The server wrapper merges consecutive items of the same role
+/// for provider compatibility.  The web UI wraps them individually in
+/// reactive signals.
+///
+/// **⚠️ Important:** all changes to how the agent's view is derived from the
+/// log must be made here, not in the consumers.  The server-side
+/// `replay_visible` and the web UI's `build_messages` are thin wrappers that
+/// must not duplicate interpretation logic.
+pub fn build_agent_view(
+    entries: &[LogEntry],
+    active_tip: Option<u64>,
+) -> Vec<AgentVisibleItem> {
+    let branch = collect_branch(entries, active_tip);
+    build_agent_view_from_branch(&branch)
+}
+
+/// Core replay on a pre-collected branch.
+fn build_agent_view_from_branch(branch: &[LogEntry]) -> Vec<AgentVisibleItem> {
+    let mut visible: Vec<AgentVisibleItem> = Vec::new();
+    let mut turn: Vec<AgentVisibleItem> = Vec::new();
+    // Pending assistant text chunks (multiple `AssistantText` events before a
+    // `ToolCall` or `TurnEnded`).  We track the seq of the first chunk so the
+    // item carries the right seq for overlay/compaction targeting.
+    let mut pending_text: Vec<(u64, String)> = Vec::new();
+
+    /// Flush pending assistant text into the turn buffer as individual
+    /// `AssistantText` items.
+    fn flush_pending_text(turn: &mut Vec<AgentVisibleItem>, pending: &mut Vec<(u64, String)>) {
+        for (seq, text) in pending.drain(..) {
+            turn.push(AgentVisibleItem::AssistantText {
+                seq,
+                content: text,
+            });
+        }
+    }
+
+    for entry in branch {
+        match &entry.event {
+            SessionEvent::TurnEnded { reason } => {
+                flush_pending_text(&mut turn, &mut pending_text);
+                match reason {
+                    TurnEndReason::Cancelled { prompt: Some(_) } => {
+                        // No work committed — discard the whole turn.
+                        turn.clear();
+                    }
+                    // Completed / StreamEnded / Cancelled { None } /
+                    // MaxTurnsExceeded / Error — the turn's work is
+                    // agent-visible.
+                    _ => visible.append(&mut turn),
+                }
+            }
+
+            // A compaction replaces a range of agent-visible items with a
+            // rolling summary.  `covers` references the seqs of the *current*
+            // visible items (including prior summaries), so a simple `retain`
+            // is correct even for nested compactions.
+            SessionEvent::Compacted {
+                summary, covers, ..
+            } => {
+                let cover_set: HashSet<u64> = covers.iter().copied().collect();
+                visible.retain(|i| !cover_set.contains(&i.seq()));
+                visible.push(AgentVisibleItem::Summary {
+                    seq: entry.seq,
+                    content: summary.clone(),
+                });
+            }
+
+            // A single tool call+result pair has been summarized.  Replaces
+            // the pair (targeted by `id`) with the summary.
+            SessionEvent::ToolSummarized { id, summary, .. } => {
+                // Check whether the id exists at all — if both halves are
+                // already gone (e.g. swept by a prior compaction), this is
+                // a no-op.
+                let has_call = visible.iter().any(|i| {
+                    matches!(i, AgentVisibleItem::ToolCall { id: call_id, .. } if call_id == id)
+                });
+                let has_result = visible.iter().any(|i| {
+                    matches!(i, AgentVisibleItem::ToolResult { id: result_id, .. } if result_id == id)
+                });
+                if !has_call && !has_result {
+                    continue;
+                }
+
+                // Snapshot positions before removal so we know where to
+                // insert the summary.
+                let call_pos = visible.iter().position(|i| {
+                    matches!(i, AgentVisibleItem::ToolCall { id: call_id, .. } if call_id == id)
+                });
+                // Only used as a fallback; the result is normally after the
+                // call, so `call_pos` is the right insertion site.
+                let result_pos = visible.iter().position(|i| {
+                    matches!(i, AgentVisibleItem::ToolResult { id: result_id, .. } if result_id == id)
+                });
+
+                // Remove both call and result.
+                visible.retain(|i| match i {
+                    AgentVisibleItem::ToolCall { id: call_id, .. } => call_id != id,
+                    AgentVisibleItem::ToolResult { id: result_id, .. } => result_id != id,
+                    _ => true,
+                });
+
+                let summary_item = AgentVisibleItem::Summary {
+                    seq: entry.seq,
+                    content: summary.clone(),
+                };
+                // Insert at the call's position; fall back to the result's
+                // position if the call was already gone (shouldn't normally
+                // happen).  Both positions are from before `retain` and
+                // remain valid because only the call and result (both at or
+                // after these positions) were removed.
+                match call_pos.or(result_pos) {
+                    Some(pos) => visible.insert(pos, summary_item),
+                    None => visible.push(summary_item),
+                }
+            }
+
+            // ── overlay events ──
+            SessionEvent::Edited {
+                target,
+                replacement,
+            } => {
+                apply_edit_agent(&mut visible, branch, *target, replacement);
+            }
+            SessionEvent::Deleted { target } => {
+                apply_delete_agent(&mut visible, branch, *target);
+            }
+
+            // `SystemPrompt`, `ContextSnapshot`, `ModelChanged`, `HistoryComplete`,
+            // `SessionInfo`, `SessionState`, `ContextUsage` — metadata, not
+            // conversation content.  Fall through to the turn buffer (they
+            // become no-ops there).
+            _ => feed_into_turn(&mut turn, &mut pending_text, entry),
+        }
+    }
+
+    // NOTE: deliberately do NOT commit a trailing un-terminated turn — the
+    // LLM appends the current prompt itself, so including the open turn
+    // would duplicate the prompt.
+
+    drop_orphaned_tool_pairs_agent(&mut visible);
+
+    visible
+}
+
+/// Feed a log entry into the current turn buffer.
+fn feed_into_turn(
+    turn: &mut Vec<AgentVisibleItem>,
+    pending_text: &mut Vec<(u64, String)>,
+    entry: &LogEntry,
+) {
+    match &entry.event {
+        SessionEvent::UserPrompt { content, .. } => {
+            turn.push(AgentVisibleItem::UserText {
+                seq: entry.seq,
+                content: content.clone(),
+            });
+        }
+        SessionEvent::AssistantText(text) => {
+            // Accumulate consecutive text chunks.  Each chunk becomes its own
+            // item (the server wrapper merges them later for provider compat).
+            pending_text.push((entry.seq, text.clone()));
+        }
+        SessionEvent::ToolCall {
+            id,
+            name,
+            arguments,
+        } => {
+            // Flush pending text first — tool calls are assistant-role,
+            // and we want text chunks before them to be separate items.
+            flush_pending_text_inline(turn, pending_text);
+            turn.push(AgentVisibleItem::ToolCall {
+                seq: entry.seq,
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            });
+        }
+        SessionEvent::ToolResult { id, content } => {
+            flush_pending_text_inline(turn, pending_text);
+            turn.push(AgentVisibleItem::ToolResult {
+                seq: entry.seq,
+                id: id.clone(),
+                content: content.clone(),
+            });
+        }
+        // Metadata / control events do not contribute messages.
+        _ => {}
+    }
+}
+
+#[inline]
+fn flush_pending_text_inline(
+    turn: &mut Vec<AgentVisibleItem>,
+    pending: &mut Vec<(u64, String)>,
+) {
+    for (seq, text) in pending.drain(..) {
+        turn.push(AgentVisibleItem::AssistantText {
+            seq,
+            content: text,
+        });
+    }
+}
+
+// ── orphan cleanup ─────────────────────────────────────────────────
+
+/// Defence in depth: drop any `ToolCall` whose `ToolResult` is absent (or
+/// vice-versa).  Catches in-flight tool calls from cancelled-with-work turns
+/// and imperfect `Deleted` overlays.
+fn drop_orphaned_tool_pairs_agent(visible: &mut Vec<AgentVisibleItem>) {
+    let mut call_ids: HashSet<String> = HashSet::new();
+    let mut result_ids: HashSet<String> = HashSet::new();
+    for item in visible.iter() {
+        match item {
+            AgentVisibleItem::ToolCall { id, .. } => {
+                call_ids.insert(id.clone());
+            }
+            AgentVisibleItem::ToolResult { id, .. } => {
+                result_ids.insert(id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let orphan_calls: HashSet<&str> = call_ids
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|id| !result_ids.contains(*id))
+        .collect();
+    let orphan_results: HashSet<&str> = result_ids
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|id| !call_ids.contains(*id))
+        .collect();
+
+    if orphan_calls.is_empty() && orphan_results.is_empty() {
+        return;
+    }
+
+    visible.retain(|item| match item {
+        AgentVisibleItem::ToolCall { id, .. } => !orphan_calls.contains(id.as_str()),
+        AgentVisibleItem::ToolResult { id, .. } => !orphan_results.contains(id.as_str()),
+        _ => true,
+    });
+}
+
+// ── edit/delete overlay application ─────────────────────────────────
+//
+// These operate on the committed agent-visible set (after turn commit).
+// Tool calls and results are targeted by seq — we look up the event payload
+// in the log to get the tool-call id, then operate by id (since multiple
+// items can share a seq after merging… but in the agent view items are
+// individual, so seq match also works for non-tool targets).
+
+/// Find the event payload at `target` seq in the log.
+fn log_event_at<'a>(log: &'a [LogEntry], target: u64) -> Option<&'a SessionEvent> {
+    log.iter().find(|e| e.seq == target).map(|e| &e.event)
+}
+
+/// Apply a `Deleted` overlay: hide `target` from the agent-visible set.
+fn apply_delete_agent(visible: &mut Vec<AgentVisibleItem>, log: &[LogEntry], target: u64) {
+    let Some(event) = log_event_at(log, target) else {
+        return; // target not in the log — no-op.
+    };
+    match event {
+        SessionEvent::ToolCall { id, .. } => {
+            visible.retain(|i| !matches!(i, AgentVisibleItem::ToolCall { id: call_id, .. } if call_id == id));
+        }
+        SessionEvent::ToolResult { id, .. } => {
+            visible.retain(|i| !matches!(i, AgentVisibleItem::ToolResult { id: result_id, .. } if result_id == id));
+        }
+        _ => {
+            visible.retain(|i| i.seq() != target);
+        }
+    }
+}
+
+/// Apply an `Edited` overlay: replace `target`'s content with `replacement`.
+fn apply_edit_agent(
+    visible: &mut [AgentVisibleItem],
+    log: &[LogEntry],
+    target: u64,
+    replacement: &EditContent,
+) {
+    // Tool targets need the id from the log.
+    if let Some(event) = log_event_at(log, target) {
+        match (event, replacement) {
+            (
+                SessionEvent::ToolCall { id, .. },
+                EditContent::ToolCall { name, arguments },
+            ) => {
+                for item in visible.iter_mut() {
+                    if let AgentVisibleItem::ToolCall {
+                        id: call_id,
+                        name: item_name,
+                        arguments: item_args,
+                        ..
+                    } = item
+                        && call_id == id
+                    {
+                        *item_name = name.clone();
+                        *item_args = arguments.clone();
+                    }
+                }
+                return;
+            }
+            (SessionEvent::ToolResult { id, .. }, EditContent::ToolResult { content }) => {
+                for item in visible.iter_mut() {
+                    if let AgentVisibleItem::ToolResult {
+                        id: result_id,
+                        content: item_content,
+                        ..
+                    } = item
+                        && result_id == id
+                    {
+                        *item_content = content.clone();
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Text replacement — operates on the item whose seq matches.
+    let EditContent::Text(text) = replacement else {
+        return;
+    };
+    let Some(item) = visible.iter_mut().find(|i| i.seq() == target) else {
+        return;
+    };
+    let text = text.clone();
+    match item {
+        AgentVisibleItem::UserText { content, .. }
+        | AgentVisibleItem::AssistantText { content, .. }
+        | AgentVisibleItem::Summary { content, .. } => {
+            *content = text;
+        }
+        // ToolCall/ToolResult edits are handled above.
+        _ => {}
+    }
 }

@@ -359,11 +359,28 @@ pub struct AppState {
     /// `SystemPrompt` event in the transaction log.  `None` until history
     /// replay delivers it.  Shown in LLM view above the message log.
     pub system_prompt: RwSignal<Option<String>>,
+
+    /// The agent-visible message list as a flat projection, built from
+    /// [`goop_shared::build_agent_view`] during history catch-up.  This
+    /// matches the server's `replay_log` output exactly: no groups, no
+    /// UI-only markers.  Stored for reference alongside the chat-view
+    /// `messages` list which wraps the same content in expandable groups
+    /// and reactive signals.
+    ///
+    /// Updated only at `HistoryComplete` — live events update `messages`
+    /// (the grouped list).  See [`Self::build_messages`] and
+    /// [`goop_shared::build_agent_view`] for the shared interpretation
+    /// logic.
+    pub agent_messages: RwSignal<Vec<UiMessage>>,
 }
 
 /// Result of pre-forming buffered history entries into UI state.
 struct BuildResult {
     messages: Vec<UiMessage>,
+    /// Flat agent-visible messages from [`goop_shared::build_agent_view`].
+    /// Matches the server's `replay_log` output exactly — no groups, no
+    /// UI-only markers.  Used by the LLM view (👁).
+    agent_messages: Vec<UiMessage>,
     session_name: Option<String>,
     running: bool,
     turn_state: TurnState,
@@ -402,6 +419,7 @@ impl AppState {
             llm_view: RwSignal::new(false),
             compacting: RwSignal::new(false),
             system_prompt: RwSignal::new(None),
+            agent_messages: RwSignal::new(Vec::new()),
         }
     }
 
@@ -622,7 +640,11 @@ impl AppState {
             return;
         };
         let llm_view = self.llm_view.get_untracked();
-        let covers: Vec<u64> = displayed_messages(&self.messages.get_untracked(), llm_view)
+        let covers: Vec<u64> = displayed_messages(
+            &self.messages.get_untracked(),
+            &self.agent_messages.get_untracked(),
+            llm_view,
+        )
             .iter()
             .enumerate()
             .filter(|(i, _)| *i >= s && *i <= e)
@@ -779,6 +801,7 @@ impl AppState {
                 self.turn_state.set(result.turn_state);
                 self.streaming_text.set(String::new());
                 self.messages.set(result.messages);
+                self.agent_messages.set(result.agent_messages);
                 self.context_usage.set(result.context_usage);
                 self.system_prompt.set(result.system_prompt);
 
@@ -801,19 +824,27 @@ impl AppState {
 
     // ── History pre-forming (pure, no signals) ────────────────────
 
-    /// Convert a sequence of `LogEntry` envelopes into a flat `Vec<UiMessage>`,
-    /// plus the final session name, running state, and turn state.
+    /// Convert catch-up `LogEntry` envelopes into `UiMessage` lists.
     ///
-    /// Pure function — no reactive side effects.  `AssistantText` chunks
-    /// are concatenated into a single `AssistantFinal`; tool calls and
-    /// results bracket them properly.  The returned `TurnState` reflects
-    /// whether the last message is a `Thinking` that was never followed
-    /// by a content event — this lets the caller initialise the live FSM
-    /// correctly.
+    /// Pure function — no reactive side effects.  Produces two message lists:
     ///
-    /// Each entry's real `seq` (from the envelope) is used — not a counted
-    /// value — so overlay/compaction targeting stays correct even on a forked
-    /// branch whose seqs are non-contiguous.
+    /// - `messages` — the chat-view list with expandable groups for compaction
+    ///   and tool summaries, plus UI-only markers (Thinking, FinalResponse,
+    ///   etc.).  This is what the chat view renders.
+    ///
+    /// - `agent_messages` — the flat agent-visible projection, built from
+    ///   [`goop_shared::build_agent_view`].  This matches the server's
+    ///   `replay_log` output exactly: no groups, no UI-only markers.  Stored
+    ///   for reference and potential future use.
+    ///
+    /// **⚠️ Interpretation logic** (compaction, tool summarization, turn
+    /// buffering, edit/delete, orphan cleanup) is defined in
+    /// [`goop_shared::build_agent_view`].  This function must not duplicate
+    /// or diverge from those rules — any change to how the agent's view is
+    /// derived from the log belongs in the shared function first.  The
+    /// `messages` list here applies the same rules but wraps results in
+    /// expandable groups and reactive signals for rendering; the
+    /// `agent_messages` list is a thin mapping from `AgentVisibleItem`.
     fn build_messages(entries: &[LogEntry], start_id: usize) -> BuildResult {
         let mut messages: Vec<UiMessage> = Vec::with_capacity(entries.len());
         let mut session_name: Option<String> = None;
@@ -1015,8 +1046,13 @@ impl AppState {
             &mut next_id,
         );
 
+        // Build the flat agent-visible list from the shared function — this
+        // is exactly what the LLM sees (no groups, no UI markers).
+        let agent_messages = Self::build_agent_ui_messages(entries, start_id);
+
         BuildResult {
             messages,
+            agent_messages,
             session_name,
             running,
             turn_state: turn,
@@ -1026,6 +1062,96 @@ impl AppState {
         }
     }
 
+    /// Build a flat `Vec<UiMessage>` from [`goop_shared::build_agent_view`].
+    ///
+    /// This is the single source of truth for "what the LLM sees" — it
+    /// matches the server's `replay_log` output exactly.  No groups, no
+    /// UI-only markers (Thinking, FinalResponse, etc.), no edit/delete
+    /// signal overlays (the content is already baked in by the shared
+    /// function).
+    ///
+    /// ⚠️ Interpretation changes belong in [`goop_shared::build_agent_view`],
+    /// not here.  This function is a thin mapper from `AgentVisibleItem` to
+    /// `UiMessage` variants.
+    fn build_agent_ui_messages(entries: &[LogEntry], start_id: usize) -> Vec<UiMessage> {
+        let items = goop_shared::build_agent_view(entries, None);
+        let mut out: Vec<UiMessage> = Vec::with_capacity(items.len());
+        let mut next_id = start_id;
+
+        for item in &items {
+            match item {
+                goop_shared::AgentVisibleItem::UserText { seq, content } => {
+                    out.push(UiMessage::UserPrompt {
+                        id: next_id,
+                        seq: *seq,
+                        content: content.clone(),
+                        deleted: RwSignal::new(false),
+                        edit: RwSignal::new(None),
+                    });
+                    next_id += 1;
+                }
+                goop_shared::AgentVisibleItem::AssistantText { seq, content } => {
+                    out.push(UiMessage::AssistantFinal {
+                        id: next_id,
+                        seq: *seq,
+                        raw: content.clone(),
+                        deleted: RwSignal::new(false),
+                        edit: RwSignal::new(None),
+                    });
+                    next_id += 1;
+                }
+                goop_shared::AgentVisibleItem::ToolCall {
+                    seq,
+                    id: tool_id,
+                    name,
+                    arguments,
+                } => {
+                    let args = flatten_args(arguments);
+                    out.push(UiMessage::ToolCall {
+                        id: next_id,
+                        seq: *seq,
+                        tool_id: tool_id.clone(),
+                        name: name.clone(),
+                        args,
+                        result: RwSignal::new(None),
+                        result_seq: RwSignal::new(None),
+                        expanded: RwSignal::new(false),
+                        deleted: RwSignal::new(false),
+                        edit: RwSignal::new(None),
+                        result_edit: RwSignal::new(None),
+                    });
+                    next_id += 1;
+                }
+                goop_shared::AgentVisibleItem::ToolResult { seq, id, content } => {
+                    // Attach result to the most-recent ToolCall without one.
+                    if let Some(UiMessage::ToolCall {
+                        result: r,
+                        result_seq: rs,
+                        ..
+                    }) = out.last_mut()
+                        && r.get_untracked().is_none()
+                    {
+                        r.set(Some(content.clone()));
+                        rs.set(Some(*seq));
+                    }
+                    let _ = id;
+                }
+                goop_shared::AgentVisibleItem::Summary { seq, content, .. } => {
+                    out.push(UiMessage::AssistantFinal {
+                        id: next_id,
+                        seq: *seq,
+                        raw: content.clone(),
+                        deleted: RwSignal::new(false),
+                        edit: RwSignal::new(None),
+                    });
+                    next_id += 1;
+                }
+            }
+        }
+
+        out
+    }
+
     // ── Live event dispatch ───────────────────────────────────────
 
     /// Dispatch a single `SessionEvent` into UI state.
@@ -1033,6 +1159,14 @@ impl AppState {
     /// Only called for live events (after `HistoryComplete`).
     /// An exhaustive match ensures every new event variant added to
     /// `goop-shared` produces a compile error here until handled.
+    ///
+    /// **⚠️ Interpretation logic** (compaction, tool summarization, turn
+    /// buffering, edit/delete) is defined in [`goop_shared::build_agent_view`].
+    /// This function mirrors those rules to update the chat-view `messages`
+    /// list with reactive signals and UI-only markers.  Any change to how
+    /// the agent's view is derived from the log must be made in the shared
+    /// function first — the `apply_compaction`, `apply_tool_summary`,
+    /// `apply_edit`, and `apply_delete` helpers here must stay in sync.
     fn dispatch(&self, entry: LogEntry) {
         // The real transaction-log seq from the envelope — not a counted
         // value.  This stays correct on a forked branch whose seqs are
@@ -1349,10 +1483,14 @@ fn flatten_args(arguments: &serde_json::Value) -> Vec<(String, String)> {
 /// the full conversation as if compaction never happened.
 ///
 /// **LLM view** (`llm_view = true`): groups are kept (summaries visible),
-/// and deleted messages are filtered out — this is exactly what the agent
-/// sees.  Selecting a `CompactedGroup` here and compacting it again is
-/// valid; it creates a deeper rolling summary.
-pub fn displayed_messages(msgs: &[UiMessage], llm_view: bool) -> Vec<UiMessage> {
+/// and deleted messages are filtered out.  This approximates what the agent
+/// sees — the true flat projection (without groups or UI markers) is in
+/// `agent_msgs`, built from [`goop_shared::build_agent_view`].
+pub fn displayed_messages(
+    msgs: &[UiMessage],
+    _agent_msgs: &[UiMessage],
+    llm_view: bool,
+) -> Vec<UiMessage> {
     if llm_view {
         msgs.iter().filter(|m| !m.is_deleted()).cloned().collect()
     } else {
