@@ -756,14 +756,31 @@ impl Session {
             *guard = Some(cancel_tx);
         }
 
-        // Format the conversation as text embedded in the system prompt
-        // (goose-style), so the LLM reads a transcript rather than acting
-        // as a conversation participant.
-        let messages_text = memory::format_messages_for_compacting(&messages);
-        let system_prompt =
-            COMPACTION_SYSTEM_PROMPT.replace("{{ messages }}", &messages_text);
-        let user_prompt =
-            "Please summarize the conversation history provided in the system prompt.";
+        // Choose the summarization path.  Tool-only ranges (no user text, no
+        // assistant text) get the lighter multi-tool prompt — shorter system
+        // instruction, tool text as the user message.  Mixed ranges get the
+        // full compaction prompt with the transcript embedded in the system
+        // prompt.
+        let tool_only = is_tool_only(&messages);
+        let (system_prompt, user_prompt): (String, String) = if tool_only {
+            let messages_text = memory::format_messages_for_compacting(&messages);
+            (
+                MULTI_TOOL_COMPACT_PROMPT.to_string(),
+                format!("Summarize these tool interactions:\n\n{messages_text}"),
+            )
+        } else {
+            let messages_text = memory::format_messages_for_compacting(&messages);
+            (
+                COMPACTION_SYSTEM_PROMPT.replace("{{ messages }}", &messages_text),
+                "Please summarize the conversation history provided in the system prompt."
+                    .to_string(),
+            )
+        };
+
+        tracing::info!(
+            "manual compaction: {} messages, tool_only={tool_only}",
+            messages.len()
+        );
 
         // Race the summarization against cancellation.
         let outcome = tokio::select! {
@@ -773,7 +790,7 @@ impl Session {
                 tracing::info!("manual compaction cancelled");
                 None
             }
-            result = self.agent.summarize(system_prompt, user_prompt) => {
+            result = self.agent.summarize(system_prompt, &user_prompt) => {
                 Some(result)
             }
         };
@@ -1589,12 +1606,6 @@ pub(crate) fn next_session_name() -> String {
     format!("{today}_{:03}", max_seq + 1)
 }
 
-/// System prompt for compaction summarization (embedded at compile time).
-///
-/// Instructs the model to preserve the technical substance of the
-/// conversation — decisions, code, file paths, errors, pending work —
-/// while dropping narration and redundant tool output, so the summary can
-/// stand in for the earlier conversation.
 // ── compaction prompts ──────────────────────────────────────────────
 //
 // The compaction system prompt is derived from goose's compaction.md
@@ -1611,41 +1622,7 @@ pub(crate) fn next_session_name() -> String {
 
 /// System prompt for full compaction (auto + manual).
 /// `{{ messages }}` is replaced with the formatted conversation text.
-const COMPACTION_SYSTEM_PROMPT: &str = "\
-You are summarizing an earlier portion of a conversation between a user and \
-an AI coding assistant (goop).  An LLM context limit was reached while the \
-user was in a working session with you.  Generate a version of the messages \
-below that keeps everything needed to continue the session.  The summary will \
-only be read by you on the next exchange, so it is ok to make it longer than \
-a normal human summary.  Do not exclude any information that might be \
-important to continuing a working session.
-
-**Conversation History:**
-{{ messages }}
-
-Wrap reasoning in `<analysis>` tags, then produce the final summary.  In your \
-analysis:
-- Review the conversation chronologically.
-- For each part, log: user goals and requests; your method and solution; key \
-  decisions and designs; file names, code, signatures, errors, fixes.
-- Highlight user feedback and revisions.
-- Confirm completeness and accuracy.
-
-After the analysis, include the following sections:
-
-1. **User Intent** — All goals and requests.
-2. **Technical Concepts** — All discussed tools, methods.
-3. **Files + Code** — Viewed/edited files, full code, change justifications.
-4. **Errors + Fixes** — Bugs, resolutions, user-driven changes.
-5. **Problem Solving** — Issues solved or in progress.
-6. **User Messages** — All user messages including tool calls, but truncate \
-   long tool call arguments or results.
-7. **Pending Tasks** — All unresolved user requests.
-8. **Current Work** — Active work at summary request time: filenames, code, \
-   alignment to latest instruction.
-9. **Next Step** — *Include only if* it directly continues the user's instruction.
-
-> No new ideas unless the user confirmed them.";
+static COMPACTION_SYSTEM_PROMPT: &str = include_str!("prompts/compaction.md");
 
 /// Continuation instruction appended after a full auto-compaction so the
 /// agent knows it is working from a summary.  The most-recent user message is
@@ -1671,22 +1648,40 @@ const MANUAL_COMPACT_CONTINUATION_TEXT: &str =
 /// as the user message, not embedded here (unlike full compaction).  See
 /// goose's `summarize_tool_call` system prompt for the original
 /// (BSD-3-Clause).
-const TOOL_PAIR_SYSTEM_PROMPT: &str = "\
-Your task is to summarize a tool call & response pair from a conversation \
-between a user and an AI coding assistant (goop).  The tool call and its \
-result follow as the user message.
+static TOOL_PAIR_SYSTEM_PROMPT: &str = include_str!("prompts/tool_pair.md");
 
-Reply with a single message that describes what happened.  Typically a tool \
-call asks for something using a bunch of parameters and then the result is \
-also some structured output.  So the tool might ask to read a file and the \
-reply might be the file contents.  You could reply with something like:
+/// System prompt for **manual multi-tool compaction** — the user selected a
+/// range of messages that are all tool calls and results (no user text, no
+/// assistant text).  Like the tool-pair prompt, formatted tool text goes in
+/// the **user message**; this is just the short instruction.
+static MULTI_TOOL_COMPACT_PROMPT: &str =
+    include_str!("prompts/multi_tool_compact.md");
 
-\"Read config.rs (180 lines) — established the tool group defaults and \
-compaction threshold.\"
-
-Keep it to a few sentences at most.  Preserve facts that matter for ongoing \
-work (file paths, counts, error messages, key findings).  Drop verbatim file \
-contents and raw command output.";
+/// Returns true when every message in `messages` contains **only** tool
+/// content — no user text, no assistant text.  This detects ranges that are
+/// better served by the lighter multi-tool prompt than the full compaction
+/// prompt.
+fn is_tool_only(messages: &[Message]) -> bool {
+    for m in messages {
+        match m {
+            Message::User { content } => {
+                if content.iter().any(|c| !matches!(c, message::UserContent::ToolResult(_))) {
+                    return false;
+                }
+            }
+            Message::Assistant { content, .. } => {
+                if content
+                    .iter()
+                    .any(|c| !matches!(c, message::AssistantContent::ToolCall(_)))
+                {
+                    return false;
+                }
+            }
+            _ => return false, // System, etc. — not tool-only.
+        }
+    }
+    !messages.is_empty()
+}
 
 /// Resolve the compaction token threshold from the merged config.
 ///
