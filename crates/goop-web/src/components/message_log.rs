@@ -168,7 +168,7 @@ pub fn MessageLog() -> impl IntoView {
             }
             let text = state.streaming_text.get_untracked();
             let prev_len = streamed_len.get_untracked();
-            if let Some(el) = stream_ref.get() {
+            if let Some(el) = stream_ref.get_untracked() {
                 if text.is_empty() {
                     el.set_text_content(None);
                     streamed_len.set(0);
