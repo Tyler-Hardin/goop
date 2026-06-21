@@ -307,13 +307,21 @@ The web UI shows a session sidebar for switching between sessions.
 - **Manual range compaction** (`src/session.rs` + `src/memory/compaction.rs`)
   — the user can manually select a range of messages in the web UI and
   compact them into a summary.  `ClientMessage::CompactRange { covers }`
-  triggers `Session::compact_range`, which collects the covered
-  agent-visible messages (`covered_messages` pure helper in
-  `memory/compaction.rs`), calls `AnyAgent::summarize`, and appends a
-  `Compacted { manual: true, .. }` event.  Replay is unchanged — `covers`
-  is an arbitrary `Vec<u64>`, so manual and auto compaction use the same
-  path.  The web UI uses a select mode (header ⊟ toggle → per-message
-  checkboxes → `SelectBar` footer with ✦ Compact / ✕ Done).  See §2.11 of
+  triggers `Session::compact_range`, which **queues the action through
+  `drain_queue`** (same channel as prompts) so it is serialized — no races
+  with concurrent prompt processing.  The queued action emits the full
+  lifecycle: `Thinking` → `Compacted { manual: true, .. }` → `TurnEnded`,
+  so the client shows the `Running` button state (with Cancel) and exits
+  select mode only when the compaction completes.  Cancellation uses a
+  `tokio::select!` race between the `summarize` call and `cancel_rx`,
+  allowing the user to abort a long-running summarization.  Validation
+  (`covers.len() >= 2`, `covered_messages` must return non-empty) produces
+  `TurnEnded::Error` with actionable messages on mismatch.  Replay is
+  unchanged — `covers` is an arbitrary `Vec<u64>`, so manual and auto
+  compaction use the same path.  The web UI uses a select mode (header ⊟
+  toggle → per-message checkboxes → `SelectBar` footer with ✦ Compact /
+  ✕ Done).  `AppState::compacting` (a `RwSignal`) tracks in-flight
+  compactions; `TurnEnded` checks it to exit select mode.  See §2.11 of
   the redesign doc.
 - **Context snapshots** (`src/session.rs`) — before each turn the session
   emits `ContextSnapshot { seqs, model }`, recording which events formed
@@ -689,8 +697,11 @@ Two independent history systems:
   a no-op when nothing completed).  The `MaxTurnsError` is surfaced with
   an actionable message noting that work was saved; other errors are
   shown verbatim.
-- **Prompt queue.** `Session::submit()` sends into an unbounded mpsc;
-  a background `drain_queue()` task processes them serially.
+- **Prompt queue.**  All actions (prompts and manual compaction) go through
+  a single unbounded mpsc channel as `QueuedAction` enum variants.  A
+  background `drain_queue()` task processes them serially — no races, and
+  every action emits lifecycle events (`Thinking` + `TurnEnded`) so the
+  client shows proper progress and can cancel.
 - **History replay.** `subscribe_all()` returns a `SessionSubscriber`
   that replays all past events before yielding live ones. This lets
   late-joining web clients catch up.

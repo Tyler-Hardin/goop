@@ -83,15 +83,30 @@ impl SessionSubscriber {
 
 // ── session ─────────────────────────────────────────────────────
 
-/// A queued prompt: the text, its source, an optional fork point (the seq to
-/// branch from — `None` for a normal linear prompt), and an optional
-/// completion signal for the submitter.
-type QueuedPrompt = (
-    String,
-    PromptSource,
-    Option<u64>,
-    Option<oneshot::Sender<()>>,
-);
+/// A queued action drained serially by the background worker.
+///
+/// All prompts and compaction requests go through this channel so only one
+/// action runs at a time — no races with `drain_queue`, and every action
+/// emits proper lifecycle events (`Thinking` + `TurnEnded`) so the client can
+/// show progress and cancel.
+enum QueuedAction {
+    /// Submit a text prompt.
+    Prompt {
+        content: String,
+        source: PromptSource,
+        /// Seq of the fork point (the parent of the target), or `None` for a
+        /// normal linear prompt.
+        fork_point: Option<u64>,
+        /// Fires when the turn completes.
+        done: Option<oneshot::Sender<()>>,
+    },
+    /// Manually compact a range of agent-visible messages into a summary.
+    CompactRange {
+        covers: Vec<u64>,
+        /// Fires when the compaction finishes (success or failure).
+        done: Option<oneshot::Sender<()>>,
+    },
+}
 
 /// Holds the agent, conversation state, and a serialised prompt queue.
 ///
@@ -141,8 +156,8 @@ pub struct Session {
     tool_summarizer: Option<Arc<crate::model::AnyAgent>>,
 
     /// Push a prompt here from any view; the background worker drains it.
-    /// See [`QueuedPrompt`] for the fields.
-    submit_tx: mpsc::UnboundedSender<QueuedPrompt>,
+    /// See [`QueuedAction`] for the variants.
+    submit_tx: mpsc::UnboundedSender<QueuedAction>,
 
     /// Set by `cancel()` and consumed by the currently-running turn.
     /// When the sender is dropped or fired, the turn is cancelled.
@@ -399,7 +414,12 @@ impl Session {
     pub fn submit(&self, prompt: impl Into<String>, source: PromptSource) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         // Unbounded send never fails.  No fork point → linear append.
-        let _ = self.submit_tx.send((prompt.into(), source, None, Some(tx)));
+        let _ = self.submit_tx.send(QueuedAction::Prompt {
+            content: prompt.into(),
+            source,
+            fork_point: None,
+            done: Some(tx),
+        });
         rx
     }
 
@@ -433,9 +453,12 @@ impl Session {
         };
         tracing::info!("forking from seq {fork_point} (target {target} replaced)");
         let (tx, _rx) = oneshot::channel();
-        let _ = self
-            .submit_tx
-            .send((content, PromptSource::Web, Some(fork_point), Some(tx)));
+        let _ = self.submit_tx.send(QueuedAction::Prompt {
+            content,
+            source: PromptSource::Web,
+            fork_point: Some(fork_point),
+            done: Some(tx),
+        });
     }
 
     /// Cancel the currently-running LLM turn (if any).
@@ -502,8 +525,12 @@ impl Session {
 
     /// Manually compact a range of agent-visible messages into a summary.
     /// The user selects messages in the UI; `covers` is their seqs.  The
-    /// server collects those messages, calls LLM summarization, and appends a
-    /// [`Compacted`](SessionEvent::Compacted) event with `manual = true`.
+    /// action is queued and processed by [`drain_queue`](Self::drain_queue)
+    /// serially — no race with prompts, and lifecycle events (`Thinking` +
+    /// `TurnEnded`) bracket the summarization so the client can show progress
+    /// and cancel.
+    ///
+    /// Returns a receiver that fires when the compaction completes (or fails).
     /// See §2.11 of the redesign doc.
     ///
     /// Unlike [`maybe_compact`](Self::maybe_compact) (which covers the entire
@@ -511,34 +538,13 @@ impl Session {
     /// range — messages before and after the range remain agent-visible.
     /// Replay is the same either way: `covers` is an arbitrary `Vec<u64>`, so
     /// no special-casing is needed.
-    pub async fn compact_range(&self, covers: Vec<u64>) {
-        if covers.len() < 2 {
-            return;
-        }
-        let items = self.memory.agent_visible_items().await;
-        let messages = memory::covered_messages(&items, &covers);
-        if messages.is_empty() {
-            return;
-        }
-        tracing::info!("manual compaction of {} items", covers.len());
-        match self
-            .agent
-            .summarize(messages, COMPACTION_SYSTEM_PROMPT)
-            .await
-        {
-            Ok(summary) => {
-                self.emit(SessionEvent::Compacted {
-                    summary,
-                    model: self.model_label.clone(),
-                    covers,
-                    manual: true,
-                })
-                .await;
-            }
-            Err(e) => {
-                tracing::warn!("manual compaction failed: {e:#}");
-            }
-        }
+    pub fn compact_range(&self, covers: Vec<u64>) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.submit_tx.send(QueuedAction::CompactRange {
+            covers,
+            done: Some(tx),
+        });
+        rx
     }
 
     /// Submit audio for speech-to-text transcription.
@@ -634,57 +640,167 @@ impl Session {
 
     // ── internals ────────────────────────────────────────────────
 
-    /// Background worker: drain prompts one at a time.
-    async fn drain_queue(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<QueuedPrompt>) {
-        while let Some((prompt, source, fork_point, done)) = rx.recv().await {
-            // Write every prompt to the global history file (all sources).
-            append_prompt_to_history(&prompt).await;
+    /// Background worker: drain prompts and compaction requests one at a time.
+    async fn drain_queue(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<QueuedAction>) {
+        while let Some(action) = rx.recv().await {
+            match action {
+                QueuedAction::Prompt {
+                    content,
+                    source,
+                    fork_point,
+                    done,
+                } => {
+                    // Write every prompt to the global history file (all sources).
+                    append_prompt_to_history(&content).await;
 
-            // ── fork (edit-and-regenerate) ──
-            // Move the active tip to the fork point and signal subscribers to
-            // re-catch-up *before* the new turn's events are appended.  The
-            // Reset carries the fork point so subscribers re-snapshot the
-            // shared prefix deterministically, even if the new turn's entries
-            // have already been appended by the time they process it.
-            //
-            // We do NOT persist the active tip here: basic forking always
-            // continues on the newest branch, whose entries are appended last,
-            // so the default ("last entry") is correct after the turn.  The
-            // tip is only non-default transiently (between this set and the
-            // UserPrompt append); a crash in that window just drops the
-            // in-progress fork, which the user re-triggers.
-            if let Some(tip) = fork_point {
-                let mut log = self.history.lock().await;
-                log.set_active_tip(tip);
-                drop(log);
-                let _ = self.tx.send(ServerMessage::Reset { tip });
+                    // ── fork (edit-and-regenerate) ──
+                    if let Some(tip) = fork_point {
+                        let mut log = self.history.lock().await;
+                        log.set_active_tip(tip);
+                        drop(log);
+                        let _ = self.tx.send(ServerMessage::Reset { tip });
+                    }
+
+                    // Auto-compaction (tier 2) — roll up the prefix if over budget.
+                    self.maybe_compact().await;
+
+                    // Tool-pair summarization (tier 1) — summarise verbose pairs.
+                    self.maybe_summarize_tool_pairs().await;
+
+                    self.emit(SessionEvent::UserPrompt {
+                        content: content.clone(),
+                        source,
+                    })
+                    .await;
+                    self.run_one(&content).await;
+                    // Notify the submitter that this prompt is done.
+                    if let Some(tx) = done {
+                        let _ = tx.send(());
+                    }
+
+                    // If the restart tool was called during this prompt, the
+                    // flag is now set.  Signal the server to shut down gracefully
+                    // and stop processing further prompts.
+                    if crate::server::is_restart_requested() {
+                        crate::server::notify_shutdown();
+                        break;
+                    }
+                }
+                QueuedAction::CompactRange { covers, done } => {
+                    self.compact_range_impl(covers).await;
+                    if let Some(tx) = done {
+                        let _ = tx.send(());
+                    }
+                }
             }
+        }
+    }
 
-            // Compact the agent-visible conversation if it has grown past the
-            // configured budget, so the next turn stays within context.
-            self.maybe_compact().await;
-
-            // Summarize verbose tool pairs (tier-1 compaction) before the
-            // next turn.  No-op when disabled.
-            self.maybe_summarize_tool_pairs().await;
-
-            self.emit(SessionEvent::UserPrompt {
-                content: prompt.clone(),
-                source,
+    /// Actual compaction logic, called from [`drain_queue`](Self::drain_queue).
+    ///
+    /// Emits `Thinking` → `Compacted` (or `Error`) → `TurnEnded` so the
+    /// client sees a normal turn lifecycle: the input button goes to Running
+    /// mode (showing Cancel), and the message log shows a thinking placeholder
+    /// replaced by the result.
+    async fn compact_range_impl(&self, covers: Vec<u64>) {
+        if covers.len() < 2 {
+            tracing::warn!("compact_range: covers too short ({})", covers.len());
+            self.emit(SessionEvent::TurnEnded {
+                reason: TurnEndReason::Error {
+                    message: "Select at least 2 messages to compact.".into(),
+                },
             })
             .await;
-            self.run_one(&prompt).await;
-            // Notify the submitter that this prompt is done.
-            if let Some(tx) = done {
-                let _ = tx.send(());
-            }
+            return;
+        }
 
-            // If the restart tool was called during this prompt, the
-            // flag is now set.  Signal the server to shut down gracefully
-            // and stop processing further prompts.
-            if crate::server::is_restart_requested() {
-                crate::server::notify_shutdown();
-                break;
+        let items = self.memory.agent_visible_items().await;
+        let messages = memory::covered_messages(&items, &covers);
+        if messages.is_empty() {
+            // The covers didn't match any agent-visible items.  This is a
+            // client/server mismatch — the client's displayed message list
+            // got out of sync with the server's agent-visible projection.
+            tracing::warn!(
+                "compact_range: no agent-visible items matched covers={covers:?}; \
+                 agent-visible seqs: {:?}",
+                items.iter().map(|i| i.seq).collect::<Vec<_>>()
+            );
+            self.emit(SessionEvent::TurnEnded {
+                reason: TurnEndReason::Error {
+                    message: "The selected messages are no longer agent-visible. \
+                              They may have been compacted or deleted by a prior action."
+                        .into(),
+                },
+            })
+            .await;
+            return;
+        }
+
+        tracing::info!(
+            "manual compaction of {} messages ({} covers, {} agent-visible items)",
+            messages.len(),
+            covers.len(),
+            items.len()
+        );
+
+        // Emit Thinking so the client enters the "running" state (Cancel
+        // button visible).  We do this *after* validation so the thinking
+        // placeholder doesn't flash for an immediate error.
+        self.emit(SessionEvent::Thinking).await;
+
+        // Set up a cancellation channel for this compaction so the user can
+        // abort a long-running summarization via the Cancel button.
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        {
+            let mut guard = self.cancel_tx.lock().await;
+            *guard = Some(cancel_tx);
+        }
+
+        // Race the summarization against cancellation.
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut cancel_rx => {
+                // User cancelled — drop the in-flight summarization.
+                tracing::info!("manual compaction cancelled");
+                None
+            }
+            result = self.agent.summarize(messages, COMPACTION_SYSTEM_PROMPT) => {
+                Some(result)
+            }
+        };
+
+        // Always clear the cancel channel.
+        self.cancel_tx.lock().await.take();
+
+        match outcome {
+            None => {
+                // Cancelled.
+                self.emit(SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Cancelled { prompt: None },
+                })
+                .await;
+            }
+            Some(Ok(summary)) => {
+                self.emit(SessionEvent::Compacted {
+                    summary,
+                    model: self.model_label.clone(),
+                    covers,
+                    manual: true,
+                })
+                .await;
+                self.emit(SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                })
+                .await;
+            }
+            Some(Err(e)) => {
+                tracing::warn!("manual compaction summarization failed: {e:#}");
+                self.emit(SessionEvent::TurnEnded {
+                    reason: TurnEndReason::Error {
+                        message: format!("Compaction summarization failed: {e}"),
+                    },
+                })
+                .await;
             }
         }
     }
@@ -1633,11 +1749,13 @@ mod compaction_integration_tests {
         // Cover the middle turn: q2 (seq 3) and a2 (seq 4).
         let covers = vec![items[2].seq, items[3].seq];
 
-        session.compact_range(covers).await;
+        session.compact_range_impl(covers).await;
 
         let events = collect_events(&mut rx);
-        assert_eq!(events.len(), 1, "expected one Compacted event");
-        match &events[0] {
+        // compact_range_impl emits: Thinking → Compacted → TurnEnded(Completed)
+        assert_eq!(events.len(), 3, "expected Thinking + Compacted + TurnEnded");
+        let compacted = &events[1]; // second event is Compacted
+        match compacted {
             SessionEvent::Compacted {
                 summary,
                 manual,

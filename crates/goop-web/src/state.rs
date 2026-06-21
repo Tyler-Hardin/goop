@@ -329,6 +329,12 @@ pub struct AppState {
     /// 👁 button in the header.
     pub llm_view: RwSignal<bool>,
 
+    /// `true` while a manual compaction is in progress (queued on the
+    /// server).  When `TurnEnded` arrives and this is set, we exit select
+    /// mode.  Separated from `select_mode` so a regular prompt's
+    /// `TurnEnded` doesn't accidentally dismiss the selection UI.
+    pub compacting: RwSignal<bool>,
+
     /// The session's system prompt (preamble), extracted from the
     /// `SystemPrompt` event in the transaction log.  `None` until history
     /// replay delivers it.  Shown in LLM view above the message log.
@@ -374,6 +380,7 @@ impl AppState {
             selection_start: RwSignal::new(None),
             selection_end: RwSignal::new(None),
             llm_view: RwSignal::new(false),
+            compacting: RwSignal::new(false),
             system_prompt: RwSignal::new(None),
         }
     }
@@ -513,6 +520,7 @@ impl AppState {
 
     /// Exit select mode and clear the selection.
     pub fn exit_select_mode(&self) {
+        self.compacting.set(false);
         self.select_mode.set(false);
         self.selection_start.set(None);
         self.selection_end.set(None);
@@ -610,7 +618,12 @@ impl AppState {
                 serde_json::to_string(&ClientMessage::CompactRange { covers }).unwrap_or_default();
             ws.send_with_str(&msg).ok();
         }
-        self.exit_select_mode();
+        // Don't exit select mode — the compaction is queued on the server.
+        // The server will emit Thinking → Compacted → TurnEnded lifecycle
+        // events.  We enter Running state so the input button shows Cancel;
+        // when TurnEnded arrives we exit select mode.
+        self.btn_state.set(BtnState::Running);
+        self.compacting.set(true);
     }
 
     /// Send raw WAV audio to the server for speech-to-text transcription.
@@ -1161,6 +1174,11 @@ impl AppState {
                         self.messages
                             .update(|ms| ms.push(UiMessage::Error { id, msg }));
                     }
+                }
+                // If this TurnEnded closes a manual compaction, exit select mode.
+                if self.compacting.get_untracked() {
+                    self.compacting.set(false);
+                    self.exit_select_mode();
                 }
                 self.turn_state.set(TurnState::Idle);
             }

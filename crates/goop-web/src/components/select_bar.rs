@@ -8,17 +8,22 @@ use crate::state::AppState;
 /// "✦ Compact" button that sends a `CompactRange` request to the server,
 /// plus a "✕ Done" button that exits select mode without compacting.
 ///
-/// The compact button is disabled until a range of ≥ 2 messages is selected.
+/// The compact button is disabled until a range of ≥ 2 messages is selected,
+/// and hidden entirely once compaction is in progress (server-side queue).
+/// During compaction a "Compacting…" label with a Cancel button is shown.
 /// See §2.11 of the redesign doc.
 #[component]
 pub fn SelectBar() -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState missing");
 
+    let compacting = state.compacting;
+
     let count = {
         let state = state.clone();
         Signal::derive(move || state.selection_count())
     };
-    let can_compact = Signal::derive(move || count.get() >= 2);
+    let can_compact =
+        Signal::derive(move || count.get() >= 2 && !compacting.get());
 
     let do_compact = {
         let state = state.clone();
@@ -35,24 +40,34 @@ pub fn SelectBar() -> impl IntoView {
         <footer class="select-bar">
             <span class="select-count">
                 {move || {
-                    let n = count.get();
-                    if n == 0 {
-                        "Click a message to start a range".to_string()
-                    } else if n == 1 {
-                        "Click another message to set the range end".to_string()
+                    if compacting.get() {
+                        "Compacting…".to_string()
                     } else {
-                        format!("{n} messages selected")
+                        let n = count.get();
+                        if n == 0 {
+                            "Click a message to start a range".to_string()
+                        } else if n == 1 {
+                            "Click another message to set the range end".to_string()
+                        } else {
+                            format!("{n} messages selected")
+                        }
                     }
                 }}
             </span>
             <div class="select-actions">
+                // Compact button: hidden while compaction is in-flight
+                // (the input button shows Cancel during Running).
                 <button
                     class="select-compact-btn"
+                    class:hidden=move || compacting.get()
                     disabled=move || !can_compact.get()
                     on:click=do_compact
                 >
                     "✦ Compact"
                 </button>
+                // "✕ Done" is always available — exits select mode without
+                // cancelling an in-flight compaction (the Cancel button on the
+                // input bar handles that).
                 <button class="select-cancel-btn" on:click=do_cancel>
                     "✕ Done"
                 </button>

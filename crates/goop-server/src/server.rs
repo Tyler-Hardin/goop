@@ -453,7 +453,7 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
                                 session.fork(target, content).await;
                             }
                             ClientMessage::CompactRange { covers } => {
-                                session.compact_range(covers).await;
+                                session.compact_range(covers);
                             }
                         }
                     }
