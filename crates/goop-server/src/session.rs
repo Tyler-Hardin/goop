@@ -756,6 +756,15 @@ impl Session {
             *guard = Some(cancel_tx);
         }
 
+        // Format the conversation as text embedded in the system prompt
+        // (goose-style), so the LLM reads a transcript rather than acting
+        // as a conversation participant.
+        let messages_text = memory::format_messages_for_compacting(&messages);
+        let system_prompt =
+            COMPACTION_SYSTEM_PROMPT.replace("{{ messages }}", &messages_text);
+        let user_prompt =
+            "Please summarize the conversation history provided in the system prompt.";
+
         // Race the summarization against cancellation.
         let outcome = tokio::select! {
             biased;
@@ -764,7 +773,7 @@ impl Session {
                 tracing::info!("manual compaction cancelled");
                 None
             }
-            result = self.agent.summarize(messages, COMPACTION_SYSTEM_PROMPT) => {
+            result = self.agent.summarize(system_prompt, user_prompt) => {
                 Some(result)
             }
         };
@@ -781,8 +790,15 @@ impl Session {
                 .await;
             }
             Some(Ok(summary)) => {
+                // Append a continuation instruction so the agent knows it's
+                // working from a summary and doesn't mention the compaction.
+                let summary_with_continuation = format!(
+                    "{}\n\n{M}",
+                    summary.trim_end(),
+                    M = MANUAL_COMPACT_CONTINUATION_TEXT,
+                );
                 self.emit(SessionEvent::Compacted {
-                    summary,
+                    summary: summary_with_continuation,
                     model: self.model_label.clone(),
                     covers,
                     manual: true,
@@ -808,10 +824,15 @@ impl Session {
     /// If the agent-visible conversation has grown past the compaction
     /// threshold, summarize it into a rolling `Compacted` event so the next
     /// turn stays within the context budget.  The entire agent-visible prefix
-    /// is covered; the in-progress prompt (handled by rig) is preserved, as is
-    /// goose's "keep the most-recent user message" behaviour.  Summaries are
-    /// themselves agent-visible, so later compactions summarize the prior
-    /// summary — a rolling summary.
+    /// is covered; the in-progress prompt (handled by rig) is preserved.
+    /// Summaries are themselves agent-visible, so later compactions summarize
+    /// the prior summary — a rolling summary.
+    ///
+    /// **Most-recent user message preservation:** like goose, the most-recent
+    /// user message is kept uncompacted so the agent still sees the exact
+    /// user request.  It is *included* in the summarization context (the LLM
+    /// should describe it) but *excluded* from `covers` (replay leaves it in
+    /// place after the summary).
     ///
     /// No-op when compaction is disabled (`threshold == None`) or the
     /// conversation is still small.
@@ -822,22 +843,57 @@ impl Session {
         let items = self.memory.agent_visible_items().await;
         let messages: Vec<Message> = items.iter().map(|i| i.msg.clone()).collect();
         let tokens = self.memory.count_tokens(&messages);
-        let Some(covers) = memory::compaction_covers(&items, threshold, tokens) else {
+        let Some(mut covers) = memory::compaction_covers(&items, threshold, tokens) else {
             return;
         };
+
+        // Find the most-recent user message so we can preserve it
+        // uncompacted (goose-style).  Including it in summarization but
+        // excluding from covers means: the LLM describes it in the summary,
+        // then the original survives beneath the summary for the next turn.
+        let last_user_seq: Option<u64> = items
+            .iter()
+            .rev()
+            .find(|i| matches!(&i.msg, Message::User { .. }))
+            .map(|i| i.seq);
+
+        if let Some(seq) = last_user_seq {
+            covers.retain(|&s| s != seq);
+            // Don't compact if the only thing left would be the user message
+            // (covers would be empty or just 1 item — not worth it).
+            if covers.len() < 2 {
+                return;
+            }
+        }
+
         tracing::info!(
-            "compacting {} agent-visible items (~{} tokens >= threshold {threshold})",
+            "compacting {} agent-visible items (~{} tokens >= threshold {threshold}); \
+             covers={} items, most-recent user msg {}",
             items.len(),
-            tokens
+            tokens,
+            covers.len(),
+            if last_user_seq.is_some() { "preserved" } else { "none" }
         );
-        match self
-            .agent
-            .summarize(messages, COMPACTION_SYSTEM_PROMPT)
-            .await
-        {
+
+        // Format the conversation as text embedded in the system prompt so
+        // the LLM reads a transcript rather than acting as a participant.
+        let messages_text = memory::format_messages_for_compacting(&messages);
+        let system_prompt =
+            COMPACTION_SYSTEM_PROMPT.replace("{{ messages }}", &messages_text);
+        let user_prompt =
+            "Please summarize the conversation history provided in the system prompt.";
+
+        match self.agent.summarize(system_prompt, user_prompt).await {
             Ok(summary) => {
+                // Append a continuation instruction so the agent knows it's
+                // working from a summary and doesn't mention the compaction.
+                let summary_with_continuation = format!(
+                    "{}\n\n{C}",
+                    summary.trim_end(),
+                    C = AUTO_COMPACT_CONTINUATION_TEXT,
+                );
                 self.emit(SessionEvent::Compacted {
-                    summary,
+                    summary: summary_with_continuation,
                     model: self.model_label.clone(),
                     covers,
                     manual: false,
@@ -884,11 +940,16 @@ impl Session {
 
         let mut summaries: Vec<(String, String)> = Vec::new();
         for c in &candidates {
+            // Goose-style: the formatted pair text goes in the user message,
+            // the system prompt is a short generic instruction.
+            let pair_text =
+                memory::format_messages_for_compacting(&[c.call_msg.clone(), c.result_msg.clone()]);
+            let user_prompt = format!(
+                "Summarize this tool interaction:\n\n{}",
+                pair_text
+            );
             match summarizer
-                .summarize(
-                    vec![c.call_msg.clone(), c.result_msg.clone()],
-                    TOOL_PAIR_SYSTEM_PROMPT,
-                )
+                .summarize(TOOL_PAIR_SYSTEM_PROMPT.to_string(), &user_prompt)
                 .await
             {
                 Ok(summary) => summaries.push((c.id.clone(), summary)),
@@ -1534,55 +1595,98 @@ pub(crate) fn next_session_name() -> String {
 /// conversation — decisions, code, file paths, errors, pending work —
 /// while dropping narration and redundant tool output, so the summary can
 /// stand in for the earlier conversation.
+// ── compaction prompts ──────────────────────────────────────────────
+//
+// The compaction system prompt is derived from goose's compaction.md
+// (<https://github.com/block/goose/blob/main/crates/goose/src/prompts/compaction.md>,
+// BSD-3-Clause).  Key differences from goose:
+//   - The conversation text is spliced into `{{ messages }}` by the caller
+//     (using [`format_messages_for_compacting`]) rather than Tera templates.
+//   - The `<analysis>` section is simplified for models that don't support
+//     structured thinking tags natively.
+//
+// The continuation texts tell the agent it's working from a summary so it
+// doesn't mention the compaction or treat the summary as something the user
+// wrote.  See §2.8 of the redesign doc.
+
+/// System prompt for full compaction (auto + manual).
+/// `{{ messages }}` is replaced with the formatted conversation text.
 const COMPACTION_SYSTEM_PROMPT: &str = "\
 You are summarizing an earlier portion of a conversation between a user and \
-an AI coding assistant (goop). The conversation has grown too long and must be \
-compressed so work can continue within a limited context window. Produce a \
-concise but complete summary that preserves everything needed to keep working.
+an AI coding assistant (goop).  An LLM context limit was reached while the \
+user was in a working session with you.  Generate a version of the messages \
+below that keeps everything needed to continue the session.  The summary will \
+only be read by you on the next exchange, so it is ok to make it longer than \
+a normal human summary.  Do not exclude any information that might be \
+important to continuing a working session.
 
-Preserve in detail:
-- The user's goals, requests, requirements, and any stated constraints or \
-preferences.
-- Key decisions made and the reasoning behind them.
-- Technical specifics: file paths, code snippets, shell commands, APIs, \
-library/framework names and versions, and configuration.
-- Errors, stack traces, and how they were resolved (or remain unresolved).
-- The current state of every task: what is done, what is in progress, what \
-is pending, and the concrete next step.
-- Any open questions, TODOs, or follow-ups.
+**Conversation History:**
+{{ messages }}
 
-Drop:
-- Pleasantries, narration of the assistant's thought process, and redundant \
-back-and-forth.
-- Verbatim tool output that is no longer needed — but keep the facts it \
-established (file listings, counts, the relevant excerpts).
+Wrap reasoning in `<analysis>` tags, then produce the final summary.  In your \
+analysis:
+- Review the conversation chronologically.
+- For each part, log: user goals and requests; your method and solution; key \
+  decisions and designs; file names, code, signatures, errors, fixes.
+- Highlight user feedback and revisions.
+- Confirm completeness and accuracy.
 
-Format the result as prose with short sections or bullet points as needed. \
-The summary replaces the earlier conversation, so it must stand alone; do not \
-omit technical details, and when unsure whether something matters, keep it.";
+After the analysis, include the following sections:
+
+1. **User Intent** — All goals and requests.
+2. **Technical Concepts** — All discussed tools, methods.
+3. **Files + Code** — Viewed/edited files, full code, change justifications.
+4. **Errors + Fixes** — Bugs, resolutions, user-driven changes.
+5. **Problem Solving** — Issues solved or in progress.
+6. **User Messages** — All user messages including tool calls, but truncate \
+   long tool call arguments or results.
+7. **Pending Tasks** — All unresolved user requests.
+8. **Current Work** — Active work at summary request time: filenames, code, \
+   alignment to latest instruction.
+9. **Next Step** — *Include only if* it directly continues the user's instruction.
+
+> No new ideas unless the user confirmed them.";
+
+/// Continuation instruction appended after a full auto-compaction so the
+/// agent knows it is working from a summary.  The most-recent user message is
+/// preserved uncompacted, so the agent should continue naturally.
+const AUTO_COMPACT_CONTINUATION_TEXT: &str =
+    "Your context was compacted.  The previous message above contains a \
+     summary of the conversation so far.  Do not mention that you read a \
+     summary or that conversation summarization occurred.  Just continue \
+     the conversation naturally based on the summarized context.";
+
+/// Continuation instruction for manual compaction (user selected a range).
+const MANUAL_COMPACT_CONTINUATION_TEXT: &str =
+    "Your context was compacted at the user's request.  The previous message \
+     above contains a summary of the conversation so far.  Do not mention \
+     that you read a summary or that conversation summarization occurred.  \
+     Just continue the conversation naturally based on the summarized context.";
 
 /// System prompt for tool-pair summarization (embedded at compile time).
 ///
 /// Instructs the model to summarize a single tool call+result pair — what was
 /// requested, what happened, and any key data — so the summary can stand in
-/// for the original verbose call and result.
+/// for the original verbose call and result.  The actual pair text is passed
+/// as the user message, not embedded here (unlike full compaction).  See
+/// goose's `summarize_tool_call` system prompt for the original
+/// (BSD-3-Clause).
 const TOOL_PAIR_SYSTEM_PROMPT: &str = "\
-You are summarizing a single tool call and its result from a conversation \
-between a user and an AI coding assistant (goop). Produce a concise summary \
-that preserves the essential outcome.
+Your task is to summarize a tool call & response pair from a conversation \
+between a user and an AI coding assistant (goop).  The tool call and its \
+result follow as the user message.
 
-Preserve:
-- What the tool was asked to do (the tool name and key arguments).
-- The result: success or failure, key data (file paths, counts, error \
-messages, relevant excerpts).
-- Any facts established by the tool call that matter for the ongoing work.
+Reply with a single message that describes what happened.  Typically a tool \
+call asks for something using a bunch of parameters and then the result is \
+also some structured output.  So the tool might ask to read a file and the \
+reply might be the file contents.  You could reply with something like:
 
-Drop:
-- Verbatim file contents, raw command output, and redundant detail.
-- Narration or commentary.
+\"Read config.rs (180 lines) — established the tool group defaults and \
+compaction threshold.\"
 
-The summary replaces the original tool call and result, so it must stand \
-alone.  Keep it short — a few sentences at most.";
+Keep it to a few sentences at most.  Preserve facts that matter for ongoing \
+work (file paths, counts, error messages, key findings).  Drop verbatim file \
+contents and raw command output.";
 
 /// Resolve the compaction token threshold from the merged config.
 ///
@@ -1699,7 +1803,14 @@ mod compaction_integration_tests {
                 manual,
                 covers,
             } => {
-                assert_eq!(summary, "SUMMARY OF CHAT");
+                assert!(
+                    summary.starts_with("SUMMARY OF CHAT"),
+                    "summary should start with the mock summary: {summary:?}"
+                );
+                assert!(
+                    summary.contains(AUTO_COMPACT_CONTINUATION_TEXT),
+                    "summary should contain continuation text"
+                );
                 assert_eq!(model, "mock/model");
                 assert!(!*manual, "auto-compaction should not be manual");
                 assert!(
@@ -1711,18 +1822,17 @@ mod compaction_integration_tests {
         }
 
         // Replay the log: the covered messages should be replaced by the
-        // summary.  The summary is a single User message (the Compacted event
-        // becomes a user-role summary in the agent view).
+        // summary, but the most-recent user message is preserved uncompacted
+        // (goose-style).  So we expect 2 messages: [summary+continuation,
+        // most-recent user message "how are you"].
         let log = session.history.lock().await;
         let messages = replay_log(log.entries(), log.active_tip());
         drop(log);
 
-        // Should be exactly 1 message (the summary) — the 4 original messages
-        // (2 user + 2 assistant) are all covered.
         assert_eq!(
             messages.len(),
-            1,
-            "replay should show only the summary, got {messages:?}"
+            2,
+            "replay should show summary + preserved user msg, got {messages:?}"
         );
     }
 
@@ -1762,7 +1872,14 @@ mod compaction_integration_tests {
                 covers,
                 ..
             } => {
-                assert_eq!(summary, "RANGE SUMMARY");
+                assert!(
+                    summary.starts_with("RANGE SUMMARY"),
+                    "summary should start with the mock summary: {summary:?}"
+                );
+                assert!(
+                    summary.contains(MANUAL_COMPACT_CONTINUATION_TEXT),
+                    "summary should contain manual-continuation text"
+                );
                 assert!(*manual, "should be manual compaction");
                 assert_eq!(*covers, vec![items[2].seq, items[3].seq]);
             }
@@ -1805,9 +1922,14 @@ mod compaction_integration_tests {
             _ => panic!("expected Compacted"),
         }
 
-        // After compaction, the agent-visible items should be just the summary.
+        // After first compaction: the most-recent user message ("second") is
+        // preserved uncompacted, so we see [summary+continuation, "second"].
         let items = session.memory.agent_visible_items().await;
-        assert_eq!(items.len(), 1, "only the summary should be visible");
+        assert_eq!(
+            items.len(),
+            2,
+            "summary + preserved user msg should be visible"
+        );
         let summary_seq = items[0].seq;
 
         // Add another turn so there are ≥ 2 items to trigger a second
@@ -1826,7 +1948,10 @@ mod compaction_integration_tests {
                 manual,
                 ..
             } => {
-                assert_eq!(summary, "ROLLING SUMMARY");
+                assert!(
+                    summary.starts_with("ROLLING SUMMARY"),
+                    "summary should start with the mock summary: {summary:?}"
+                );
                 assert!(!*manual);
                 // The second compaction covers the first summary's seq.
                 assert!(
@@ -1837,11 +1962,16 @@ mod compaction_integration_tests {
             other => panic!("expected Compacted, got {other:?}"),
         }
 
-        // Replay: only the latest rolling summary survives.
+        // Replay: the latest rolling summary + the preserved most-recent user
+        // message ("third") survive.  So 2 messages.
         let log = session.history.lock().await;
         let messages = replay_log(log.entries(), log.active_tip());
         drop(log);
-        assert_eq!(messages.len(), 1, "only the latest rolling summary");
+        assert_eq!(
+            messages.len(),
+            2,
+            "rolling summary + preserved user msg, got {messages:?}"
+        );
     }
 
     /// When the conversation is under the threshold, `maybe_compact` is a

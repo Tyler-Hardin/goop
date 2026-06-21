@@ -271,39 +271,59 @@ The web UI shows a session sidebar for switching between sessions.
 - **Compaction** (`src/memory/compaction.rs` + `src/session.rs`) — when the
   agent-visible conversation exceeds a token threshold, the whole prefix
   is summarized into a rolling `Compacted { summary, model, covers,
-  manual }` event before the next turn. Replay applies it: the covered
-  items (by seq) are dropped and the summary inserted. Summaries are
-  themselves agent-visible, so later compactions summarize the prior
-  summary (a rolling summary). The threshold comes from `compaction` in
-  config.toml (`CompactionMode::Tokens(n)` or `Percent(pct)` of the
-  model's context window); `None` disables it — **opt-in (default off)**.
-  Env: `GOOP_COMPACTION`. Summarization is a one-shot, tool-less,
+  manual }` event before the next turn.  **Summarization is goose-style:**
+  messages to summarize are formatted as plain text via
+  `format_message_for_compacting` (see goose's BSD-3-Clause
+  `format_message_for_compacting` for the original) and embedded in the
+  system prompt, rather than passed as structured `Message` objects.
+  This prevents the summarizer LLM from acting as a conversation
+  participant (making tool calls, etc.).  The system prompt
+  (`COMPACTION_SYSTEM_PROMPT`) is derived from goose's `compaction.md`
+  (BSD-3-Clause) and directs the model to produce structured sections:
+  User Intent, Technical Concepts, Files+Code, Errors+Fixes, Problem
+  Solving, User Messages, Pending Tasks, Current Work, Next Step.
+  A continuation instruction (`AUTO_COMPACT_CONTINUATION_TEXT` /
+  `MANUAL_COMPACT_CONTINUATION_TEXT`) is appended to the summary so the
+  agent knows it's working from a summary and doesn't mention it.
+  **Most-recent user message preservation:** auto-compaction excludes
+  the most-recent user message from `covers` (but includes it in the
+  summarization context), so the exact user request survives
+  uncompacted — goose-style.  Manual compaction does not preserve.
+  Replay applies it: the covered items (by seq) are dropped and the
+  summary inserted. Summaries are themselves agent-visible, so later
+  compactions summarize the prior summary (a rolling summary). The
+  threshold comes from `compaction` in config.toml
+  (`CompactionMode::Tokens(n)` or `Percent(pct)` of the model's context
+  window); `None` disables it — **opt-in (default off)**.
+  Env: `GOOP_COMPACTION`.  Summarization is a one-shot, tool-less,
   memory-less completion (`AnyAgent::summarize`) with an embedded system
-  prompt. A failed summarization is logged and skipped (full history kept).
-  The pure decision logic (`compaction_covers`) is in `memory/compaction.rs`
-  and unit-tested; `session.rs`'s `maybe_compact` is thin glue (snapshot →
-  decide → LLM call → emit).
+  prompt.  A failed summarization is logged and skipped (full history
+  kept).  The pure decision logic (`compaction_covers`) is in
+  `memory/compaction.rs` and unit-tested; `session.rs`'s `maybe_compact`
+  is thin glue (snapshot → decide → LLM call → emit).
 - **Tool-pair summarization** (`src/memory/compaction.rs` + `src/session.rs`
   + `src/memory/replay.rs`) — tier-1 compaction: verbose individual tool
   call+result pairs are summarized by an LLM into `ToolSummarized { id,
   summary, model }` events, reclaiming tokens incrementally without a full
   context rewrite. `maybe_summarize_tool_pairs()` runs between prompts in
   `drain_queue` (alongside `maybe_compact`), using a snapshot → summarize
-  (outside lock) → revalidate → commit lifecycle. The pure decision logic
+  (outside lock) → revalidate → commit lifecycle.  Pairs are formatted as
+  text and embedded in the system prompt (same goose-style approach as full
+  compaction) via the same `AnyAgent::summarize(system_prompt, user_prompt)`
+  API.  The pure decision logic
   (`select_tool_summary_candidates` — trigger check, most-recent-turn
   protection, min-tokens filter, batch truncation; `revalidate_tool_summaries`
   — drop vanished pairs) is in `memory/compaction.rs` and unit-tested;
   `session.rs` is thin glue around the LLM calls. Replay applies
   `ToolSummarized` via `apply_tool_summary()` — content-granularity surgery
   that splices the target call/result out of merged messages (reusing the
-  `drop_orphaned_tool_pairs` rebuild pattern), since replay merges
-  consecutive calls into one assistant `VisibleItem` and consecutive results
-  into one user `VisibleItem`. Targets by tool-call `id` (stable across
-  merging), not `seq`. Config: `[tool_summarization]` in config.toml
-  (`enabled`, `model`, `min_tokens`, `trigger_tool_count`); **opt-in (default
-  off)**. Env: `GOOP_TOOL_SUMMARIZATION*`. A separate `AnyAgent` is built via
-  `build_summarizer()` when `model` is set; otherwise the session's main agent
-  is used. The most-recent turn's tool calls are protected from summarization.
+  `drop_orphaned_tool_pairs` rebuild pattern).  Targets by tool-call `id`
+  (stable across merging), not `seq`. Config: `[tool_summarization]` in
+  config.toml (`enabled`, `model`, `min_tokens`, `trigger_tool_count`);
+  **opt-in (default off)**. Env: `GOOP_TOOL_SUMMARIZATION*`.  A separate
+  `AnyAgent` is built via `build_summarizer()` when `model` is set;
+  otherwise the session's main agent is used.  The most-recent turn's tool
+  calls are protected from summarization.
 - **Manual range compaction** (`src/session.rs` + `src/memory/compaction.rs`)
   — the user can manually select a range of messages in the web UI and
   compact them into a summary.  `ClientMessage::CompactRange { covers }`

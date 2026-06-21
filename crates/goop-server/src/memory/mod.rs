@@ -18,7 +18,8 @@ mod replay;
 mod transaction_log;
 
 pub(crate) use compaction::{
-    compaction_covers, covered_messages, revalidate_tool_summaries, select_tool_summary_candidates,
+    compaction_covers, covered_messages, format_messages_for_compacting, revalidate_tool_summaries,
+    select_tool_summary_candidates,
 };
 pub(crate) use replay::{VisibleItem, collect_branch, replay_log, replay_visible};
 pub(crate) use transaction_log::TransactionLog;

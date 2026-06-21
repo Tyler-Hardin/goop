@@ -82,22 +82,22 @@ impl AnyAgent {
     /// (no agent memory, no tools — just the model + a system prompt).  Used to
     /// roll up the agent-visible conversation into a single summary message.
     ///
-    /// `messages` is the conversation to summarize; `system_prompt` is the
-    /// compaction instruction.  Returns the concatenated assistant text.
+    /// The conversation to summarize is embedded as text inside `system_prompt`
+    /// (see [`format_messages_for_compacting`]).  `user_prompt` is a short
+    /// instruction to the model, e.g. "Please summarize the conversation
+    /// history provided in the system prompt."  Returns the concatenated
+    /// assistant text.
     pub(crate) async fn summarize(
         &self,
-        messages: Vec<Message>,
-        system_prompt: &str,
+        system_prompt: String,
+        user_prompt: &str,
     ) -> anyhow::Result<String> {
         macro_rules! do_summarize {
             ($agent:expr) => {{
                 let model = &$agent.model;
                 let resp = model
-                    .completion_request(Message::user(
-                        "Summarize the conversation above, following the system instructions.",
-                    ))
-                    .preamble(system_prompt.to_string())
-                    .messages(messages.clone())
+                    .completion_request(Message::user(user_prompt))
+                    .preamble(system_prompt)
                     .send()
                     .await
                     .map_err(anyhow::Error::from)?;

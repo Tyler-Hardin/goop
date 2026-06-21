@@ -145,6 +145,96 @@ fn expand_tool_pairs(items: &[VisibleItem], cover_set: &HashSet<u64>) -> HashSet
     expanded
 }
 
+// ── message formatting for summarization ───────────────────────────
+
+/// Format one agent-visible message as a compact text line for
+/// compaction summarization, like goose's [`format_message_for_compacting`].
+///
+/// The LLM summarizer sees these as plain text embedded in the system
+/// prompt, not as structured `Message` objects — this prevents it from
+/// acting as a conversation participant and keeps it in pure-summary mode.
+///
+/// See <https://github.com/block/goose/blob/main/crates/goose/src/context_mgmt/mod.rs>
+/// (BSD-3-Clause) for the original.
+pub(crate) fn format_message_for_compacting(msg: &Message) -> String {
+    let role_str = match msg {
+        Message::User { .. } => "user",
+        Message::Assistant { .. } => "assistant",
+        _ => return String::new(), // System messages shouldn't appear in agent-visible items.
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+
+    match msg {
+        Message::User { content } => {
+            for c in content.clone() {
+                match c {
+                    UserContent::Text(t) => parts.push(t.text.clone()),
+                    UserContent::ToolResult(tr) => {
+                        let text_items: Vec<&str> = tr
+                            .content
+                            .iter()
+                            .filter_map(|tc| match tc {
+                                rig::message::ToolResultContent::Text(t) => {
+                                    Some(t.text.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if !text_items.is_empty() {
+                            let joined = text_items.join("\n");
+                            // Truncate very long results.
+                            if joined.len() > 4000 {
+                                parts.push(format!(
+                                    "tool_response({}): {}…[truncated {} chars]",
+                                    tr.id,
+                                    &joined[..4000],
+                                    joined.len() - 4000
+                                ));
+                            } else {
+                                parts.push(format!("tool_response({}): {}", tr.id, joined));
+                            }
+                        } else {
+                            parts.push(format!("tool_response({}): [no text]", tr.id));
+                        }
+                    }
+                    _ => {} // Image, audio, video — skip.
+                }
+            }
+        }
+        Message::Assistant { content, .. } => {
+            for c in content.clone() {
+                match c {
+                    AssistantContent::Text(t) => parts.push(t.text.clone()),
+                    AssistantContent::ToolCall(tc) => {
+                        let args_str = serde_json::to_string(&tc.function.arguments)
+                            .unwrap_or_else(|_| "<<invalid json>>".to_string());
+                        parts.push(format!("tool_request({}): {}", tc.function.name, args_str));
+                    }
+                    _ => {} // Thinking content, etc. — skip.
+                }
+            }
+        }
+        _ => {} // System messages — not agent-visible, skip.
+    }
+
+    if parts.is_empty() {
+        format!("[{}]: <empty>", role_str)
+    } else {
+        format!("[{}]: {}", role_str, parts.join("\n"))
+    }
+}
+
+/// Format a slice of messages as newline-separated text, one line per
+/// message.
+pub(crate) fn format_messages_for_compacting(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|m| format_message_for_compacting(m))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ── tool-pair summarization (tier 1) ──
 
 /// A tool-call+result pair selected for summarization.
