@@ -753,13 +753,16 @@ main.select-mode .msg-select-overlay {
 /*
    In LLM view, compaction summaries and tool summaries render as plain
    messages — exactly what the agent sees.  A small label distinguishes
-   them from regular user/assistant messages.
+   them from regular user/assistant messages.  Full-width and solid-
+   bordered so the layout stays consistent with chat view; LLM view
+   changes content, not spacing.
 */
 .msg.llm-summary {
-  align-self: flex-start;
-  max-width: 85%;
+  align-self: stretch;
+  max-width: 100%;
   padding: 10px 14px;
-  border: 1px dashed var(--border);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--purple);
   border-radius: 8px;
   background: var(--surface);
 }

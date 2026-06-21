@@ -238,7 +238,6 @@ pub fn MessageLog() -> impl IntoView {
             node_ref=scroll_ref
             on:scroll=on_scroll
             class:select-mode=move || select_mode.get()
-            class:llm-view=move || llm_view.get()
         >
             // System prompt — metadata, not a conversation message.  Rendered
             // above the <For> so it doesn't interfere with compaction

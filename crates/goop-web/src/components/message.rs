@@ -123,7 +123,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             };
 
             let actions_hidden =
-                move || editing.get() || deleted.get() || running.get() || llm_view.get();
+                move || editing.get() || deleted.get() || running.get();
 
             view! {
                 <div class="msg-wrap user" class:confirming=confirm_delete>
@@ -254,7 +254,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
             };
 
             let actions_hidden =
-                move || editing.get() || deleted.get() || running.get() || llm_view.get();
+                move || editing.get() || deleted.get() || running.get();
 
             view! {
                 <div class="msg-wrap assistant" class:confirming=confirm_delete>
@@ -330,7 +330,7 @@ pub fn Message(msg: UiMessage) -> impl IntoView {
                 confirm_delete.set(false);
             };
 
-            let actions_hidden = move || deleted.get() || running.get() || llm_view.get();
+            let actions_hidden = move || deleted.get() || running.get();
 
             view! {
                 <div class="msg-wrap tool" class:confirming=confirm_delete>
