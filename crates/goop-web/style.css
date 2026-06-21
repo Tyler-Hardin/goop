@@ -297,7 +297,6 @@ main {
 }
 
 .msg.user {
-  align-self: flex-end;
   background: var(--blue-dim);
   color: #fff;
   border-bottom-right-radius: 4px;
@@ -305,7 +304,6 @@ main {
 }
 
 .msg.assistant {
-  align-self: flex-start;
   background: var(--surface2);
   border-bottom-left-radius: 4px;
   border: 1px solid var(--border);
@@ -350,13 +348,11 @@ main {
 }
 
 .msg.tool {
-  align-self: flex-start;
   background: var(--surface);
   border: 1px solid var(--border);
   border-left: 3px solid var(--cyan);
   font-family: var(--mono);
   font-size: 13px;
-  max-width: 85%;
   cursor: pointer;
   user-select: none;
   transition: border-color 0.2s;
@@ -443,6 +439,500 @@ main {
   background: none;
   padding: 2px 0;
   letter-spacing: 0.4px;
+}
+
+/* ── compaction & tool-summary groups (collapsible tree nodes) ─── */
+
+.msg.group {
+  align-self: stretch;
+  max-width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--purple);
+  border-radius: var(--radius-sm);
+  font-family: var(--font);
+  overflow: hidden;
+}
+.msg.group.tool-summary {
+  border-left-color: var(--cyan);
+}
+
+.msg.group .group-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 14px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+.msg.group .group-header:hover {
+  background: var(--surface2);
+}
+.msg.group .group-header .arrow {
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.5;
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+.msg.group.open .group-header .arrow {
+  transform: rotate(90deg);
+}
+
+.msg.group .group-summary {
+  flex: 1;
+  min-width: 0;
+}
+.msg.group .group-meta {
+  color: var(--dim2);
+  font-size: 11px;
+  font-style: italic;
+  letter-spacing: 0.2px;
+  margin-bottom: 4px;
+}
+.msg.group .group-summary .rendered-inner {
+  font-size: 13.5px;
+  color: var(--fg);
+  line-height: 1.5;
+}
+.msg.group .group-summary .rendered-inner p {
+  margin: 0;
+}
+.msg.group .group-summary .rendered-inner p:first-child {
+  margin-top: 0;
+}
+
+/* Children hidden by default; revealed on expand. */
+.msg.group .group-children {
+  display: none;
+  padding: 4px 10px 10px 22px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  max-height: 50vh;
+}
+.msg.group.open .group-children {
+  display: flex;
+}
+
+/* ── edit / delete overlays ─────────────────────── */
+
+.msg.deleted {
+  opacity: 0.4;
+  text-decoration: line-through;
+  text-decoration-color: var(--dim2);
+}
+
+.edit-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--yellow);
+  background: rgba(226, 185, 111, 0.1);
+  border: 1px solid rgba(226, 185, 111, 0.2);
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: middle;
+  transition: background 0.15s;
+}
+.edit-badge:hover {
+  background: rgba(226, 185, 111, 0.2);
+}
+
+.msg.tool .name.edited-replacement {
+  white-space: pre-wrap;
+  color: var(--yellow);
+  font-size: 12.5px;
+}
+
+/* ── message action buttons (edit / delete) ──────────────────── */
+
+/* Utility: elements with class `hidden` are removed from the layout.
+   Used to toggle between display and inline-edit views without
+   conditional rendering (which would move FnOnce closures into Fn). */
+.hidden {
+  display: none !important;
+}
+
+/* ── message wrapper (bubble + actions row) ──────────────────── */
+/*
+   The three action-bearing variants (UserPrompt, AssistantFinal,
+   ToolCall) are wrapped so the action row can sit *outside* the chat
+   bubble — against the page background for better contrast, rather
+   than inside the bubble's tinted surface.  The wrapper inherits the
+   flex alignment and max-width the bubble used to own; the bubble
+   fills the wrapper (max-width: none).
+*/
+.msg-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.msg-wrap > .msg {
+  max-width: none;
+}
+.msg-wrap.user {
+  align-self: flex-end;
+  max-width: 78%;
+}
+.msg-wrap.assistant {
+  align-self: flex-start;
+  max-width: 78%;
+}
+.msg-wrap.tool {
+  align-self: flex-start;
+  max-width: 85%;
+}
+
+/* ── message action buttons (edit / delete) ──────────────────── */
+/*
+   Actions sit in a row *below* the bubble, outside it (against the
+   page background for contrast).  The row is always in the DOM but
+   `opacity: 0`; `:hover` on the `.msg-wrap` reveals it.  On touch
+   devices a tap on the message triggers `:hover` (browsers fire
+   `mouseover` on touch), so the pattern doubles as tap-to-reveal —
+   no JS needed.  The `.confirming` class forces the row visible so
+   the inline delete-confirm prompt is always shown.
+*/
+.msg-actions {
+  display: flex;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.msg-wrap:hover .msg-actions,
+.msg-wrap.confirming .msg-actions {
+  opacity: 1;
+}
+/* User messages are right-aligned bubbles — actions align right. */
+.msg-wrap.user .msg-actions {
+  justify-content: flex-end;
+}
+.msg-wrap.assistant .msg-actions,
+.msg-wrap.tool .msg-actions {
+  justify-content: flex-start;
+}
+
+.actions-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.actions-row.confirm {
+  gap: 4px;
+}
+.confirm-text {
+  font-size: 11px;
+  color: var(--red);
+  font-family: var(--mono);
+  margin-right: 2px;
+}
+
+.msg-action {
+  background: none;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 4px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.msg-action:hover {
+  background: var(--surface2);
+  color: var(--fg);
+}
+.msg-action.delete:hover,
+.msg-action.confirm {
+  color: var(--red);
+}
+.msg-action.confirm:hover {
+  background: rgba(242, 98, 90, 0.12);
+}
+.msg-action.cancel:hover {
+  color: var(--fg);
+}
+
+/* ── select mode (manual range compaction) ───────────────────── */
+
+/*
+   In select mode, clicking a message sets the start/end of a contiguous
+   range.  An invisible overlay div sits on top of each message to capture
+   clicks; selected messages get a blue border highlight.
+
+   `.msg-select-wrap` is a flex column so `.msg-wrap`'s `align-self`
+   (flex-end for user, flex-start for assistant) still works — the wrapper
+   replaced `.msg-wrap` as the direct child of `main`'s flex column.
+*/
+.msg-select-wrap {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* Invisible click overlay — only active in select mode.  Sits above the
+   message content to intercept clicks for range selection. */
+.msg-select-overlay {
+  display: none;
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+  z-index: 10;
+}
+.msg-select-overlay.hidden {
+  display: none;
+}
+main.select-mode .msg-select-overlay {
+  display: block;
+}
+
+/* Selected messages get a blue border highlight. */
+.msg-select-wrap.selected .msg-wrap > .msg {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
+}
+
+/* ── header select button ─────────────────────────── */
+
+.select-btn {
+  background: none;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 4px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.select-btn:hover {
+  background: var(--surface2);
+  color: var(--fg);
+}
+.select-btn.active {
+  color: var(--blue);
+  background: rgba(100, 149, 237, 0.12);
+}
+
+/* ── LLM view button ─────────────────────────────── */
+
+.llm-view-btn {
+  background: none;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 4px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.llm-view-btn:hover {
+  background: var(--surface2);
+  color: var(--fg);
+}
+.llm-view-btn.active {
+  color: var(--blue);
+  background: rgba(100, 149, 237, 0.12);
+}
+
+/* ── LLM view summary messages ───────────────────── */
+
+/*
+   In LLM view, compaction summaries and tool summaries render as plain
+   messages — exactly what the agent sees.  A small label distinguishes
+   them from regular user/assistant messages.  Full-width and solid-
+   bordered so the layout stays consistent with chat view; LLM view
+   changes content, not spacing.
+*/
+.msg.llm-summary {
+  align-self: stretch;
+  max-width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--purple);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.llm-summary-label {
+  font-size: 11px;
+  color: var(--dim2);
+  font-family: var(--mono);
+  margin-bottom: 4px;
+}
+
+/* ── system prompt (LLM view only) ─────────────────── */
+
+/*
+   Shown above the message log in LLM view.  Collapsed by default — the
+   preamble can be very long (it includes AGENTS.md).  Click the header to
+   expand/collapse the rendered markdown.
+*/
+.msg.system-prompt {
+  align-self: stretch;
+  flex-shrink: 0;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--red);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.system-prompt-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.system-prompt-header .arrow {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  color: var(--dim2);
+  font-size: 11px;
+}
+.system-prompt-header .arrow.open {
+  transform: rotate(90deg);
+}
+.system-prompt-label {
+  font-size: 11px;
+  color: var(--dim2);
+  font-family: var(--mono);
+}
+.system-prompt-body {
+  padding: 0 14px 12px;
+  border-top: 1px solid var(--border);
+  max-height: 60vh;
+  overflow: hidden auto;
+}
+.system-prompt-body .rendered-inner {
+  font-size: 13px;
+  color: var(--dim);
+}
+
+/* ── select bar (replaces input bar in select mode) ──────────── */
+
+.select-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  gap: 12px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+.select-count {
+  font-size: 13px;
+  color: var(--dim);
+  font-family: var(--mono);
+}
+.select-actions {
+  display: flex;
+  gap: 8px;
+}
+.select-compact-btn {
+  background: var(--blue);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.select-compact-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.select-compact-btn:not(:disabled):hover {
+  opacity: 0.88;
+}
+.select-cancel-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.select-cancel-btn:hover {
+  color: var(--fg);
+  border-color: var(--dim2);
+}
+
+/* ── inline edit mode ────────────────────────────── */
+
+.msg.editing {
+  padding: 8px;
+}
+.msg-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.msg-edit-area {
+  width: 100%;
+  min-height: 38px;
+  max-height: 200px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  resize: none;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.msg-edit-area:focus {
+  border-color: var(--cyan);
+}
+.msg-edit-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.msg-edit-btn {
+  padding: 3px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg);
+  transition:
+    background 0.15s,
+    opacity 0.15s;
+}
+.msg-edit-btn.save {
+  background: var(--blue-dim);
+  color: #fff;
+  border-color: transparent;
+}
+.msg-edit-btn.save:hover {
+  opacity: 0.85;
+}
+.msg-edit-btn.cancel:hover {
+  background: var(--surface2);
 }
 
 /* ── rendered markdown ────────────────────────── */
@@ -569,6 +1059,7 @@ main {
 /* ── input bar ────────────────────────────────── */
 
 footer {
+  position: relative;
   padding: 12px 20px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
@@ -576,6 +1067,30 @@ footer {
   gap: 10px;
   background: var(--surface);
   min-height: 71px;
+}
+
+/* ── context-usage progress bar ───────────────── */
+.context-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: transparent;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+  z-index: 10;
+}
+.context-bar.visible {
+  opacity: 1;
+}
+.context-bar-fill {
+  height: 100%;
+  transition:
+    width 0.4s ease,
+    background-color 0.4s ease;
+  border-radius: 0 2px 2px 0;
 }
 footer textarea {
   flex: 1;

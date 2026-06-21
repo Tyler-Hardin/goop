@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::events::SessionEvent;
+use crate::events::{EditContent, PromptSource, ServerMessage, SessionEvent, TurnEndReason};
 use crate::memory::prompt_history_path;
 use streamdown_parser::Parser;
 use streamdown_render::Renderer;
@@ -122,7 +122,7 @@ impl TerminalClient {
         let ready_rx = Arc::new(StdMutex::new(Some(ready_rx)));
 
         // Events from WS → render task.
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
         // Shared session name — captured from SessionInfo event, printed on exit.
         let session_name: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
@@ -221,10 +221,10 @@ impl TerminalClient {
         });
 
         // ── WS receive task ───────────────────────────────────
-        // Reads JSON SessionEvent from the WebSocket and forwards
-        // to the render task. Filters out UserPrompt echoes — the
-        // terminal user already saw their input on the readline.
-        // Captures SessionInfo for display on exit.
+        // Reads `ServerMessage` envelopes from the WebSocket and forwards
+        // them to the render task.  Suppresses UserPrompt echoes for terminal-
+        // sourced prompts — the terminal user already saw their input on the
+        // readline.  Captures SessionInfo for display on exit.
         let fwd_tx = ev_tx.clone();
         let mut ws_rx = ws_rx;
         let ws_session_name = session_name.clone();
@@ -232,21 +232,32 @@ impl TerminalClient {
             while let Some(msg) = ws_rx.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        let event: SessionEvent = match serde_json::from_str(&text) {
-                            Ok(e) => e,
+                        let sm: ServerMessage = match serde_json::from_str(&text) {
+                            Ok(s) => s,
                             Err(_) => continue,
                         };
-                        // Capture session name when we see SessionInfo.
-                        if let SessionEvent::SessionInfo { ref name } = event {
-                            *ws_session_name.lock().expect("session name mutex poisoned") =
-                                Some(name.clone());
-                        }
-                        // Suppress UserPrompt echoes — the terminal
-                        // user already saw their input on the readline.
-                        if matches!(event, SessionEvent::UserPrompt { .. }) {
-                            continue;
-                        }
-                        if fwd_tx.send(event).is_err() {
+                        // Capture session name + suppress terminal UserPrompt
+                        // echoes on `Entry` events.
+                        let sm = match sm {
+                            ServerMessage::Entry(entry) => {
+                                if let SessionEvent::SessionInfo { ref name } = entry.event {
+                                    *ws_session_name.lock().expect("session name mutex poisoned") =
+                                        Some(name.clone());
+                                }
+                                if matches!(
+                                    &entry.event,
+                                    SessionEvent::UserPrompt {
+                                        source: PromptSource::Terminal,
+                                        ..
+                                    }
+                                ) {
+                                    continue;
+                                }
+                                ServerMessage::Entry(entry)
+                            }
+                            other => other,
+                        };
+                        if fwd_tx.send(sm).is_err() {
                             break;
                         }
                     }
@@ -344,9 +355,10 @@ impl TerminalClient {
 // events from an mpsc receiver, drives a streamdown Parser +
 // Renderer, and prints every line through the external printer.
 //
-// When the LLM finishes a turn (FinalResponse / Error) it sends
-// `()` on `done_tx` so the main loop knows the output is fully
-// visible and it's safe to show the next readline prompt.
+// When the LLM finishes a turn (TurnEnded) it sends
+// `Option<String>` on `done_tx` so the main loop knows the output is fully
+// visible and it's safe to show the next readline prompt.  A `Some(prompt)`
+// (cancel-with-no-work) repopulates the readline input for editing.
 
 /// Owns all mutable rendering state so the event loop can call
 /// methods instead of macros.
@@ -357,6 +369,11 @@ struct RenderState<P: rustyline::ExternalPrinter> {
     renderer: Option<Renderer<PrinterWriter<P>>>,
     line_buf: String,
     in_turn: bool,
+    /// While `true`, incoming `Entry` events are skipped — they're a
+    /// post-fork history re-replay whose content is already on screen.
+    /// Set by `Reset`, cleared by `HistoryComplete`.  (The terminal can't
+    /// un-print the old branch, so it just continues from the fork point.)
+    resetting: bool,
 }
 
 impl<P: rustyline::ExternalPrinter> RenderState<P> {
@@ -375,6 +392,7 @@ impl<P: rustyline::ExternalPrinter> RenderState<P> {
             renderer,
             line_buf: String::new(),
             in_turn: false,
+            resetting: false,
         }
     }
 
@@ -425,15 +443,38 @@ impl<P: rustyline::ExternalPrinter> RenderState<P> {
 
 pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
     printer: Arc<StdMutex<P>>,
-    mut events: mpsc::UnboundedReceiver<SessionEvent>,
+    mut events: mpsc::UnboundedReceiver<ServerMessage>,
     done_tx: mpsc::UnboundedSender<Option<String>>,
     term_width: usize,
 ) {
-    use crate::events::PromptSource;
-
     let mut state = RenderState::new(printer, term_width);
 
-    while let Some(event) = events.recv().await {
+    while let Some(msg) = events.recv().await {
+        let event = match msg {
+            // A fork happened.  The server re-replays the active branch
+            // (already on screen); skip it until HistoryComplete.  Print a
+            // notice so the fork is visible in the linear terminal log.
+            ServerMessage::Reset { .. } => {
+                state.resetting = true;
+                state
+                    .lock_printer()
+                    .print(format!("{DIM}  ↻ forked — regenerating from here{RST}\n"))
+                    .ok();
+                continue;
+            }
+            ServerMessage::HistoryComplete => {
+                // End of a history batch (initial catch-up or post-fork
+                // re-replay).  Stop skipping.
+                state.resetting = false;
+                continue;
+            }
+            ServerMessage::Entry(entry) => {
+                if state.resetting {
+                    continue; // re-replayed history — already on screen.
+                }
+                entry.event
+            }
+        };
         match event {
             SessionEvent::SessionInfo { ref name } => {
                 state
@@ -491,6 +532,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             SessionEvent::ToolCall {
                 ref name,
                 ref arguments,
+                ..
             } => {
                 state.flush_markdown();
                 state.reset_renderer();
@@ -533,7 +575,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
                 }
             }
 
-            SessionEvent::ToolResult { ref content } => {
+            SessionEvent::ToolResult { ref content, .. } => {
                 if !content.is_empty() {
                     let displayed = ellipsize(content, MAX_RESULT_LEN);
                     state
@@ -545,49 +587,114 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
 
             SessionEvent::Thinking => { /* implicit */ }
 
-            SessionEvent::FinalResponse => {
-                state.flush_markdown();
-                state.reset_renderer();
-                state.parser = Parser::new();
-                state.line_buf.clear();
-                state.in_turn = false;
-                done_tx.send(None).ok();
-            }
-
-            SessionEvent::Cancelled { prompt } => {
-                // Flush any partial markdown, then signal done.
-                state.flush_markdown();
-                state.reset_renderer();
-                state.parser = Parser::new();
-                state.line_buf.clear();
-                if prompt.is_some() {
-                    state
-                        .lock_printer()
-                        .print(format!("{DIM}cancelled — ↑ to edit{RST}\n"))
-                        .ok();
-                } else {
-                    state
-                        .lock_printer()
-                        .print(format!("{DIM}cancelled.{RST}\n"))
-                        .ok();
+            SessionEvent::TurnEnded { reason } => {
+                match reason {
+                    TurnEndReason::Completed | TurnEndReason::StreamEnded => {
+                        state.flush_markdown();
+                        state.reset_renderer();
+                        state.parser = Parser::new();
+                        state.line_buf.clear();
+                        state.in_turn = false;
+                        done_tx.send(None).ok();
+                    }
+                    TurnEndReason::Cancelled { prompt } => {
+                        // Flush any partial markdown, then signal done.
+                        state.flush_markdown();
+                        state.reset_renderer();
+                        state.parser = Parser::new();
+                        state.line_buf.clear();
+                        if prompt.is_some() {
+                            state
+                                .lock_printer()
+                                .print(format!("{DIM}cancelled — ↑ to edit{RST}\n"))
+                                .ok();
+                        } else {
+                            state
+                                .lock_printer()
+                                .print(format!("{DIM}cancelled.{RST}\n"))
+                                .ok();
+                        }
+                        state.in_turn = false;
+                        done_tx.send(prompt).ok();
+                    }
+                    reason @ (TurnEndReason::MaxTurnsExceeded { .. }
+                    | TurnEndReason::Error { .. }) => {
+                        state.line_buf.clear();
+                        let msg = reason.error_message().unwrap_or_default();
+                        state
+                            .lock_printer()
+                            .print(format!("\x1b[1;31merror:\x1b[0m {msg}\n"))
+                            .ok();
+                        state.in_turn = false;
+                        done_tx.send(None).ok();
+                    }
                 }
-                state.in_turn = false;
-                done_tx.send(prompt).ok();
             }
 
-            SessionEvent::Error(e) => {
-                state.line_buf.clear();
+            // ── compaction ──────────────────────────────────────────
+            // A rolling LLM summary replaced some earlier messages.
+            // Shown as a one-line notice so compaction is observable in
+            // the terminal; the summary itself lives in the log.
+            SessionEvent::Compacted { covers, model, .. } => {
+                let n = covers.len();
                 state
                     .lock_printer()
-                    .print(format!("\x1b[1;31merror:\x1b[0m {e}\n"))
+                    .print(format!(
+                        "{DIM}  ✦ compacted {n} message{} into a summary · {model}{RST}\n",
+                        if n == 1 { "" } else { "s" }
+                    ))
                     .ok();
-                state.in_turn = false;
-                done_tx.send(None).ok();
             }
+
+            // ── tool-pair summarization ─────────────────────────────
+            // A single tool call+result pair was summarized.
+            SessionEvent::ToolSummarized { id, model, .. } => {
+                state
+                    .lock_printer()
+                    .print(format!(
+                        "{DIM}  ◇ summarized tool call {id} · {model}{RST}\n",
+                    ))
+                    .ok();
+            }
+
+            // ── overlay events ─────────────────────────────────────
+            // Edits and deletes are initiated from the web UI (the terminal
+            // can't un-print old output).  Show a one-line notice so the
+            // change is observable in the linear log; the target seq is the
+            // concrete handle for what was touched.
+            SessionEvent::Edited {
+                target,
+                replacement,
+            } => {
+                let kind = match replacement {
+                    EditContent::Text(_) => "message",
+                    EditContent::ToolCall { .. } => "tool call",
+                    EditContent::ToolResult { .. } => "tool result",
+                };
+                state
+                    .lock_printer()
+                    .print(format!("{DIM}  ✎ edited {kind} #{target}{RST}\n"))
+                    .ok();
+            }
+            SessionEvent::Deleted { target } => {
+                state
+                    .lock_printer()
+                    .print(format!("{DIM}  ✕ deleted message #{target}{RST}\n"))
+                    .ok();
+            }
+
+            // ── metadata events (audit only, no terminal rendering) ──
+            SessionEvent::ContextSnapshot { .. }
+            | SessionEvent::ModelChanged { .. }
+            | SessionEvent::SystemPrompt { .. } => {}
 
             SessionEvent::HistoryComplete => {
                 // Web-only sentinel marking end of history replay.
                 // The terminal doesn't batch-render, so ignore it.
+            }
+
+            SessionEvent::ContextUsage { .. } => {
+                // Web-only progress bar — the terminal has no context bar.
             }
         }
     }

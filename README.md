@@ -27,7 +27,7 @@ $ goop
   desktop (screenshot, mouse, keyboard).  You control which tool groups are
   active.
 - **Your model, your keys.**  Bring your own API keys.  Supports DeepSeek,
-  OpenAI, OpenRouter (200+ models), Groq, Anthropic, and local Ollama.
+  OpenAI, OpenRouter (200+ models), Groq, Anthropic, Z.ai, and local Ollama.
 - **Persistent by default.**  Every session is saved to disk — conversation
   history, working directory, and SSH state.  Resume any session by name.
 - **One binary, three interfaces.**  Terminal REPL, desktop GUI (native
@@ -67,7 +67,10 @@ GOOP_MODEL=openrouter/openai/gpt-4o OPENROUTER_API_KEY=sk-… goop
 GOOP_MODEL=ollama/llama3.2 goop
 
 # Groq
-GOOP_MODEL=groq/llama-3.3-70b GROQ_API_KEY=gsk-… goop
+GOOP_MODEL=groq/llama-3.2-70b-versatile GROQ_API_KEY=gsk-… goop
+
+# Z.ai / GLM
+GOOP_MODEL=zai/glm-5.2 ZAI_API_KEY=… goop
 ```
 
 ## Modes
@@ -110,11 +113,14 @@ Environment variables override the config file:
 |---|---|
 | `GOOP_MODEL` | Model in `provider/model` format |
 | `GOOP_OLLAMA_BASE_URL` | Ollama API URL (default: `http://localhost:11434`) |
+| `GOOP_COMPACTION` | Compaction budget — integer or `"80%"` |
+| `GOOP_TOOL_SUMMARIZATION` | Enable tool-pair summarization (`"true"` or `"1"`) |
 | `DEEPSEEK_API_KEY` | DeepSeek API key |
 | `OPENAI_API_KEY` | OpenAI API key |
 | `OPENROUTER_API_KEY` | OpenRouter API key |
 | `GROQ_API_KEY` | Groq API key |
 | `ANTHROPIC_API_KEY` | Anthropic API key |
+| `ZAI_API_KEY` | Z.ai / GLM API key |
 
 ## Tools
 
@@ -123,7 +129,7 @@ goop gives the agent real access to your machine — you decide how much.
 | Group | Tools | Description |
 |---|---|---|
 | `file_ops` | read, write, replace, read_html, cd | File I/O and directory navigation |
-| `shell` | shell | Run arbitrary shell commands |
+| `shell` | shell, restart | Run arbitrary shell commands; restart the server after recompiling |
 | `ssh` | ssh, disconnect | Connect to remote hosts; file and shell tools then run remotely |
 | `web_fetch` | web_fetch | Fetch and extract text from web pages |
 | `computer_use` | screenshot, cursor_position, mouse_*, key_*, window_*, open_url | Desktop control (disabled by default) |
@@ -156,12 +162,70 @@ falling back to password auth.
   back on local ✓
 ```
 
+### Context compaction
+
+When the conversation gets long, goop can automatically summarize the prefix
+into a rolling summary — keeping the LLM focused without losing context.
+
+```toml
+# ~/.config/goop/config.toml
+compaction = "75%"          # trigger at 75% of model's context window
+# compaction = 64000        # or an absolute token limit
+```
+
+Set via `GOOP_COMPACTION` env var or config file.  Opt-in (default off).
+
+Verbose tool call+result pairs can also be individually summarized (tier-1
+compaction), independent of full compaction:
+
+```toml
+[tool_summarization]
+enabled = true
+model = "deepseek/deepseek-v4-flash"   # cheap model for summaries
+min_tokens = 2000
+```
+
+### MCP (Model Context Protocol)
+
+Connect goop to external MCP servers — their tools appear alongside goop's
+built-in tools, named `server.tool`.
+
+```toml
+# ~/.config/goop/config.toml
+[mcp_servers.github]
+type = "http"
+url = "http://localhost:8080"
+shared = true            # one instance, all sessions
+
+[mcp_servers.code_indexer]
+type = "stdio"
+command = "my-indexer"
+args = ["--project", "."]
+
+enabled_mcp_servers = ["github"]
+```
+
+### Speech-to-text
+
+Opt-in local speech recognition via Whisper.  Models auto-download on first use.
+
+```toml
+[stt]
+enabled = true
+model = "base"            # tiny | base | small | medium | large
+```
+
+### Edit, delete, and fork
+
+Right-click or hover any message in the web UI to edit its content (the LLM
+sees the edit), delete it (and its tool-pair half), or fork the conversation
+from that point — branching off a new timeline while preserving the old one.
+
 ## Sessions
 
 Every session is persisted to `~/.config/goop/sessions/`:
 
-- `<name>.jsonl` — full event history (replayed when you reconnect)
-- `<name>.messages.jsonl` — LLM conversation memory (the agent remembers)
+- `<name>.jsonl` — append-only transaction log (full event history, replayed for both UI and LLM memory)
 - `<name>.state.toml` — working directory, SSH state, and per-session config overrides
 
 Sessions are auto-named as `YYYYMMDD_NNN` unless you give them a name with
@@ -186,6 +250,8 @@ The REST API:
 GET  /api/sessions              list active sessions
 POST /api/sessions              create a new session
 DELETE /api/sessions/{name}     close a session
+GET  /api/vapid-public-key      VAPID public key for push notifications
+POST /api/push-subscribe        register a push subscription
 WS   /ws?session={name}         real-time event stream
 ```
 

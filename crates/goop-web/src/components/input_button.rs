@@ -26,15 +26,15 @@
 //!   │         │       │  sent)  │ │      │
 //!   └────┬────┘       └─────────┘ └──────┘
 //!        │
-//!        │ FinalResponse / Error / Cancelled (server) / click-cancel
+//!        │ TurnEnded (server) / click-cancel
 //!        ▼
 //!   ┌──────┐   disconnect ┌──────────┐  connect
 //!   │ Idle │◄────────────│ Disabled │──────────▶ Idle
 //!   └──────┘             └──────────┘
 //! ```
 //!
-//! The key invariant (from the original JS design): **server lifecycle
-//! events (FinalResponse, Error, Cancelled) must never exit the
+//! The key invariant (from the original JS design): **server turn-end
+//! events (TurnEnded) must never exit the
 //! Recording or CancelSlide states.**  The user's finger owns those
 //! states; only a release transitions out of them.  [`on_llm_done`]
 //! enforces this by being a no-op for every variant except `Running`.
@@ -152,7 +152,7 @@ impl BtnState {
         }
     }
 
-    /// Server finished processing (FinalResponse, Error, Cancelled).
+    /// Server finished processing (a TurnEnded event).
     /// Transitions `Running` → `Idle`, but **never** clobbers
     /// `Recording` or `CancelSlide` — the user's finger owns those
     /// states.

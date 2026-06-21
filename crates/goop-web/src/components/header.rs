@@ -77,6 +77,31 @@ pub fn Header() -> impl IntoView {
         }
     };
 
+    // Select mode toggle — enters/exits multi-select for manual compaction.
+    // Always rendered; hidden via `class:hidden` when no session or running.
+    // (The always-render pattern avoids the Leptos `FnOnce`-in-`Fn` trap —
+    // see AGENTS.md "Always-render pattern".)
+    let select_mode = state.select_mode;
+    let toggle_select = {
+        let state = state.clone();
+        move |_| {
+            state.toggle_select_mode();
+        }
+    };
+    let show_select =
+        Signal::derive(move || state.current_session.get().is_some() && !running.get());
+
+    // LLM view toggle — shows exactly what the agent sees (compaction
+    // summaries as plain messages, deleted messages hidden).
+    let llm_view = state.llm_view;
+    let toggle_llm_view = {
+        let state = state.clone();
+        move |_| {
+            state.llm_view.update(|v| *v = !*v);
+        }
+    };
+    let has_session = move || state.current_session.get().is_some();
+
     view! {
         <header>
             <button class="menu-btn" id="menuBtn" title="Sessions" on:click=toggle_sidebar>
@@ -87,6 +112,25 @@ pub fn Header() -> impl IntoView {
                 {move || current_session.get().unwrap_or_else(|| "goop".into())}
             </span>
             <span class="status" id="status">{move || status_text.get()}</span>
+            <button
+                class="select-btn"
+                id="selectBtn"
+                title="Select messages to compact"
+                class:active=select_mode
+                class:hidden=move || !show_select.get()
+                on:click=toggle_select
+            >
+                "⊟"
+            </button>
+            <button
+                class="llm-view-btn"
+                title="Toggle LLM view (show what the model sees)"
+                class:active=llm_view
+                class:hidden=move || !has_session()
+                on:click=toggle_llm_view
+            >
+                "👁"
+            </button>
             <button
                 class="reload-btn"
                 id="reloadBtn"

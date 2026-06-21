@@ -11,14 +11,21 @@ shell access.
 ```
 goop/                         (workspace root)
 ├── crates/
-│   ├── goop-shared/          shared types (SessionEvent, ClientMessage, PromptSource)
+│   ├── goop-shared/          shared types (SessionEvent, ClientMessage, ServerMessage,
+│   │                         LogEntry, AgentVisibleItem, TurnEndReason, PromptSource)
 │   ├── goop-server/          main binary ("goop") — axum server, tools, terminal, GUI
-│   │   └── assets/           embedded fallback HTML (fb.html, used when trunk dist absent)
+│   │   ├── src/
+│   │   │   ├── memory/       LogReplayMemory, transaction_log, compaction, replay
+│   │   │   ├── mcp/          MCP client subsystem (manager, proxy_tool)
+│   │   │   ├── prompts/      LLM prompts (compaction.md, tool_pair.md, multi_tool_compact.md)
+│   │   │   ├── tools/        agent tools — file, shell, restart, ssh, web, computer
+│   │   │   └── ...
+│   │   └── assets/           embedded fallback HTML (fb.html), default_config.toml template
 │   └── goop-web/             Leptos frontend (built by Trunk → wasm)
 │       ├── src/
 │       │   ├── components/   UI components (header, message_log, input_bar, etc.)
 │       │   ├── state.rs      AppState — global reactive state (RwSignals)
-│       │   ├── ws.rs         WebSocket connection + SessionEvent dispatch
+│       │   ├── ws.rs         WebSocket connection + ServerMessage dispatch
 │       │   ├── markdown.rs   Markdown → HTML via marked.js + DOMPurify
 │       │   ├── stt.rs        Speech-to-text bridge (→ js/stt.js)
 │       │   ├── pwa.rs        Service worker + push subscription
@@ -79,15 +86,22 @@ The web UI shows a session sidebar for switching between sessions.
   exists, a well-commented default is written automatically.
 - **`model`** (`src/model.rs`) — provider abstraction layer. Wraps rig's
   type-level providers (DeepSeek, OpenAI, OpenRouter, Groq, Ollama,
-  Anthropic) behind enums so one binary works with any provider. The
+  Anthropic, Z.ai) behind enums so one binary works with any provider. The
   `AnyAgent` enum owns the rig `Agent`; `AnyStream` unifies the
   provider-specific stream types via mapping.  Tools are attached at build
   time via `AgentBuilder::tools(Vec<Box<dyn ToolDyn>>)`, enabling runtime
   configuration of which tool groups are active.
-- **`SessionEvent`** (`src/events.rs`) — enum of all events the session
-  emits: `UserPrompt`, `Thinking`, `AssistantText`, `ToolCall`,
-  `ToolResult`, `FinalResponse`, `Error`, `Cancelled`.  Serialized as
-  tagged JSON over the WebSocket.
+- **`SessionEvent`** (`goop_shared::SessionEvent`) — enum of all events the session
+  emits: `SessionInfo`, `SystemPrompt`, `SessionState`, `UserPrompt`, `Thinking`,
+  `AssistantText`, `ToolCall`, `ToolResult`, `ContextUsage`, `TurnEnded`,
+  `Compacted`, `ToolSummarized`, `ContextSnapshot`, `ModelChanged`, `Edited`,
+  `Deleted`, `HistoryComplete`.  Serialized inside `LogEntry` envelopes over
+  the WebSocket as `ServerMessage::Entry`.  `ContextUsage`
+  (approximate `used`/`limit` token counts) is emitted after each turn
+  so the web UI can show a context-window progress bar.
+  `TurnEnded { reason: TurnEndReason }` replaces the former flat `FinalResponse`,
+  `Error`, and `Cancelled` events — the reason controls replay visibility
+  (`Cancelled { prompt: Some(_) }` → turn dropped; everything else → committed).
 - **Server** (`src/server.rs`) — axum HTTP + WebSocket server bound to
   `127.0.0.1:8187`. Serves the Leptos frontend from disk (trunk dist)
   with an embedded `assets/fb.html` as fallback, a REST API for session
@@ -136,10 +150,22 @@ The web UI shows a session sidebar for switching between sessions.
   fragile: `build_messages` didn't set it, so after history replay or
   session switches it could point to a wrong or nonexistent message).
   Instead it scans the `messages` vec backwards for the most-recent
-  `ToolCall` whose `result` is `None`.  The server serialises tool
+  `ToolCall` whose `result` signal holds `None`.  The server serialises tool
   execution, so the first `None`-result `ToolCall` from the end is always
   the right target.  The scan is O(n) but stops at the first match,
   effectively O(1) in practice.
+
+  **ToolCall fields must be signals** (`state.rs`, `components/message.rs`)
+  — the `UiMessage::ToolCall` variant carries `result` and `expanded` as
+  `RwSignal`s, not plain values.  This is intentional, not over-engineering:
+  `<For>` in `message_log.rs` keys items by `id` and never re-runs the
+  child view for an unchanged key.  The `ToolResult` event arrives *after*
+  the `Message` component for that `ToolCall` has already been rendered, so
+  a by-value `result: Option<String>` would never update in the DOM (the
+  expanded bubble would always be empty).  Using a signal lets the view
+  update reactively regardless of `<For>` reconciliation.  Any new field on
+  `ToolCall` that is populated by a later event must follow the same
+  pattern.
 
   **TurnState FSM** (`state.rs`) — `TurnState { Idle, Thinking, Active }`.
   Replaces the former `thinking: bool` + `remove_last_thinking()` pattern.
@@ -150,6 +176,44 @@ The web UI shows a session sidebar for switching between sessions.
   the same `leave_thinking()` helper — no more duplicated removal logic.
   After `HistoryComplete`, the initial live state is derived from the last
   message in the batch, so the FSM is always in sync with the message list.
+
+  **Compaction tree view** (`state.rs`, `components/message.rs`) — Phase 7 of
+  the compaction redesign.  `Compacted` and `ToolSummarized` events no longer
+  render as one-line notices; they wrap their covered messages in collapsible
+  `UiMessage::CompactedGroup` / `ToolSummaryGroup` tree nodes (faint outline,
+  `▸` arrow, summary header, children hidden by default).  Nesting is
+  structural: a later `Compacted` groups an earlier `CompactedGroup` as a
+  child, so recursive summaries form a tree with no special-casing.
+  `apply_compaction` groups from the first `covers`-matched message to the
+  end of the list (correct for auto-compaction's full-prefix `covers`);
+  `apply_tool_summary` targets by tool-call `id` (now stored on
+  `UiMessage::ToolCall`), recursing into group children.
+
+  **Per-message seq** (`state.rs`) — every agent-visible `UiMessage` carries
+  the transaction-log `seq` of its originating event.  The web client
+  reproduces the server's contiguous-from-zero seq assignment by counting
+  received events (`AppState::seq_counter`, reset on connect, advanced once
+  per event in `build_messages` and `dispatch`).  This is what lets
+  `Compacted.covers` and `Edited`/`Deleted` `target` (both seqs) resolve to
+  the right message.  The invariant holds because every event the client
+  receives went through `Session::emit` (append → contiguous seq); a future
+  live-only event not appended to the log would need to skip the counter.
+  `Edited`/`Deleted` overlays (`apply_edit`/`apply_delete`) search the
+  message tree recursively; edits set an `EditOverlay` signal (replacement +
+  show-original `✎` toggle), deletes set a `deleted` flag (faded
+  strikethrough).  Phase 8 wires the trigger: `ClientMessage::Edit`/`Delete`
+  are sent from the web UI's hover-revealed ✎/✕ action buttons; the server
+  appends the overlay events which come back as live events and set the
+  signals — and like all lazily-populated `UiMessage`
+  state, the overlays are `RwSignal`s (the `<For>`-keyed constraint above).
+
+  **Fork** — the web UI can fork the conversation from any message: right-click
+  or hover-menu → 🔀.  `ClientMessage::Fork { target, content }` tells the
+  server to create a new branch rooted at `target`'s parent, append a new
+  `UserPrompt` on that branch, and run a turn.  The old branch is preserved in
+  the append-only log (reachable via `parent` pointers).  The server broadcasts
+  `ServerMessage::Reset { tip }` to all clients, which then clear their state
+  and re-replay the active branch via `build_agent_view` with the new `active_tip`.
 
 - **Tools** (`src/tools/`) — each tool implements `rig::tool::Tool` on a
   struct that holds an `Arc<SessionState>`.  Tools are organised by group:
@@ -165,10 +229,20 @@ The web UI shows a session sidebar for switching between sessions.
   in `~/.config/goop/models/whisper/`).  Transcription is batch-only
   (push-to-talk): the web UI sends a complete WAV file as a binary WS frame;
   `Session::submit_audio` transcribes it and submits the resulting text as a
-  normal prompt.  STT is opt-in — set `[stt] enabled = true` in config.toml.
+  normal prompt.  STT is opt-in — set `[stt] enabled = true` in config.toml
+  and optionally `model = "base"` (`tiny`|`base`|`small`|`medium`|`large`).
   whisper.cpp contexts are not `Sync`, so transcription is serialised behind
   a tokio `Mutex` (contention is negligible — prompts are already serial).
   WAV parsing uses `hound`; resampling is linear.
+- **MCP** (`src/mcp/`) — Model Context Protocol client.  Connects to external
+  MCP servers (HTTP or stdio) and bridges their tools into the agent as
+  dynamic `ToolDyn` implementations (`McpProxyTool`, named `server.tool`).
+  Per-session `McpManager` handles the handshake (`initialize` →
+  `notify_initialized` → `tools/list`) and holds discovered tool metadata.
+  Servers are configured in config.toml under `[mcp_servers.<name>]` with
+  `type = "http"` or `type = "stdio"`; a `shared = true` flag makes the
+  server a global singleton (one instance across all sessions).  Enabled
+  globally (`enabled_mcp_servers`) or per-session in `<name>.state.toml`.
 - **`SessionState`** (`src/session_state.rs`) — runtime per-session shared
   mutable state: `name`, `home_dir` (from Config), `cwd` (Mutex<PathBuf>),
   `transport` (Mutex<Transport>), and a `state_path` for persistence.  Tools
@@ -187,20 +261,154 @@ The web UI shows a session sidebar for switching between sessions.
   snapshot).  `Transport::to_persisted()` converts a live transport into
   its persistable form.  File and shell tools route through the transport
   so they work transparently on local or remote hosts.
-- **FileConversationMemory** (`src/memory.rs`) — implements rig's
-  `ConversationMemory` trait backed by a JSONL file on disk. One
-  per session at `~/.config/goop/sessions/<name>.messages.jsonl`.
-- **Compaction** (`src/memory.rs`) — `SessionMemory` type alias wraps
-  `FileConversationMemory` in `rig_memory::CompactingMemory` with a
-  `TokenWindowMemory` policy and `TemplateCompactor`.  When the token
-  budget is exceeded, older messages are evicted from the active window
-  and replaced with a rolling text summary (no extra LLM call — the
-  `TemplateCompactor` produces a textual rollup).  The summary cap is
-  4 KiB.  Budget is configured via `compaction` in config.toml (an
-  integer for absolute tokens, or a string like `"80%"` for a percentage
-  of the model's context window, resolved from a built-in lookup table).
-  When not set, the budget is `usize::MAX` (nothing evicted).
-  Env var: `GOOP_COMPACTION`.
+- **TransactionLog** (`src/memory/transaction_log.rs`) — the append-only
+  log struct with **private fields** (`entries`, `next_seq`, `path`).
+  `open(path, name)` is the RAII constructor: loads from disk (with legacy
+  migration), injects `SessionInfo` if absent, persists if new.  `append()`
+  is the **sole mutation path** — assigns seq, computes parent, stamps ts,
+  all under the caller's lock.  `persist()` does best-effort async file
+  write.  Keeping `next_seq` inside the struct (not a separate `AtomicU64`
+  on `Session`) makes the ordering invariant (seq == parent == file order)
+  structural, so a future background appender (tool-pair summarizer) can't
+  corrupt the tree by racing the lock.  The system prompt (preamble) is
+  stored as a `SystemPrompt` event: `ensure_system_prompt()` injects it for
+  new/legacy sessions (no-op if already present), `system_prompt()` reads
+  it.  On resume the stored value is authoritative — the preamble is NOT
+  rebuilt, so the log is a complete audit trail of what the LLM saw.
+- **Shared types** (`goop_shared::*`) — all types shared between server and web
+  UI move through `goop-shared/src/lib.rs`.  Key additions beyond `SessionEvent`:
+  - **`LogEntry`** — envelope carrying `seq`, `parent`, `ts`, and `event`.
+    Every event is wrapped in a `LogEntry` when persisted and streamed over WS.
+  - **`ServerMessage`** — the WS wire format: `Entry(LogEntry)`,
+    `HistoryComplete`, and `Reset { tip }` (broadcast on fork — clients
+    re-replay the active branch).
+  - **`AgentVisibleItem`** — the single-source-of-truth projection from the
+    transaction log into "what the LLM sees" (`UserText`, `AssistantText`,
+    `ToolCall`, `ToolResult`, `Summary`).  Both the server's `replay_visible`
+    and the web UI's `build_messages` consume `build_agent_view()` — no
+    duplicated interpretation.
+  - **`TurnEndReason`** — why a turn ended: `Completed`, `StreamEnded`,
+    `Cancelled { prompt }`, `MaxTurnsExceeded`, `Error`.  Controls whether
+    the turn's content is agent-visible on replay.
+- **System prompts** (`src/prompts/`) — LLM prompt templates stored as
+  external `.md` files (loaded at runtime) rather than inline strings:
+  `compaction.md` (full-compaction system prompt), `tool_pair.md` (single
+  tool-pair summary), `multi_tool_compact.md` (batch tool-pair summary).
+- **LogReplayMemory** (`src/memory/mod.rs`) — implements rig's
+  `ConversationMemory` trait by **replaying the session's append-only
+  transaction log** into `Vec<Message>` (the agent view). The events log
+  (`~/.config/goop/sessions/<name>.jsonl`) is the single source of
+  truth — the old separate `<name>.messages.jsonl` is eliminated.
+  `load()` replays; `append()`/`clear()` are no-ops (the session writes
+  every event to the log during streaming). The log is shared
+  (`Arc<Mutex<TransactionLog>>`) between the session and the memory. See
+  `docs/compaction-redesign.md`.
+- **Log replay** (`replay_visible` in `src/memory/replay.rs`) — turns are
+  buffered and committed only at a `TurnEnded` event;
+  `TurnEnded::Cancelled { prompt: Some(_) }` drops the turn (no work
+  committed), every other reason commits it. A trailing in-progress turn
+  is dropped (rig appends the current prompt itself, so replay omits it).
+  An orphan-tool-pair net drops any `ToolCall` whose `ToolResult` is
+  absent. Replay is a **pure projection** (takes `&[LogEntry]`, returns
+  `Vec<Message>`) — kept separate from `TransactionLog` for independent
+  testability and to respect the distinction between the source of truth
+  and its consumer-specific projections. Legacy pre-redesign events
+  (removed `FinalResponse`/`Error`/`Cancelled`; `ToolCall`/`ToolResult`
+  with no `id`) are migrated on load (in `transaction_log.rs`) — turn-end
+  variants map to `TurnEnded` and tool calls/results get order-paired
+  synthetic ids.
+- **Compaction** (`src/memory/compaction.rs` + `src/session.rs`) — when the
+  agent-visible conversation exceeds a token threshold, the whole prefix
+  is summarized into a rolling `Compacted { summary, model, covers,
+  manual }` event before the next turn.  **Summarization is goose-style:**
+  messages to summarize are formatted as plain text via
+  `format_message_for_compacting` (see goose's BSD-3-Clause
+  `format_message_for_compacting` for the original) and embedded in the
+  system prompt, rather than passed as structured `Message` objects.
+  This prevents the summarizer LLM from acting as a conversation
+  participant (making tool calls, etc.).  The system prompt
+  (`COMPACTION_SYSTEM_PROMPT`) is derived from goose's `compaction.md`
+  (BSD-3-Clause) and directs the model to produce structured sections:
+  User Intent, Technical Concepts, Files+Code, Errors+Fixes, Problem
+  Solving, User Messages, Pending Tasks, Current Work, Next Step.
+  A continuation instruction (`AUTO_COMPACT_CONTINUATION_TEXT` /
+  `MANUAL_COMPACT_CONTINUATION_TEXT`) is appended to the summary so the
+  agent knows it's working from a summary and doesn't mention it.
+  Prompts are loaded at runtime from `prompts/compaction.md` (not
+  hard-coded).
+  **Most-recent user message preservation:** auto-compaction excludes
+  the most-recent user message from `covers` (but includes it in the
+  summarization context), so the exact user request survives
+  uncompacted — goose-style.  Manual compaction does not preserve.
+  Replay applies it: the covered items (by seq) are dropped and the
+  summary inserted. Summaries are themselves agent-visible, so later
+  compactions summarize the prior summary (a rolling summary). The
+  threshold comes from `compaction` in config.toml
+  (`CompactionMode::Tokens(n)` or `Percent(pct)` of the model's context
+  window); `None` disables it — **opt-in (default off)**.
+  Env: `GOOP_COMPACTION`.  Summarization is a one-shot, tool-less,
+  memory-less completion (`AnyAgent::summarize`) with an embedded system
+  prompt.  A failed summarization is logged and skipped (full history
+  kept).  The pure decision logic (`compaction_covers`) is in
+  `memory/compaction.rs` and unit-tested; `session.rs`'s `maybe_compact`
+  is thin glue (snapshot → decide → LLM call → emit).
+- **Tool-pair summarization** (`src/memory/compaction.rs` + `src/session.rs`
+  + `src/memory/replay.rs`) — tier-1 compaction: verbose individual tool
+  call+result pairs are summarized by an LLM into `ToolSummarized { id,
+  summary, model }` events, reclaiming tokens incrementally without a full
+  context rewrite. `maybe_summarize_tool_pairs()` runs between prompts in
+  `drain_queue` (alongside `maybe_compact`), using a snapshot → summarize
+  (outside lock) → revalidate → commit lifecycle.  Pairs are formatted as
+  text and embedded in the system prompt (same goose-style approach as full
+  compaction, using prompts from `prompts/tool_pair.md` and
+  `prompts/multi_tool_compact.md`) via the same `AnyAgent::summarize(system_prompt, user_prompt)`
+  API.  The pure decision logic
+  (`select_tool_summary_candidates` — trigger check, most-recent-turn
+  protection, min-tokens filter, batch truncation; `revalidate_tool_summaries`
+  — drop vanished pairs) is in `memory/compaction.rs` and unit-tested;
+  `session.rs` is thin glue around the LLM calls. Replay applies
+  `ToolSummarized` via `apply_tool_summary()` — content-granularity surgery
+  that splices the target call/result out of merged messages (reusing the
+  `drop_orphaned_tool_pairs` rebuild pattern).  Targets by tool-call `id`
+  (stable across merging), not `seq`. Config: `[tool_summarization]` in
+  config.toml (`enabled`, `model`, `min_tokens`, `trigger_tool_count`);
+  **opt-in (default off)**. Env: `GOOP_TOOL_SUMMARIZATION*`.  A separate
+  `AnyAgent` is built via `build_summarizer()` when `model` is set;
+  otherwise the session's main agent is used.  The most-recent turn's tool
+  calls are protected from summarization.
+- **Manual range compaction** (`src/session.rs` + `src/memory/compaction.rs`)
+  — the user can manually select a range of messages in the web UI and
+  compact them into a summary.  `ClientMessage::CompactRange { covers }`
+  triggers `Session::compact_range`, which **queues the action through
+  `drain_queue`** (same channel as prompts) so it is serialized — no races
+  with concurrent prompt processing.  The queued action emits the full
+  lifecycle: `Thinking` → `Compacted { manual: true, .. }` → `TurnEnded`,
+  so the client shows the `Running` button state (with Cancel) and exits
+  select mode only when the compaction completes.  Cancellation uses a
+  `tokio::select!` race between the `summarize` call and `cancel_rx`,
+  allowing the user to abort a long-running summarization.  Validation
+  (`covers.len() >= 2`, `covered_messages` must return non-empty) produces
+  `TurnEnded::Error` with actionable messages on mismatch.  Replay is
+  unchanged — `covers` is an arbitrary `Vec<u64>`, so manual and auto
+  compaction use the same path.  The web UI uses a select mode (header ⊟
+  toggle → per-message checkboxes → `SelectBar` footer with ✦ Compact /
+  ✕ Done).  `AppState::compacting` (a `RwSignal`) tracks in-flight
+  compactions; `TurnEnded` checks it to exit select mode.  See §2.11 of
+  the redesign doc.
+- **Context snapshots** (`src/session.rs`) — before each turn the session
+  emits `ContextSnapshot { seqs, model }`, recording which events formed
+  the LLM's context. Replay skips it (audit-only metadata).
+- **System prompt** (`src/preamble.rs` + `src/session.rs` +
+  `src/memory/transaction_log.rs`) — the preamble (system prompt) is built
+  once via `build_preamble()` for new sessions, stored as a `SystemPrompt`
+  event in the transaction log, and baked into the agent at build time.
+  On resume the log's stored value is authoritative — the preamble is NOT
+  rebuilt, so edits to USER.md / AGENTS.md only take effect on new sessions.
+  This makes the log a complete audit trail of what the LLM saw.  The web
+  UI's LLM view (👁) renders the stored preamble in a collapsible panel
+  above the message log.  `SystemPrompt` is metadata — skipped during
+  agent-memory replay (it's already in the agent's preamble, not the
+  conversation messages).
 
 ## Startup modes
 
@@ -249,12 +457,17 @@ Tera at runtime, embedded via `include_str!` at compile time):
 # goop configuration — ~/.config/goop/config.toml
 #
 # Environment variable overrides this file:
-#   GOOP_MODEL             — model in provider/model format
-#   GOOP_OLLAMA_BASE_URL   — Ollama API base URL (default: http://localhost:11434)
+#   GOOP_MODEL                        — model in provider/model format
+#   GOOP_OLLAMA_BASE_URL              — Ollama API base URL (default: http://localhost:11434)
+#   GOOP_COMPACTION                   — compaction budget (integer or "80%")
+#   GOOP_TOOL_SUMMARIZATION           — enable tool-pair summarization ("true" or "1")
+#   GOOP_TOOL_SUMMARIZATION_MODEL     — model for tool-pair summaries (provider/model format)
+#   GOOP_TOOL_SUMMARIZATION_MIN_TOKENS — min tokens for a pair to be worth summarizing
+#   GOOP_TOOL_SUMMARIZATION_TRIGGER    — tool-call count that triggers summarization
 
 # LLM model in litellm-style provider/model format.
 # Provider is the first segment, model is everything after.
-# Supported providers: deepseek | openai | openrouter | groq | ollama | anthropic
+# Supported providers: deepseek | openai | openrouter | groq | ollama | anthropic | zai
 model = "deepseek/deepseek-v4-pro"
 
 # Maximum tokens per response.
@@ -263,26 +476,64 @@ max_tokens = 100000
 # Maximum tool-calling turns per prompt (safety limit).
 default_max_turns = 100
 
+# When the agent-visible conversation exceeds a token budget, the entire
+# prefix is summarized by an LLM into a rolling summary before the next
+# turn.  Accepts an integer (absolute tokens) or "80%" (percentage of
+# the model's context window).  Uncomment to enable.
+# compaction = "75%"
+
 # Tool groups enabled for the agent.
 # Available: file_ops, shell, ssh, web_fetch, computer_use
 enabled_tool_groups = ["file_ops", "shell", "ssh", "web_fetch"]
 
-# Token budget for context compaction — when the conversation exceeds this
-# many tokens, older messages are evicted and replaced with a rolling text
-# summary.  Remove or comment out to disable (unlimited context).
-# compaction_token_budget = 64000
-
 # Base URL for the Ollama API.  Only used when provider is ollama.
 # Uncomment and set if Ollama runs on a nonstandard port or remote host.
 # ollama_base_url = "http://localhost:11434"
+
+# Verbose tool call+result pairs are individually summarized by an LLM,
+# reclaiming tokens without a full context compaction.  Independent of
+# the compaction budget above.  Uncomment to enable.
+# [tool_summarization]
+# enabled = true
+# model = "deepseek/deepseek-v4-flash"   # omit → session's main model
+# min_tokens = 2000                      # only summarize verbose pairs
+# trigger_tool_count = 15                # omit → default (15)
+
+# ── MCP servers (Model Context Protocol) ─────────────────────────────
+# Define named MCP servers.  Enable globally (enabled_mcp_servers) or
+# per-session in <name>.state.toml.
+#
+# [mcp_servers.example]
+# type = "http"
+# url = "http://localhost:8080"
+# shared = true          # one instance shared across sessions
+#
+# [mcp_servers.code_indexer]
+# type = "stdio"
+# command = "my-indexer"
+# args = ["--project", "."]
+#
+# enabled_mcp_servers = ["example"]
+
+# ── Speech-to-text (STT) ──────────────────────────────────────────────
+# Local speech recognition via OpenAI Whisper (whisper.cpp).
+# Models auto-downloaded once, cached in ~/.config/goop/models/whisper/
+#
+# [stt]
+# enabled = true       # enable mic input in web UI
+# model = "base"       # tiny | base | small | medium | large
 ```
 
 Environment variables override the config file:
 - `GOOP_MODEL` — model in `provider/model` format (e.g. `openai/gpt-4o`, `openrouter/openai/gpt-4o`)
 - `GOOP_OLLAMA_BASE_URL` — Ollama API base URL (overrides the `ollama_base_url` config field)
-- `GOOP_COMPACTION_TOKEN_BUDGET` — token budget for context compaction
+- `GOOP_COMPACTION` — compaction budget (integer or `"80%"`)
+- `GOOP_TOOL_SUMMARIZATION` — enable tool-pair summarization (`"true"` or `"1"`)
+- `GOOP_TOOL_SUMMARIZATION_MODEL` — model for tool-pair summaries (provider/model format)
+- `GOOP_TOOL_SUMMARIZATION_MIN_TOKENS` — minimum tokens for a pair to be worth summarizing
+- `GOOP_TOOL_SUMMARIZATION_TRIGGER` — tool-call count that triggers summarization
 - Provider-specific API keys: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`,
-  `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`
+  `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `ZAI_API_KEY`
   (Ollama reads `OLLAMA_API_KEY` for authentication when behind a proxy;
   Ollama base URL can also be set via the provider-level `OLLAMA_API_BASE_URL`
   env var, but `GOOP_OLLAMA_BASE_URL` and the config field take precedence)
@@ -313,17 +564,21 @@ directly to pass the configurable `ollama_base_url` (from `Config` or
 
 ### Session lifecycle
 - **Creation:** `SessionManager::create(name)` → `Session::new(256, Some(name))`.
-  The session loads events, messages, and state (config overrides + CWD +
-  transport) from disk if files exist.  Session config overrides are merged
-  into the global config before building the agent.
+  The session loads the transaction log and state (config overrides + CWD +
+  transport) from disk if files exist.  Memory is derived by replaying the log.
+  Session config overrides are merged into the global config before building
+  the agent.  The system prompt (preamble) is taken from the transaction log if
+  present (resume) or built via `build_preamble()` and injected (new session) —
+  see **System prompt** in the Architecture section.
 - **Discovery:** On server start, `SessionManager::discover()` scans
   `~/.config/goop/sessions/` for `*.jsonl` and `*.state.toml` files,
   extracts session names, and calls `get_or_create` for each **except**
   those listed in `~/.config/goop/closed_sessions.json`.  Existing sessions
   become immediately available.
-- **Persistence:** Each session stores three files:
-  - `<name>.jsonl` — event stream (JSONL)
-  - `<name>.messages.jsonl` — LLM conversation memory (JSONL)
+- **Persistence:** Each session stores two files:
+  - `<name>.jsonl` — append-only transaction log (`LogEntry` envelopes,
+    JSONL): both the UI history and the agent's memory (derived by
+    replay). Loaded into the session's `history` Vec on startup.
   - `<name>.state.toml` — config overrides + CWD + transport state (TOML)
 - **Closing (sidebar ×):** `DELETE /api/sessions/{name}` removes the session
   from the in-memory map and adds its name to `closed_sessions.json`.  Disk
@@ -489,18 +744,16 @@ Two independent history systems:
 - Always active.  If `--session <name>` is given the session is stored
   under that name; otherwise a name is auto-generated as `YYYYMMDD_NNN`
   (e.g. `20260128_001`), picking the next free sequence number for today.
-- Two files under `~/.config/goop/sessions/`:
-  - `<name>.jsonl` — `SessionEvent` stream (JSONL). Loaded into the
-    session's `history` Vec on startup so late-joining clients see past
-    events via `subscribe_all()`. Appended to on every `emit()`.
-  - `<name>.messages.jsonl` — LLM `Message` objects (JSONL). Managed by
-    `FileConversationMemory` which implements rig's `ConversationMemory`
-    trait. The agent's internal memory loads from this file before each
-    prompt and appends after each successful turn.  Cancelled prompts
-    also persist the user message and any completed tool turns
-    (see Cancellation recovery above).
+- One file under `~/.config/goop/sessions/`:
+  - `<name>.jsonl` — the append-only transaction log (`LogEntry` envelopes,
+    JSONL). Loaded into the session's `history` Vec on startup so
+    late-joining clients see past events via `subscribe_all()`, and
+    **replayed by `LogReplayMemory`** to derive the agent's conversation
+    memory. Appended to on every `emit()`. (The old separate
+    `<name>.messages.jsonl` is gone — memory is log-replay.)
 - When a session file exists, the agent picks up the conversation where
-  it left off.
+  it left off (turn-end reasons control replay visibility; cancelled-
+  no-work turns are dropped, committed work is kept).
 
 ## Key design decisions
 
@@ -529,8 +782,22 @@ Two independent history systems:
   Instead the `Cancelled` event carries the prompt text and the terminal
   repopulates the input line via `readline_with_initial` so the user can
   edit and resubmit immediately.
-- **Prompt queue.** `Session::submit()` sends into an unbounded mpsc;
-  a background `drain_queue()` task processes them serially.
+- **Error recovery (shared with cancellation).** The same preservation
+  logic runs on the **stream-error** path (`Some(Err(e))`), not just
+  cancellation.  rig yields errors — most notably
+  `PromptError::MaxTurnsError` — only *after* many tool turns have
+  already completed, so without this an error would discard the user
+  prompt and every completed tool turn.  Both early-exit paths now call
+  the shared `preserve_committed_turns()` helper, which saves the user
+  prompt + all completed `ToolCall`/`ToolResult` pairs to memory (and is
+  a no-op when nothing completed).  The `MaxTurnsError` is surfaced with
+  an actionable message noting that work was saved; other errors are
+  shown verbatim.
+- **Prompt queue.**  All actions (prompts and manual compaction) go through
+  a single unbounded mpsc channel as `QueuedAction` enum variants.  A
+  background `drain_queue()` task processes them serially — no races, and
+  every action emits lifecycle events (`Thinking` + `TurnEnded`) so the
+  client shows proper progress and can cancel.
 - **History replay.** `subscribe_all()` returns a `SessionSubscriber`
   that replays all past events before yielding live ones. This lets
   late-joining web clients catch up.
@@ -563,6 +830,12 @@ GOOP_MODEL=ollama/llama3.2 cargo run
 
 # Anthropic
 GOOP_MODEL=anthropic/claude-sonnet-4-6 ANTHROPIC_API_KEY=… cargo run
+
+# Z.ai / GLM
+GOOP_MODEL=zai/glm-5.2 ZAI_API_KEY=… cargo run
+
+# Groq
+GOOP_MODEL=groq/llama-3.2-70b-versatile GROQ_API_KEY=… cargo run
 
 # Start the server in the background, then connect terminal + GUI
 DEEPSEEK_API_KEY=… cargo run -- serve &

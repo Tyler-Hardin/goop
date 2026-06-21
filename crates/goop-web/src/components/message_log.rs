@@ -8,7 +8,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::Closure;
 
 use crate::components::message::Message;
-use crate::state::AppState;
+use crate::markdown::render_markdown;
+use crate::state::{AppState, UiMessage};
 
 /// Scrollable message list.
 ///
@@ -20,6 +21,11 @@ use crate::state::AppState;
 /// Auto-scrolls to the bottom on new content unless the user has scrolled
 /// away.  Scrolls are throttled via `requestAnimationFrame` so the visual
 /// update stays smooth even when streaming chunks arrive faster than 60 fps.
+///
+/// **Select mode:** when `AppState::select_mode` is on, each agent-visible
+/// message gets a checkbox on its left.  Clicking the checkbox toggles the
+/// message's selection for manual range compaction (§2.11).  Non-agent-
+/// visible messages (Thinking, FinalResponse, etc.) don't get a checkbox.
 #[component]
 pub fn MessageLog() -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState missing");
@@ -162,7 +168,7 @@ pub fn MessageLog() -> impl IntoView {
             }
             let text = state.streaming_text.get_untracked();
             let prev_len = streamed_len.get_untracked();
-            if let Some(el) = stream_ref.get() {
+            if let Some(el) = stream_ref.get_untracked() {
                 if text.is_empty() {
                     el.set_text_content(None);
                     streamed_len.set(0);
@@ -208,17 +214,92 @@ pub fn MessageLog() -> impl IntoView {
         }
     };
 
+    // Capture signals before `state` is moved into the <For> closure.
+    let select_mode = state.select_mode;
+    let llm_view = state.llm_view;
+
+    // System prompt (preamble) — shown in both chat and LLM view.
+    // Collapsed by default (the preamble can be very long — it includes
+    // AGENTS.md).
+    let system_prompt = state.system_prompt;
+    let sp_expanded = RwSignal::new(false);
+    let sp_html = RwSignal::new(String::new());
+    Effect::new(move || {
+        if let Some(text) = system_prompt.get() {
+            sp_html.set(render_markdown(&text));
+        } else {
+            sp_html.set(String::new());
+        }
+    });
+
     view! {
-        <main id="log" node_ref=scroll_ref on:scroll=on_scroll>
+        <main
+            id="log"
+            node_ref=scroll_ref
+            on:scroll=on_scroll
+            class:select-mode=move || select_mode.get()
+        >
+            // System prompt — metadata, not a conversation message.  Rendered
+            // above the <For> so it doesn't interfere with compaction
+            // targeting, selection indices, or <For> keying.  Visible in
+            // both chat and LLM views when a preamble is present.
+            <div
+                class="msg system-prompt"
+                class:hidden=move || system_prompt.get().is_none()
+            >
+                <div class="system-prompt-header" on:click=move |_| sp_expanded.update(|v| *v = !*v)>
+                    <span class="arrow" class:open=move || sp_expanded.get()>"▸"</span>
+                    <span class="system-prompt-label">"⚙ System Prompt"</span>
+                </div>
+                <div class="system-prompt-body" class:hidden=move || !sp_expanded.get()>
+                    <div class="rendered-inner" inner_html=move || sp_html.get()></div>
+                </div>
+            </div>
             // Messages from state, rendered with stable keys via <For>.
             // Each message has a unique `id` — Leptos tracks items by key,
             // so adding a new message only inserts one DOM node instead of
             // recreating the entire list.  This prevents the CSS fadeIn
             // animation from re-triggering on every existing message.
+            //
+            // **Chat view** (default): `CompactedGroup`/`ToolSummaryGroup`
+            // are flattened into their original children — the user sees the
+            // full conversation as if compaction never happened.
+            //
+            // **LLM view** (👁): groups are kept as-is (summaries replace
+            // covered messages), and deleted messages are filtered out —
+            // this shows exactly what the agent sees.
+            //
+            // In select mode (chat-view-only), messages are enumerated so
+            // clicking sets the range start/end for manual compaction.
             <For
-                each=move || state.messages.get()
-                key=|msg| msg.id()
-                children=move |msg| view! { <Message msg /> }
+                each=move || {
+                    let msgs = state.messages.get();
+                    let filtered: Vec<UiMessage> =
+                        crate::state::displayed_messages(&msgs, llm_view.get());
+                    filtered.into_iter().enumerate().collect::<Vec<_>>()
+                }
+                key=|(_, msg): &(usize, UiMessage)| msg.id()
+                children=move |(idx, msg)| {
+                    let st = state.clone();
+                    let st_sel = st.clone();
+
+                    view! {
+                        <div
+                            class="msg-select-wrap"
+                            class:selected=move || st_sel.select_mode.get() && st_sel.is_in_selection(idx)
+                        >
+                            <div
+                                class="msg-select-overlay"
+                                class:hidden=move || !st.select_mode.get()
+                                on:click=move |evt| {
+                                    evt.stop_propagation();
+                                    st.select_click(idx);
+                                }
+                            ></div>
+                            <Message msg />
+                        </div>
+                    }
+                }
             />
             // Live streaming assistant text (not yet flushed to messages).
             // The "streaming" class suppresses the per-message fadeIn

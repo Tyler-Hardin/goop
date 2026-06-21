@@ -3,3 +3,6 @@ target
 
 crates/goop-web/dist/
 crates/goop-web/dist/
+
+logs/
+nohup.out

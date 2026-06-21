@@ -4740,6 +4740,7 @@ dependencies = [
  "streamdown-render",
  "subprocess",
  "tao",
+ "tempfile",
  "tera",
  "thiserror 2.0.18",
  "tokio",
@@ -4757,6 +4758,7 @@ dependencies = [
 name = "goop-shared"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
 ]

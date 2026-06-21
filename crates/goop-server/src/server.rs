@@ -202,7 +202,9 @@ fn find_web_dist() -> Option<std::path::PathBuf> {
 }
 
 /// Launch the axum HTTP + WebSocket server.
-/// Binds to 127.0.0.1:8187 — safe behind an nginx reverse proxy.
+/// Binds to `127.0.0.1:8187` by default — safe behind an nginx reverse proxy.
+/// Override the port with `GOOP_PORT` (useful for running a second instance
+/// for testing without disturbing the primary server).
 ///
 /// Returns when the shutdown signal fires (restart tool or Ctrl+C).
 pub async fn serve(
@@ -210,8 +212,13 @@ pub async fn serve(
     push_manager: Arc<crate::push::PushManager>,
 ) -> anyhow::Result<()> {
     let app = build_router(manager, push_manager);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8187").await?;
-    tracing::info!("web server on http://127.0.0.1:8187");
+    let port: u16 = std::env::var("GOOP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8187);
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("web server on http://{addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -402,9 +409,9 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
     let mut send_task = tokio::spawn(async move {
         loop {
             match events.recv().await {
-                Ok(event) => {
-                    let json = serde_json::to_string(&event)
-                        .expect("SessionEvent serialization should never fail");
+                Ok(msg) => {
+                    let json = serde_json::to_string(&msg)
+                        .expect("ServerMessage serialization should never fail");
                     if tx
                         .send(axum::extract::ws::Message::Text(json.into()))
                         .await
@@ -432,6 +439,21 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
                             }
                             ClientMessage::Cancel => {
                                 session.cancel().await;
+                            }
+                            ClientMessage::Edit {
+                                target,
+                                replacement,
+                            } => {
+                                session.edit(target, replacement).await;
+                            }
+                            ClientMessage::Delete { target } => {
+                                session.delete(target).await;
+                            }
+                            ClientMessage::Fork { target, content } => {
+                                session.fork(target, content).await;
+                            }
+                            ClientMessage::CompactRange { covers } => {
+                                session.compact_range(covers);
                             }
                         }
                     }

@@ -12,8 +12,7 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use rig::agent::Agent;
 use rig::client::CompletionClient;
-use rig::completion::Message;
-use rig::memory::ConversationMemory;
+use rig::completion::{AssistantContent, CompletionModel, Message};
 use rig::providers::{anthropic, deepseek, groq, ollama, openai, openrouter, zai};
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 
@@ -54,6 +53,13 @@ pub(crate) enum AnyAgent {
     Anthropic(Agent<anthropic::completion::CompletionModel>),
     /// Z.ai / GLM — OpenAI-compatible API.  Only GLM-5.2 is used.
     Zai(Agent<openai::completion::GenericCompletionModel<zai::ZAiExt>>),
+    /// Test-only mock that returns a canned summary.  Panics on
+    /// [`stream_prompt`](Self::stream_prompt) — the integration test only
+    /// exercises the compaction path (which uses [`summarize`](Self::summarize)).
+    #[cfg(test)]
+    Mock {
+        summarize_result: String,
+    },
 }
 
 impl AnyAgent {
@@ -67,36 +73,56 @@ impl AnyAgent {
             AnyAgent::Ollama(a) => AnyStream::Ollama(a.stream_prompt(prompt).await),
             AnyAgent::Anthropic(a) => AnyStream::Anthropic(a.stream_prompt(prompt).await),
             AnyAgent::Zai(a) => AnyStream::Zai(a.stream_prompt(prompt).await),
+            #[cfg(test)]
+            AnyAgent::Mock { .. } => panic!("Mock agent does not support streaming"),
         }
     }
 
-    /// Append messages to the agent's conversation memory.
+    /// One-shot, non-streaming completion used for **compaction summarization**
+    /// (no agent memory, no tools — just the model + a system prompt).  Used to
+    /// roll up the agent-visible conversation into a single summary message.
     ///
-    /// Used when a prompt is cancelled mid-stream — the rig stream only
-    /// saves to memory on [`FinalResponse`], so a cancelled prompt loses
-    /// the user message and any completed tool turns.  This method lets
-    /// us explicitly preserve what we can.
-    pub(crate) async fn append_to_memory(&self, messages: Vec<Message>) {
-        // Each variant has the same field layout; extract via macro.
-        macro_rules! do_append {
-            ($agent:expr) => {
-                if let Some(ref memory) = $agent.memory
-                    && let Some(ref conv_id) = $agent.default_conversation_id
-                {
-                    if let Err(e) = memory.append(conv_id, messages).await {
-                        tracing::warn!("failed to save cancelled state to memory: {e}");
-                    }
-                }
-            };
+    /// The conversation to summarize is embedded as text inside `system_prompt`
+    /// (see [`format_messages_for_compacting`]).  `user_prompt` is a short
+    /// instruction to the model, e.g. "Please summarize the conversation
+    /// history provided in the system prompt."  Returns the concatenated
+    /// assistant text.
+    pub(crate) async fn summarize(
+        &self,
+        system_prompt: String,
+        user_prompt: &str,
+    ) -> anyhow::Result<String> {
+        macro_rules! do_summarize {
+            ($agent:expr) => {{
+                let model = &$agent.model;
+                let resp = model
+                    .completion_request(Message::user(user_prompt))
+                    .preamble(system_prompt)
+                    .send()
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                let text: String = resp
+                    .choice
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                Ok(text)
+            }};
         }
         match self {
-            AnyAgent::DeepSeek(a) => do_append!(a),
-            AnyAgent::OpenAI(a) => do_append!(a),
-            AnyAgent::OpenRouter(a) => do_append!(a),
-            AnyAgent::Groq(a) => do_append!(a),
-            AnyAgent::Ollama(a) => do_append!(a),
-            AnyAgent::Anthropic(a) => do_append!(a),
-            AnyAgent::Zai(a) => do_append!(a),
+            AnyAgent::DeepSeek(a) => do_summarize!(a),
+            AnyAgent::OpenAI(a) => do_summarize!(a),
+            AnyAgent::OpenRouter(a) => do_summarize!(a),
+            AnyAgent::Groq(a) => do_summarize!(a),
+            AnyAgent::Ollama(a) => do_summarize!(a),
+            AnyAgent::Anthropic(a) => do_summarize!(a),
+            AnyAgent::Zai(a) => do_summarize!(a),
+            #[cfg(test)]
+            AnyAgent::Mock { summarize_result } => Ok(summarize_result.clone()),
         }
     }
 }
@@ -313,4 +339,79 @@ fn finish_agent<M: rig::completion::CompletionModel>(
         .conversation_id("default")
         .memory(memory)
         .build()
+}
+
+/// Build a minimal agent (no tools, no memory) for tool-pair summarization.
+///
+/// Returns `Ok(None)` when no separate summarization model is configured —
+/// the caller should use the session's main agent in that case.
+///
+/// On error (bad model string, missing API key), the caller should log a
+/// warning and fall back to the main model.
+pub fn build_summarizer(config: &Config) -> anyhow::Result<Option<Arc<AnyAgent>>> {
+    let model_str = match &config.tool_summarization.model {
+        Some(m) => m.as_str(),
+        None => return Ok(None),
+    };
+    let model: crate::config::Model = model_str
+        .parse()
+        .map_err(|e: crate::config::ConfigError| anyhow::anyhow!("{e}"))?;
+    let provider = model.provider();
+    let model_name = model.model_name().to_string();
+
+    macro_rules! arm {
+        ($variant:ident, $new_client:expr) => {{
+            let client = $new_client;
+            AnyAgent::$variant(client.agent(&model_name).build())
+        }};
+    }
+
+    let any_agent = match provider {
+        Provider::DeepSeek => arm!(
+            DeepSeek,
+            deepseek::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::OpenAI => arm!(
+            OpenAI,
+            openai::CompletionsClient::new(
+                &config::api_key_for(provider).map_err(anyhow::Error::new)?
+            )?
+        ),
+        Provider::OpenRouter => arm!(
+            OpenRouter,
+            openrouter::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::Groq => arm!(
+            Groq,
+            groq::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::Ollama => {
+            let ollama_api_key = std::env::var("OLLAMA_API_KEY").ok();
+            arm!(
+                Ollama,
+                ollama::Client::builder()
+                    .api_key(ollama::OllamaApiKey::from(
+                        ollama_api_key.unwrap_or_default().as_str(),
+                    ))
+                    .base_url(&config.ollama_base_url)
+                    .build()?
+            )
+        }
+        Provider::Anthropic => arm!(
+            Anthropic,
+            anthropic::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+        Provider::Zai => arm!(
+            Zai,
+            zai::Client::new(&config::api_key_for(provider).map_err(anyhow::Error::new)?)?
+        ),
+    };
+
+    tracing::info!(
+        "● summarizer · {}  model · {}",
+        provider.label(),
+        model_name
+    );
+
+    Ok(Some(Arc::new(any_agent)))
 }

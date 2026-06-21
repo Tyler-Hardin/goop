@@ -1,4 +1,4 @@
-use goop_shared::SessionEvent;
+use goop_shared::ServerMessage;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::Closure;
@@ -25,6 +25,13 @@ pub fn connect(state: &AppState, session_name: String) {
     // the server sends HistoryComplete, then flushed in one batch.
     state.history_buffer.set(Vec::new());
     state.connection.set(ConnectionState::CatchingUp);
+    state.streaming_seq.set(None);
+    // Clear the context-usage bar so the previous session's value
+    // doesn't linger until history replay completes.
+    state.context_usage.set(None);
+    // Clear the system prompt so the previous session's preamble doesn't
+    // linger until history replay delivers the new one.
+    state.system_prompt.set(None);
 
     let w = web_sys::window().expect("no global window");
     let host = w
@@ -48,7 +55,7 @@ pub fn connect(state: &AppState, session_name: String) {
         // backoff so the next unexpected disconnect starts fresh.
         state_on_open.reconnect_attempt.set(0);
         // Connection state stays at CatchingUp — HistoryComplete promotes
-        // it to Connected in handle_event().  The dot turns green via
+        // it to Connected in handle_subscribed().  The dot turns green via
         // is_ws_open() which already covers CatchingUp.
         state_on_open.btn_state.update(|s| {
             if *s == BtnState::Disabled {
@@ -63,12 +70,12 @@ pub fn connect(state: &AppState, session_name: String) {
     let on_message =
         Closure::<dyn Fn(web_sys::MessageEvent)>::new(move |evt: web_sys::MessageEvent| {
             if let Some(text) = evt.data().as_string() {
-                match serde_json::from_str::<SessionEvent>(&text) {
-                    Ok(event) => {
+                match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(msg) => {
                         let state = state_on_msg.clone();
                         if let Some(window) = web_sys::window() {
                             let cb = Closure::once(move || {
-                                state.handle_event(event);
+                                state.handle_subscribed(msg);
                             });
                             let _ = window.set_timeout_with_callback(cb.as_ref().unchecked_ref());
                             cb.forget();

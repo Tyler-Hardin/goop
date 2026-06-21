@@ -96,6 +96,12 @@ struct SessionStateInner {
     local_cwd: PathBuf,
     transport: Transport,
     session_config: SessionConfig,
+    /// Active branch tip, mirrored from the [`TransactionLog`](crate::TransactionLog)
+    /// for persistence.  `None` = "last entry" (linear default).  The log is
+    /// the source of truth for replay; this mirror is written to
+    /// `<name>.state.toml` by [`save`](SessionState::save) and kept in sync by
+    /// the session when a branch switch happens.
+    active_tip: Option<u64>,
 }
 
 impl SessionStateInner {
@@ -135,9 +141,16 @@ impl SessionState {
                 local_cwd: initial_local_cwd,
                 transport: Transport::Local,
                 session_config,
+                active_tip: None,
             }),
             state_path,
         }
+    }
+
+    /// Set the persisted active-tip mirror (called by the session on a branch
+    /// switch).  Does not save — the caller persists via [`save`](Self::save).
+    pub(crate) async fn set_active_tip(&self, tip: Option<u64>) {
+        self.inner.lock().await.active_tip = tip;
     }
 
     // ── public operations (called by tools) ────────────────────────
@@ -410,6 +423,7 @@ impl SessionState {
                 config: inner.session_config.clone(),
                 local_cwd: inner.local_cwd.clone(),
                 transport,
+                active_tip: inner.active_tip,
             }
         }; // lock dropped — disk I/O outside critical section.
         let _ = persisted.save_to(&self.state_path);
@@ -575,6 +589,14 @@ pub struct PersistedSessionState {
     /// Transport state.
     #[serde(default)]
     pub transport: PersistedTransport,
+    /// The active branch tip (transaction-log seq) — which branch the session
+    /// is on.  `None` (the default) means "last entry" (linear); set only when
+    /// the user has switched to an older branch (future UI).  Basic forking
+    /// (edit-and-regenerate) always continues on the newest branch, so this
+    /// stays `None` and the parent pointers alone determine the active branch.
+    /// See §2.9 of the redesign doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tip: Option<u64>,
 }
 
 fn default_cwd() -> PathBuf {
@@ -587,6 +609,7 @@ impl Default for PersistedSessionState {
             config: SessionConfig::default(),
             local_cwd: default_cwd(),
             transport: PersistedTransport::default(),
+            active_tip: None,
         }
     }
 }
