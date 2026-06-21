@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::Stream;
-use rig::agent::Agent;
+use rig::agent::{Agent, InvalidToolCallContext, InvalidToolCallHookAction, PromptHook};
 use rig::client::CompletionClient;
 use rig::completion::{AssistantContent, CompletionModel, Message};
 use rig::providers::{anthropic, deepseek, groq, ollama, openai, openrouter, zai};
@@ -65,14 +65,21 @@ pub(crate) enum AnyAgent {
 impl AnyAgent {
     /// Start streaming a prompt, returning a unified stream type.
     pub(crate) async fn stream_prompt(&self, prompt: &str) -> AnyStream {
+        let hook = InvalidToolRetryHook;
         match self {
-            AnyAgent::DeepSeek(a) => AnyStream::DeepSeek(a.stream_prompt(prompt).await),
-            AnyAgent::OpenAI(a) => AnyStream::OpenAI(a.stream_prompt(prompt).await),
-            AnyAgent::OpenRouter(a) => AnyStream::OpenRouter(a.stream_prompt(prompt).await),
-            AnyAgent::Groq(a) => AnyStream::Groq(a.stream_prompt(prompt).await),
-            AnyAgent::Ollama(a) => AnyStream::Ollama(a.stream_prompt(prompt).await),
-            AnyAgent::Anthropic(a) => AnyStream::Anthropic(a.stream_prompt(prompt).await),
-            AnyAgent::Zai(a) => AnyStream::Zai(a.stream_prompt(prompt).await),
+            AnyAgent::DeepSeek(a) => {
+                AnyStream::DeepSeek(a.stream_prompt(prompt).with_hook(hook).await)
+            }
+            AnyAgent::OpenAI(a) => AnyStream::OpenAI(a.stream_prompt(prompt).with_hook(hook).await),
+            AnyAgent::OpenRouter(a) => {
+                AnyStream::OpenRouter(a.stream_prompt(prompt).with_hook(hook).await)
+            }
+            AnyAgent::Groq(a) => AnyStream::Groq(a.stream_prompt(prompt).with_hook(hook).await),
+            AnyAgent::Ollama(a) => AnyStream::Ollama(a.stream_prompt(prompt).with_hook(hook).await),
+            AnyAgent::Anthropic(a) => {
+                AnyStream::Anthropic(a.stream_prompt(prompt).with_hook(hook).await)
+            }
+            AnyAgent::Zai(a) => AnyStream::Zai(a.stream_prompt(prompt).with_hook(hook).await),
             #[cfg(test)]
             AnyAgent::Mock { .. } => panic!("Mock agent does not support streaming"),
         }
@@ -238,6 +245,31 @@ fn map_assistant<R>(
             StreamedAssistantContent::ReasoningDelta { reasoning, id }
         }
         StreamedAssistantContent::Final(r) => StreamedAssistantContent::Final(wrap(r)),
+    }
+}
+
+// ── invalid-tool retry hook ──────────────────────────────────────
+
+/// When the model calls a tool that doesn't exist or is disallowed,
+/// give it corrective feedback so it can retry rather than error out.
+///
+/// Without this hook, an `UnknownToolCall` error terminates the turn
+/// and is **not** fed to the LLM — the model sees no feedback and
+/// may repeat the same mistake on the next prompt.
+#[derive(Clone)]
+pub(crate) struct InvalidToolRetryHook;
+
+impl<M: CompletionModel> PromptHook<M> for InvalidToolRetryHook {
+    async fn on_invalid_tool_call(
+        &self,
+        ctx: &InvalidToolCallContext,
+    ) -> InvalidToolCallHookAction {
+        let feedback = format!(
+            "Tool \"{}\" is not available. Available tools: {}.",
+            ctx.tool_name,
+            ctx.available_tools.join(", ")
+        );
+        InvalidToolCallHookAction::retry(feedback)
     }
 }
 
