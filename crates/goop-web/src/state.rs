@@ -372,6 +372,11 @@ pub struct AppState {
     /// [`goop_shared::build_agent_view`] for the shared interpretation
     /// logic.
     pub agent_messages: RwSignal<Vec<UiMessage>>,
+
+    /// Whether the new-session modal is currently open.  Set to `true`
+    /// from any component (sidebar button, input-bar FAB); the `App`
+    /// component watches it and renders the modal.
+    pub new_session_modal_open: RwSignal<bool>,
 }
 
 /// Result of pre-forming buffered history entries into UI state.
@@ -420,6 +425,7 @@ impl AppState {
             compacting: RwSignal::new(false),
             system_prompt: RwSignal::new(None),
             agent_messages: RwSignal::new(Vec::new()),
+            new_session_modal_open: RwSignal::new(false),
         }
     }
 
@@ -696,11 +702,19 @@ impl AppState {
     /// Create a new session via REST, returning its name.
     ///
     /// Also calls `fetch_sessions` on success so the sidebar updates.
-    pub async fn create_session(&self, name: Option<String>) -> Option<String> {
-        let body = match name {
-            Some(n) => format!("{{\"name\":\"{}\"}}", n.replace('"', "\\\"")),
-            None => "{}".to_string(),
-        };
+    pub async fn create_session(
+        &self,
+        name: Option<String>,
+        initial_cwd: Option<String>,
+    ) -> Option<String> {
+        let mut fields = Vec::new();
+        if let Some(n) = name {
+            fields.push(format!("\"name\":\"{}\"", n.replace('"', "\\\"")));
+        }
+        if let Some(cwd) = initial_cwd {
+            fields.push(format!("\"initial_cwd\":\"{}\"", cwd.replace('"', "\\\"")));
+        }
+        let body = format!("{{{}}}", fields.join(","));
         let request = match gloo_net::http::Request::post("/api/sessions")
             .header("Content-Type", "application/json")
             .body(body)

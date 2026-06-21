@@ -116,7 +116,7 @@ async fn run_server(session_name: Option<String>) -> anyhow::Result<()> {
     manager.discover().await?;
     // If the user asked for a specific session, ensure it's loaded.
     if let Some(name) = session_name {
-        let session = manager.get_or_create(name).await?;
+        let session = manager.get_or_create(name, None).await?;
         tracing::info!("session · {}", session.name());
     }
     server::serve(manager, push_manager).await?;

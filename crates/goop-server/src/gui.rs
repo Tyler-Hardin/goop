@@ -57,7 +57,7 @@ fn run_primary(rt: tokio::runtime::Runtime, session_name: Option<String>) -> any
 
     // If the user asked for a specific session, ensure it's loaded.
     if let Some(ref name) = session_name {
-        let session = rt.block_on(async { manager.get_or_create(name.clone()).await })?;
+        let session = rt.block_on(async { manager.get_or_create(name.clone(), None).await })?;
         tracing::info!("session · {}", session.name());
     }
 

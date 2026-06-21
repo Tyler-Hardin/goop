@@ -201,6 +201,9 @@ impl Session {
     /// re-established synchronously (awaited) before the session is
     /// returned — no race between reconnect and first prompt.
     ///
+    /// `initial_cwd` is only used when creating a brand-new session
+    /// (no persisted state); on resume the persisted CWD takes precedence.
+    ///
     /// A background task is spawned to drain the prompt queue — the
     /// tokio runtime must already be running.
     pub async fn new(
@@ -210,13 +213,23 @@ impl Session {
         shared_mcp_manager: Arc<crate::mcp::McpManager>,
         push_notifier: Arc<crate::push::PushManager>,
         stt: Option<Arc<crate::stt::SpeechToText>>,
+        initial_cwd: Option<String>,
     ) -> anyhow::Result<Arc<Self>> {
         // ── persistence paths ──────────────────────────────────
         let name = session_name.unwrap_or_else(next_session_name);
         let state_path = crate::session_state::state_path(&name);
 
         // ── load persisted state (config overrides + CWD + transport) ──
-        let persisted = PersistedSessionState::load(&name).unwrap_or_default();
+        let mut persisted = PersistedSessionState::load(&name).unwrap_or_default();
+
+        // If the caller requested a specific initial CWD and this session
+        // has no persisted state (brand new), override the default CWD.
+        if !state_path.exists() {
+            if let Some(ref cwd) = initial_cwd {
+                let resolved = resolve_initial_cwd(cwd);
+                persisted.local_cwd = resolved;
+            }
+        }
 
         // Merge session config overrides into the global config.
         let merged_config = persisted.config.merge(config);
@@ -1408,7 +1421,14 @@ impl SessionManager {
     ///
     /// If the session was previously SSH'd, the SSH connection is
     /// re-established before this returns (no race with first prompt).
-    pub async fn get_or_create(&self, name: String) -> anyhow::Result<Arc<Session>> {
+    ///
+    /// `initial_cwd` is only used when creating a brand-new session
+    /// (no persisted state); on resume the persisted CWD takes precedence.
+    pub async fn get_or_create(
+        &self,
+        name: String,
+        initial_cwd: Option<String>,
+    ) -> anyhow::Result<Arc<Session>> {
         // Fast path: read lock.
         {
             let sessions = self.sessions.read().await;
@@ -1428,6 +1448,7 @@ impl SessionManager {
             shared_mcp,
             push_manager,
             stt,
+            initial_cwd,
         )
         .await?;
         let mut sessions = self.sessions.write().await;
@@ -1445,9 +1466,13 @@ impl SessionManager {
     }
 
     /// Create a new session with an auto-generated name like `20260128_001`.
-    pub async fn create(&self, name: Option<String>) -> anyhow::Result<Arc<Session>> {
+    pub async fn create(
+        &self,
+        name: Option<String>,
+        initial_cwd: Option<String>,
+    ) -> anyhow::Result<Arc<Session>> {
         let name = name.unwrap_or_else(next_session_name);
-        self.get_or_create(name).await
+        self.get_or_create(name, initial_cwd).await
     }
 
     /// List all currently loaded session names, sorted.
@@ -1510,7 +1535,7 @@ impl SessionManager {
             }
             // Ignore errors for individual sessions — a corrupt file
             // shouldn't prevent the server from starting.
-            let _ = self.get_or_create(name).await;
+            let _ = self.get_or_create(name, None).await;
         }
         Ok(())
     }
@@ -1604,6 +1629,41 @@ pub(crate) fn next_session_name() -> String {
     }
 
     format!("{today}_{:03}", max_seq + 1)
+}
+
+/// Resolve a user-provided initial CWD string to a [`PathBuf`].
+///
+/// Handles `~` for home, `~user` for another user's home, and relative
+/// paths (resolved against the process CWD).
+fn resolve_initial_cwd(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default_cwd();
+    }
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(default_cwd);
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if rest.is_empty() {
+            return dirs::home_dir().unwrap_or_else(default_cwd);
+        }
+        let home = dirs::home_dir().unwrap_or_else(default_cwd);
+        return home.join(rest);
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        path
+    } else {
+        // Relative — resolve against process CWD.
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+/// Default CWD for a new session — the process's current directory.
+fn default_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 // ── compaction prompts ──────────────────────────────────────────────

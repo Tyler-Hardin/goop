@@ -4,8 +4,8 @@ use wasm_bindgen::prelude::Closure;
 
 use crate::components::{
     empty_state::EmptyState, header::Header, input_bar::InputBar, message_log::MessageLog,
-    refresh_indicator::RefreshIndicator, select_bar::SelectBar, session_list::SessionList,
-    swipe_sidebar::SwipeSidebar,
+    new_session_modal::NewSessionModal, refresh_indicator::RefreshIndicator,
+    select_bar::SelectBar, session_list::SessionList, swipe_sidebar::SwipeSidebar,
 };
 use crate::state::AppState;
 
@@ -124,23 +124,34 @@ pub fn App() -> impl IntoView {
     let empty_show_hint = Signal::derive(move || !state.connection.get().is_catching_up());
 
     let sidebar_open = state.sidebar_open;
+    let show_new_modal = state.new_session_modal_open;
     let new_session = {
-        let state = state.clone();
+        let show_new_modal = show_new_modal.clone();
         move |_| {
+            show_new_modal.set(true);
+        }
+    };
+
+    let on_create_session = {
+        let state = state.clone();
+        let show_new_modal = show_new_modal.clone();
+        Callback::new(move |(name, initial_cwd): (Option<String>, Option<String>)| {
             let state = state.clone();
+            let show_new_modal = show_new_modal.clone();
             leptos::task::spawn_local(async move {
-                let name = web_sys::window()
-                    .and_then(|w| {
-                        w.prompt_with_message("Session name (leave blank for auto-generated):")
-                            .ok()
-                    })
-                    .and_then(|s| s)
-                    .filter(|s| !s.trim().is_empty());
-                if let Some(session_name) = state.create_session(name).await {
+                show_new_modal.set(false);
+                if let Some(session_name) = state.create_session(name, initial_cwd).await {
                     state.connect_session(session_name);
                 }
             });
-        }
+        })
+    };
+
+    let on_close_modal = {
+        let show_new_modal = show_new_modal.clone();
+        Callback::new(move |_: ()| {
+            show_new_modal.set(false);
+        })
     };
 
     view! {
@@ -194,29 +205,17 @@ pub fn App() -> impl IntoView {
             <button
                 id="newSessionFab"
                 title="New session"
-                on:click={
-                    let state = state.clone();
-                    move |_| {
-                        let state = state.clone();
-                        leptos::task::spawn_local(async move {
-                            let name = web_sys::window()
-                                .and_then(|w| {
-                                    w.prompt_with_message(
-                                        "Session name (leave blank for auto-generated):",
-                                    )
-                                    .ok()
-                                })
-                                .and_then(|s| s)
-                                .filter(|s| !s.trim().is_empty());
-                            if let Some(session_name) = state.create_session(name).await {
-                                state.connect_session(session_name);
-                            }
-                        });
-                    }
-                }
+                on:click=move |_| show_new_modal.set(true)
             >
                 "+"
             </button>
+        </Show>
+
+        // New session modal — shown when the user clicks "+ New session"
+        // or the FAB.  Pre-fills a date-based session name and optionally
+        // accepts an initial working directory.
+        <Show when=move || show_new_modal.get()>
+            <NewSessionModal on_create=on_create_session on_close=on_close_modal />
         </Show>
     }
 }

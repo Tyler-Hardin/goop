@@ -35,7 +35,10 @@ pub fn build_preamble(cwd: &str, home_dir: &Path) -> String {
     };
 
     // AGENTS.md (may be present or absent — template handles the conditional)
-    let agents_md = std::fs::read_to_string("AGENTS.md").ok();
+    let agents_md = {
+        let agents_path = Path::new(cwd).join("AGENTS.md");
+        std::fs::read_to_string(&agents_path).ok()
+    };
 
     let mut context = tera::Context::new();
     context.insert("user", &user);

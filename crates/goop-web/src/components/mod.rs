@@ -4,6 +4,7 @@ pub mod input_bar;
 pub mod input_button;
 pub mod message;
 pub mod message_log;
+pub mod new_session_modal;
 pub mod refresh_indicator;
 pub mod select_bar;
 pub mod session_list;

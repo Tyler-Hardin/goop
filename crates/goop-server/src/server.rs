@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 use tower_http::services::ServeDir;
 
@@ -141,6 +141,7 @@ pub fn build_router(
         // Always serve the fallback HTML at this path, even
         // when the trunk dist is available — useful for comparison.
         .route("/fb.html", get(index_fallback))
+        .route("/api/browse-dir", get(browse_dir))
         .with_state(state);
 
     if let Some(dist_dir) = web_dist {
@@ -284,6 +285,9 @@ async fn icon_512() -> impl IntoResponse {
 #[derive(Deserialize)]
 struct CreateSessionBody {
     name: Option<String>,
+    /// Initial working directory for the new session.  Ignored when
+    /// resuming an existing session (the persisted CWD takes precedence).
+    initial_cwd: Option<String>,
 }
 
 async fn list_sessions(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
@@ -297,7 +301,7 @@ async fn create_session(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session = state
         .manager
-        .create(body.name)
+        .create(body.name, body.initial_cwd)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(axum::Json(serde_json::json!({ "name": session.name() })))
@@ -331,6 +335,92 @@ async fn push_subscribe(
 ) -> impl IntoResponse {
     state.push_manager.add_subscription(body.subscription);
     axum::Json(serde_json::json!({ "ok": true }))
+}
+
+// ── directory browser ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct BrowseDirQuery {
+    path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BrowseDirEntry {
+    name: String,
+    is_dir: bool,
+}
+
+#[derive(Serialize)]
+struct BrowseDirResponse {
+    path: String,
+    parent: Option<String>,
+    entries: Vec<BrowseDirEntry>,
+}
+
+/// Browse a directory on the server's filesystem.  Resolves `~` and
+/// relative paths against the process CWD.  Returns the canonical path,
+/// optional parent, and sorted directory listing (dirs first, then files).
+async fn browse_dir(
+    axum::extract::Query(q): axum::extract::Query<BrowseDirQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let raw = q.path.as_deref().unwrap_or(".").trim();
+    let resolved = resolve_browse_path(raw);
+    let canonical = std::fs::canonicalize(&resolved).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("{}: {e}", resolved.display()),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("not a directory: {}", canonical.display()),
+        ));
+    }
+
+    let parent = canonical.parent().map(|p| p.display().to_string());
+
+    let mut entries: Vec<BrowseDirEntry> = Vec::new();
+    if let Ok(iter) = std::fs::read_dir(&canonical) {
+        for entry in iter.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue; // skip hidden
+            }
+            entries.push(BrowseDirEntry {
+                is_dir: entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                name,
+            });
+        }
+    }
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+
+    let resp = BrowseDirResponse {
+        path: canonical.display().to_string(),
+        parent,
+        entries,
+    };
+    Ok(axum::Json(resp))
+}
+
+/// Resolve a path string like `~`, `~/foo`, `/abs`, or `rel` against
+/// the process CWD and home directory.
+fn resolve_browse_path(raw: &str) -> std::path::PathBuf {
+    if raw == "~" || raw == "~/" {
+        return dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        return home.join(rest);
+    }
+    let p = std::path::PathBuf::from(raw);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(p)
+    }
 }
 
 // ── websocket ───────────────────────────────────────────────────
@@ -380,14 +470,14 @@ fn resolve_and_upgrade(
     let manager = Arc::clone(&state.manager);
     ws.on_upgrade(move |socket| async move {
         let session = match session_name {
-            Some(name) => match manager.get_or_create(name).await {
+            Some(name) => match manager.get_or_create(name, None).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("failed to get or create session: {e}");
                     return;
                 }
             },
-            None => match manager.create(None).await {
+            None => match manager.create(None, None).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("failed to create session: {e}");

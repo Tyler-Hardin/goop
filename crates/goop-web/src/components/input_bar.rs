@@ -255,21 +255,7 @@ pub fn InputBar() -> impl IntoView {
                 id="newSessionFab"
                 title="New session"
                 on:click=move |_| {
-                    let state = state.clone();
-                    leptos::task::spawn_local(async move {
-                        let name = web_sys::window()
-                            .and_then(|w| {
-                                w.prompt_with_message(
-                                    "Session name (leave blank for auto-generated):",
-                                )
-                                .ok()
-                            })
-                            .and_then(|s| s)
-                            .filter(|s| !s.trim().is_empty());
-                        if let Some(session_name) = state.create_session(name).await {
-                            state.connect_session(session_name);
-                        }
-                    });
+                    state.new_session_modal_open.set(true);
                 }
             >
                 "+"
