@@ -229,6 +229,26 @@ impl UiMessage {
         }
     }
 
+    /// All transaction-log seqs this message contributes to the agent-visible
+    /// set.  For most messages this is just `agent_seq()`.  For `ToolCall` it
+    /// includes both the call seq and the result seq (when present), so that
+    /// manual compaction covers the full tool-call+result pair — the LLM API
+    /// rejects an assistant `tool_calls` message without matching tool messages.
+    pub fn all_event_seqs(&self) -> Vec<u64> {
+        match self {
+            UiMessage::ToolCall {
+                seq, result_seq, ..
+            } => {
+                let mut v = vec![*seq];
+                if let Some(rs) = result_seq.get_untracked() {
+                    v.push(rs);
+                }
+                v
+            }
+            other => other.agent_seq().into_iter().collect(),
+        }
+    }
+
     /// Whether this message has been deleted (hidden from the agent's view
     /// by a `Deleted` overlay).  Used to filter messages in LLM view.
     pub fn is_deleted(&self) -> bool {
@@ -606,7 +626,7 @@ impl AppState {
             .iter()
             .enumerate()
             .filter(|(i, _)| *i >= s && *i <= e)
-            .filter_map(|(_, m)| m.agent_seq())
+            .flat_map(|(_, m)| m.all_event_seqs())
             .collect();
         if covers.len() < 2 {
             return;

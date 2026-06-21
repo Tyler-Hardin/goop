@@ -11,9 +11,10 @@
 //! §2.6 (two-tier summarization) and §5.3 (the snapshot → summarize →
 //! revalidate lifecycle).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rig::completion::{AssistantContent, Message};
+use rig::message::UserContent;
 
 use crate::config::ToolSummarizationConfig;
 
@@ -54,13 +55,94 @@ pub(crate) fn compaction_covers(
 /// their messages in order.  Used by manual range compaction to collect the
 /// messages to summarize.  Items not in `covers` are left untouched by replay
 /// (they remain agent-visible alongside the summary).
+///
+/// **Tool-pair atomicity:** if `covers` includes one half of a tool call+result
+/// pair but not the other, both halves are included anyway.  The LLM API rejects
+/// an assistant `tool_calls` message without matching tool messages, and a
+/// lone tool result without its call is equally invalid.
 pub(crate) fn covered_messages(items: &[VisibleItem], covers: &[u64]) -> Vec<Message> {
     let cover_set: HashSet<u64> = covers.iter().copied().collect();
+
+    // Expand to include the other half of any partially-covered tool pair.
+    let expanded = expand_tool_pairs(items, &cover_set);
+
     items
         .iter()
-        .filter(|i| cover_set.contains(&i.seq))
+        .filter(|i| expanded.contains(&i.seq))
         .map(|i| i.msg.clone())
         .collect()
+}
+
+/// If `cover_set` includes one half of a tool call+result pair but not the
+/// other, add the missing half.  Returns a clone of `cover_set` with both
+/// sides of every partially-covered pair.
+fn expand_tool_pairs(items: &[VisibleItem], cover_set: &HashSet<u64>) -> HashSet<u64> {
+    // Build tool-call → result seq mapping from the agent-visible items.
+    // Each ToolCall lives in an Assistant VisibleItem; each ToolResult lives
+    // in a User VisibleItem.  They share the same `id`.
+    let mut call_to_result: HashMap<&str, u64> = HashMap::new();
+    let mut result_to_call: HashMap<&str, u64> = HashMap::new();
+
+    for item in items {
+        match &item.msg {
+            Message::Assistant { content, .. } => {
+                for c in content.iter() {
+                    if let AssistantContent::ToolCall(tc) = c {
+                        // Placeholder — will be overwritten when we find the
+                        // matching ToolResult item below.
+                        call_to_result.entry(tc.id.as_str()).or_insert(0);
+                    }
+                }
+            }
+            Message::User { content } => {
+                for c in content.iter() {
+                    if let UserContent::ToolResult(tr) = c {
+                        result_to_call.insert(tr.id.as_str(), item.seq);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Resolve call → result: match each Assistant item's tool calls against
+    // the result seqs we collected from User items.
+    for item in items {
+        if let Message::Assistant { content, .. } = &item.msg {
+            for c in content.iter() {
+                if let AssistantContent::ToolCall(tc) = c {
+                    if let Some(&result_seq) = result_to_call.get(tc.id.as_str()) {
+                        call_to_result.insert(tc.id.as_str(), result_seq);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut expanded = cover_set.clone();
+    for item in items {
+        if let Message::Assistant { content, .. } = &item.msg {
+            for c in content.iter() {
+                if let AssistantContent::ToolCall(tc) = c {
+                    let Some(&result_seq) = call_to_result.get(tc.id.as_str()) else {
+                        continue;
+                    };
+                    if result_seq == 0 {
+                        continue; // orphaned call (no result found)
+                    }
+                    let has_call = cover_set.contains(&item.seq);
+                    let has_result = cover_set.contains(&result_seq);
+                    if has_call && !has_result {
+                        expanded.insert(result_seq);
+                    } else if has_result && !has_call {
+                        expanded.insert(item.seq);
+                    }
+                }
+            }
+        }
+    }
+
+    expanded
 }
 
 // ── tool-pair summarization (tier 1) ──
