@@ -779,8 +779,10 @@ main.select-mode .msg-select-overlay {
 */
 .msg.system-prompt {
   align-self: stretch;
+  flex-shrink: 0;
   margin-bottom: 8px;
-  border: 1px dashed var(--border);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--red);
   border-radius: 8px;
   background: var(--surface);
   overflow: hidden;
@@ -811,7 +813,7 @@ main.select-mode .msg-select-overlay {
   padding: 0 14px 12px;
   border-top: 1px solid var(--border);
   max-height: 60vh;
-  overflow-y: auto;
+  overflow: hidden auto;
 }
 .system-prompt-body .rendered-inner {
   font-size: 13px;

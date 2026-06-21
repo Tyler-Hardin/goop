@@ -218,8 +218,9 @@ pub fn MessageLog() -> impl IntoView {
     let select_mode = state.select_mode;
     let llm_view = state.llm_view;
 
-    // System prompt (preamble) — shown only in LLM view.  Collapsed by
-    // default (the preamble can be very long — it includes AGENTS.md).
+    // System prompt (preamble) — shown in both chat and LLM view.
+    // Collapsed by default (the preamble can be very long — it includes
+    // AGENTS.md).
     let system_prompt = state.system_prompt;
     let sp_expanded = RwSignal::new(false);
     let sp_html = RwSignal::new(String::new());
@@ -241,11 +242,11 @@ pub fn MessageLog() -> impl IntoView {
         >
             // System prompt — metadata, not a conversation message.  Rendered
             // above the <For> so it doesn't interfere with compaction
-            // targeting, selection indices, or <For> keying.  Visible only in
-            // LLM view when a preamble is present.
+            // targeting, selection indices, or <For> keying.  Visible in
+            // both chat and LLM views when a preamble is present.
             <div
                 class="msg system-prompt"
-                class:hidden=move || !llm_view.get() || system_prompt.get().is_none()
+                class:hidden=move || system_prompt.get().is_none()
             >
                 <div class="system-prompt-header" on:click=move |_| sp_expanded.update(|v| *v = !*v)>
                     <span class="arrow" class:open=move || sp_expanded.get()>"▸"</span>
