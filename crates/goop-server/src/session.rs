@@ -11,7 +11,7 @@ use rig::streaming::StreamedAssistantContent;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
-use crate::config::{self, Config, McpServerDef};
+use crate::config::{self, Config, McpServerDef, merge_session_config, session_mcp_server_names};
 use crate::events::{
     EditContent, LogEntry, PromptSource, ServerMessage, SessionEvent, TurnEndReason,
 };
@@ -23,6 +23,7 @@ use crate::model;
 use crate::preamble::build_preamble;
 use crate::session_state::{PersistedSessionState, SessionState};
 use crate::transport::{PersistedTransport, Transport};
+use goop_shared::{SessionConfig, SettingsUpdate};
 
 // ── subscriber with history replay ──────────────────────────────
 
@@ -106,6 +107,14 @@ enum QueuedAction {
         /// Fires when the compaction finishes (success or failure).
         done: Option<oneshot::Sender<()>>,
     },
+    /// Change the session settings mid-conversation.  The server merges
+    /// the overrides, persists, appends `SettingsChanged` to the log, and
+    /// rebuilds the agent if needed.
+    ApplySettings {
+        update: goop_shared::SettingsUpdate,
+        /// Fires when the change completes (or fails).
+        done: Option<oneshot::Sender<()>>,
+    },
 }
 
 /// Holds the agent, conversation state, and a serialised prompt queue.
@@ -122,7 +131,10 @@ pub struct Session {
     /// at construction time via [`model::build_agent`].
     #[allow(dead_code)]
     pub(crate) state: Arc<SessionState>,
-    agent: Arc<crate::model::AnyAgent>,
+    /// The active agent — wrapped in a [`Mutex`] so it can be swapped
+    /// mid-session when the model changes.  The lock is never contended:
+    /// all access is serialized through [`drain_queue`](Self::drain_queue).
+    agent: std::sync::Mutex<Arc<crate::model::AnyAgent>>,
     tx: broadcast::Sender<ServerMessage>,
     history: Arc<Mutex<TransactionLog>>,
 
@@ -134,26 +146,30 @@ pub struct Session {
 
     /// Context window limit (in tokens) for the progress bar.  Uses the
     /// compaction budget when compaction is enabled, otherwise the model's
-    /// known context window.  `None` when neither is known.
-    context_limit: Option<usize>,
+    /// known context window.  Wrapped in a [`Mutex`] so
+    /// [`apply_settings`](Self::apply_settings) can update it through `&self`.
+    context_limit: std::sync::Mutex<Option<usize>>,
 
     /// Token budget at which the agent-visible conversation is compacted into a
     /// rolling LLM summary (see [`maybe_compact`](Self::maybe_compact)).
-    /// `None` disables compaction (unlimited context).
-    compaction_threshold: Option<usize>,
+    /// `None` disables compaction (unlimited context).  Wrapped in a [`Mutex`]
+    /// so [`apply_settings`](Self::apply_settings) can update it through `&self`.
+    compaction_threshold: std::sync::Mutex<Option<usize>>,
 
     /// The session's model string (e.g. `deepseek/deepseek-v4-pro`), recorded
-    /// in `Compacted` events for "which model produced this summary".
-    model_label: String,
+    /// recorded in `Compacted` and `SettingsChanged` events.  Wrapped in a
+    /// [`apply_settings`](Self::apply_settings) can update it through `&self`.
+    model_label: std::sync::Mutex<String>,
 
     /// Tool-pair summarization configuration.  When `enabled` is false, the
     /// summarizer is a no-op.
     tool_summarization: crate::config::ToolSummarizationConfig,
 
     /// Separate agent for tool-pair summarization (built from
-    /// `tool_summarization.model`).  `None` when no separate model is
-    /// configured — the session's main `agent` is used instead.
-    tool_summarizer: Option<Arc<crate::model::AnyAgent>>,
+    /// `tool_summarization.model`).  Wrapped in a [`Mutex`] so it can
+    /// be swapped when the model changes.  `None` when no separate model
+    /// is configured — the session's main `agent` is used instead.
+    tool_summarizer: std::sync::Mutex<Option<Arc<crate::model::AnyAgent>>>,
 
     /// Push a prompt here from any view; the background worker drains it.
     /// See [`QueuedAction`] for the variants.
@@ -174,6 +190,10 @@ pub struct Session {
     /// for tool invocation. Shared MCP servers live in [`SessionManager`].
     #[allow(dead_code)]
     session_mcp: Arc<crate::mcp::McpManager>,
+
+    /// Cached MCP managers, stored so model/tool reconfiguration can
+    /// reconstruct the agent without reconnecting to MCP servers.
+    shared_mcp: Arc<crate::mcp::McpManager>,
 
     /// Push notification sender — called when a prompt completes so PWAs
     /// in the background get a system notification.
@@ -232,7 +252,7 @@ impl Session {
         }
 
         // Merge session config overrides into the global config.
-        let merged_config = persisted.config.merge(config);
+        let merged_config = merge_session_config(&persisted.config, config);
 
         let initial_local_cwd = persisted.local_cwd.clone();
 
@@ -291,7 +311,7 @@ impl Session {
 
         // ── MCP servers ────────────────────────────────────────
         // Resolve which servers to enable: global ∪ session overrides.
-        let session_names = crate::mcp::resolve(config, persisted.config.mcp_server_names());
+        let session_names = crate::mcp::resolve(config, session_mcp_server_names(&persisted.config));
 
         // Build the list of (name, def) pairs for per-session servers.
         let session_servers: Vec<(String, McpServerDef)> = session_names
@@ -314,6 +334,11 @@ impl Session {
         // ── open the transaction log (RAII: loads, migrates, injects
         //    SessionInfo, persists if new) ──────────────────────────
         let mut log = TransactionLog::open(&name).await?;
+        // Stamp the creation model into SessionInfo for new sessions
+        // (where it was injected as None) so the log records what model
+        // the session started with.  Idempotent on resume.
+        log.stamp_session_info_model(&merged_config.model.to_string());
+
         // Apply a persisted active tip (a resumed session that was viewing an
         // older branch — future UI).  `None` (the default) means "last entry"
         // — linear, or the newest fork (basic forking always continues on the
@@ -350,10 +375,23 @@ impl Session {
             }
         };
 
-        // ── shared transaction log: the source of truth for agent memory ──
-        // The same `Arc` is handed to the `LogReplayMemory` below, so every
-        // event emitted via `emit()` is visible to `ConversationMemory::load`.
+        // ── scan: if the merged config (global + session overrides) differs
+        //    from the last `SettingsChanged` recorded in the log (e.g. someone
+        //    edited <name>.state.toml between sessions), append a
+        //    `SettingsChanged` event so the audit trail is complete.
         let history = Arc::new(Mutex::new(log));
+        {
+            let log_settings = history.lock().await.last_settings_in_log();
+            if persisted.config != log_settings {
+                let mut log = history.lock().await;
+                let entry = log
+                    .append(SessionEvent::SettingsChanged {
+                        config: persisted.config.clone(),
+                    })
+                    .await;
+                let _ = tx.send(ServerMessage::Entry(entry));
+            }
+        }
 
         let mem = build_session_memory(history.clone());
         // Clone for the context-usage progress bar (shares the log `Arc`).
@@ -392,19 +430,20 @@ impl Session {
         let this = Arc::new(Self {
             name: name.clone(),
             state: state.clone(),
-            agent,
+            agent: std::sync::Mutex::new(agent),
             tx,
             history,
             memory: memory_for_usage,
-            context_limit,
-            compaction_threshold,
-            model_label,
+            context_limit: std::sync::Mutex::new(context_limit),
+            compaction_threshold: std::sync::Mutex::new(compaction_threshold),
+            model_label: std::sync::Mutex::new(model_label),
             tool_summarization,
-            tool_summarizer,
+            tool_summarizer: std::sync::Mutex::new(tool_summarizer),
             submit_tx,
             cancel_tx: Mutex::new(None),
             is_running: AtomicBool::new(false),
             session_mcp: session_mcp_manager,
+            shared_mcp: Arc::clone(&shared_mcp_manager),
             push_notifier,
             stt,
         });
@@ -705,6 +744,12 @@ impl Session {
                         let _ = tx.send(());
                     }
                 }
+                QueuedAction::ApplySettings { update, done } => {
+                    self.apply_settings(update).await;
+                    if let Some(tx) = done {
+                        let _ = tx.send(());
+                    }
+                }
             }
         }
     }
@@ -796,6 +841,8 @@ impl Session {
         );
 
         // Race the summarization against cancellation.
+        // Clone the Arc out of the Mutex so the guard doesn't cross .await.
+        let agent = self.agent.lock().unwrap().clone();
         let outcome = tokio::select! {
             biased;
             _ = &mut cancel_rx => {
@@ -803,7 +850,7 @@ impl Session {
                 tracing::info!("manual compaction cancelled");
                 None
             }
-            result = self.agent.summarize(system_prompt, &user_prompt) => {
+            result = agent.summarize(system_prompt, &user_prompt) => {
                 Some(result)
             }
         };
@@ -827,9 +874,10 @@ impl Session {
                     summary.trim_end(),
                     M = MANUAL_COMPACT_CONTINUATION_TEXT,
                 );
+                let model = self.model_label.lock().unwrap().clone();
                 self.emit(SessionEvent::Compacted {
                     summary: summary_with_continuation,
-                    model: self.model_label.clone(),
+                    model,
                     covers,
                     manual: true,
                 })
@@ -851,6 +899,136 @@ impl Session {
         }
     }
 
+    /// Apply session config overrides mid-conversation: merge incoming
+    /// [`SettingsUpdate`] into the current `SessionConfig`, persist,
+    /// append `SettingsChanged`, and rebuild agent if needed.
+    async fn apply_settings(&self, incoming: SettingsUpdate) {
+        let current = self.state.session_config().await;
+
+        // Build the new config by applying each incoming `Setting<T>` to the
+        // current override.  `Set(v)` replaces; `Clear` removes; `None` leaves.
+        let mut merged = current.clone();
+        apply_setting_field(&mut merged.model, incoming.model);
+        apply_setting_field(&mut merged.ollama_base_url, incoming.ollama_base_url);
+        apply_setting_field(
+            &mut merged.enabled_tool_groups,
+            incoming.enabled_tool_groups,
+        );
+
+        if merged == current {
+            tracing::info!("settings unchanged, skipping rebuild");
+            return;
+        }
+
+        let model_changed = merged.model != current.model;
+        let tools_changed = merged.enabled_tool_groups != current.enabled_tool_groups;
+        let url_changed = merged.ollama_base_url != current.ollama_base_url;
+
+        // Persist to disk so the change survives restarts.
+        self.state.set_session_config(merged.clone()).await;
+
+        // Emit the audit event.
+        self.emit(SessionEvent::SettingsChanged {
+            config: merged.clone(),
+        })
+        .await;
+
+        // Only rebuild the agent if a provider-affecting field changed.
+        if !model_changed && !tools_changed && !url_changed {
+            tracing::info!(
+                "settings changed (non-provider fields only), skipping agent rebuild"
+            );
+            return;
+        }
+
+        let model_str = merged.model.as_deref().unwrap_or("unknown");
+        let new_model: crate::config::Model = match model_str.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("apply_settings: invalid model {model_str:?}: {e}");
+                return;
+            }
+        };
+
+        let provider = new_model.provider();
+        let model_name = new_model.model_name().to_string();
+
+        tracing::info!(
+            "rebuilding agent with {model_str} ({}, {model_name})",
+            provider.label()
+        );
+
+        let temp_config = build_temp_config(&merged);
+
+        let preamble = {
+            let log = self.history.lock().await;
+            log.system_prompt().unwrap_or_default()
+        };
+
+        let mut mcp_tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+        mcp_tools.extend(self.shared_mcp.build_tools());
+        mcp_tools.extend(self.session_mcp.build_tools());
+
+        let new_agent = match model::build_agent(
+            &temp_config,
+            &preamble,
+            build_session_memory(self.history.clone()),
+            self.state.clone(),
+            mcp_tools,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("apply_settings: failed to build agent: {e}");
+                return;
+            }
+        };
+
+        let new_summarizer = match model::build_summarizer(&temp_config) {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::warn!("apply_settings: failed to build summarizer: {e}");
+                None
+            }
+        };
+
+        let new_context_limit =
+            crate::memory::lookup_context_length(provider, &model_name)
+                .map(|v| v as usize);
+
+        let new_compaction_threshold =
+            if let Some(ref mode) = temp_config.compaction {
+                match mode {
+                    goop_shared::CompactionMode::Tokens(n) => Some(*n),
+                    goop_shared::CompactionMode::Percent(pct) => {
+                        crate::memory::lookup_context_length(provider, &model_name)
+                            .map(|ctx| (ctx as usize) * (*pct as usize) / 100)
+                    }
+                }
+            } else {
+                None
+            };
+
+        *self.agent.lock().unwrap() = new_agent;
+        *self.tool_summarizer.lock().unwrap() = new_summarizer;
+        *self.model_label.lock().unwrap() = model_str.to_string();
+        *self.context_limit.lock().unwrap() = new_context_limit;
+        *self.compaction_threshold.lock().unwrap() = new_compaction_threshold;
+
+        tracing::info!("agent rebuilt with new settings");
+    }
+
+    /// Queue a settings change.  Returns a receiver that fires when done.
+    pub fn apply_session_settings(&self, update: SettingsUpdate) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.submit_tx.send(QueuedAction::ApplySettings {
+            update,
+            done: Some(tx),
+        });
+        rx
+    }
+
+    // ── helpers ────────────────────────────────────────────────────
+
     /// If the agent-visible conversation has grown past the compaction
     /// threshold, summarize it into a rolling `Compacted` event so the next
     /// turn stays within the context budget.  The entire agent-visible prefix
@@ -867,7 +1045,7 @@ impl Session {
     /// No-op when compaction is disabled (`threshold == None`) or the
     /// conversation is still small.
     async fn maybe_compact(&self) {
-        let Some(threshold) = self.compaction_threshold else {
+        let Some(threshold) = *self.compaction_threshold.lock().unwrap() else {
             return;
         };
         let items = self.memory.agent_visible_items().await;
@@ -913,7 +1091,7 @@ impl Session {
         let user_prompt =
             "Please summarize the conversation history provided in the system prompt.";
 
-        match self.agent.summarize(system_prompt, user_prompt).await {
+        match { self.agent.lock().unwrap().clone() }.summarize(system_prompt, user_prompt).await {
             Ok(summary) => {
                 // Append a continuation instruction so the agent knows it's
                 // working from a summary and doesn't mention the compaction.
@@ -922,9 +1100,10 @@ impl Session {
                     summary.trim_end(),
                     C = AUTO_COMPACT_CONTINUATION_TEXT,
                 );
+                let model = self.model_label.lock().unwrap().clone();
                 self.emit(SessionEvent::Compacted {
                     summary: summary_with_continuation,
-                    model: self.model_label.clone(),
+                    model,
                     covers,
                     manual: false,
                 })
@@ -965,8 +1144,13 @@ impl Session {
         }
 
         // ── 2. Summarize (outside the lock) ──
-        let summarizer: &crate::model::AnyAgent =
-            self.tool_summarizer.as_deref().unwrap_or(&self.agent);
+        let summarizer_arc: Arc<crate::model::AnyAgent> = {
+            let s_guard = self.tool_summarizer.lock().unwrap();
+            let a_guard = self.agent.lock().unwrap();
+            s_guard
+                .clone()
+                .unwrap_or_else(|| a_guard.clone())
+        };
 
         let mut summaries: Vec<(String, String)> = Vec::new();
         for c in &candidates {
@@ -978,7 +1162,7 @@ impl Session {
                 "Summarize this tool interaction:\n\n{}",
                 pair_text
             );
-            match summarizer
+            match summarizer_arc
                 .summarize(TOOL_PAIR_SYSTEM_PROMPT.to_string(), &user_prompt)
                 .await
             {
@@ -999,11 +1183,12 @@ impl Session {
         // depth for future concurrency — see §5.3 step 3.
         let items = self.memory.agent_visible_items().await;
         let validated = memory::revalidate_tool_summaries(&items, &summaries);
+        let model = self.model_label.lock().unwrap().clone();
         for (id, summary) in &validated {
             self.emit(SessionEvent::ToolSummarized {
                 id: id.clone(),
                 summary: summary.clone(),
-                model: self.model_label.clone(),
+                model: model.clone(),
             })
             .await;
         }
@@ -1024,9 +1209,10 @@ impl Session {
         // itself, so the snapshot captures the committed memory context.
         {
             let items = self.memory.agent_visible_items().await;
+            let model = self.model_label.lock().unwrap().clone();
             self.emit(SessionEvent::ContextSnapshot {
                 seqs: items.iter().map(|i| i.seq).collect(),
-                model: self.model_label.clone(),
+                model,
             })
             .await;
         }
@@ -1044,7 +1230,8 @@ impl Session {
         let mut committed_work = false;
 
         {
-            let mut stream = self.agent.stream_prompt(prompt).await;
+            let agent = self.agent.lock().unwrap().clone();
+            let mut stream = agent.stream_prompt(prompt).await;
 
             loop {
                 tokio::select! {
@@ -1235,7 +1422,7 @@ impl Session {
     ///
     /// No-op when `context_limit` is `None` (unknown model + no compaction).
     async fn emit_context_usage(&self) {
-        let Some(limit) = self.context_limit else {
+        let Some(limit) = *self.context_limit.lock().unwrap() else {
             return;
         };
         let used = self.memory.estimated_tokens().await;
@@ -1300,21 +1487,22 @@ impl Session {
                 Default::default(),
                 PathBuf::from("/tmp/test.state.toml"),
             )),
-            agent: Arc::new(model::AnyAgent::Mock {
+            agent: std::sync::Mutex::new(Arc::new(model::AnyAgent::Mock {
                 summarize_result: summarize_result.to_string(),
-            }),
+            })),
             tx: tx.clone(),
             history,
             memory,
-            context_limit: None,
-            compaction_threshold: Some(compaction_threshold),
-            model_label: "mock/model".to_string(),
+            context_limit: std::sync::Mutex::new(None),
+            compaction_threshold: std::sync::Mutex::new(Some(compaction_threshold)),
+            model_label: std::sync::Mutex::new("mock/model".to_string()),
             tool_summarization: Default::default(),
-            tool_summarizer: None,
+            tool_summarizer: std::sync::Mutex::new(None),
             submit_tx: mpsc::unbounded_channel().0,
             cancel_tx: Mutex::new(None),
             is_running: AtomicBool::new(false),
             session_mcp: crate::mcp::McpManager::empty(),
+            shared_mcp: crate::mcp::McpManager::empty(),
             push_notifier: Arc::new(crate::push::PushManager::new()),
             stt: None,
         });
@@ -1666,6 +1854,49 @@ fn default_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+// ── settings helpers ───────────────────────────────────────────────
+
+/// Apply a single [`Setting<T>`] change to a field: `Set(v)` replaces,
+/// `Clear` removes the override, `None` leaves it alone.
+fn apply_setting_field<T>(target: &mut Option<T>, incoming: Option<goop_shared::Setting<T>>) {
+    match incoming {
+        Some(goop_shared::Setting::Set(v)) => *target = Some(v),
+        Some(goop_shared::Setting::Clear) => *target = None,
+        None => {}
+    }
+}
+
+/// Build a minimal [`Config`] from a [`SessionConfig`] — just enough
+/// fields to construct an agent.
+fn build_temp_config(session: &SessionConfig) -> Config {
+    let mut c = Config::default();
+    c.home_dir = crate::config::home_dir();
+    if let Some(ref m) = session.model {
+        if let Ok(parsed) = m.parse::<crate::config::Model>() {
+            c.model = parsed;
+        }
+    }
+    if let Some(t) = session.max_tokens {
+        c.max_tokens = t;
+    }
+    if let Some(t) = session.default_max_turns {
+        c.default_max_turns = t;
+    }
+    if let Some(ref cm) = session.compaction {
+        c.compaction = Some(cm.clone());
+    }
+    if let Some(ref g) = session.enabled_tool_groups {
+        c.enabled_tool_groups = g.clone();
+    }
+    if let Some(ref u) = session.ollama_base_url {
+        c.ollama_base_url = u.clone();
+    }
+    if let Some(ref ts) = session.tool_summarization {
+        c.tool_summarization = ts.clone();
+    }
+    c
+}
+
 // ── compaction prompts ──────────────────────────────────────────────
 //
 // The compaction system prompt is derived from goose's compaction.md
@@ -1750,7 +1981,7 @@ fn is_tool_only(messages: &[Message]) -> bool {
 /// context window (falling back to `None` — disabled — when the window is
 /// unknown).  `None` (no `compaction` set in config) disables compaction.
 fn resolve_compaction_threshold(config: &Config) -> Option<usize> {
-    use crate::config::CompactionMode;
+    use goop_shared::CompactionMode;
     match &config.compaction {
         Some(CompactionMode::Tokens(n)) => Some(*n),
         Some(CompactionMode::Percent(pct)) => {

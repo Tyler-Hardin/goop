@@ -14,6 +14,9 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
+pub use goop_shared::{
+    CompactionMode, SessionConfig, ToolGroup, ToolSummarizationConfig,
+};
 use serde::{Deserialize, Serialize};
 
 // ── error type ───────────────────────────────────────────────────────
@@ -257,22 +260,6 @@ impl<'de> Deserialize<'de> for Model {
 
 // ── tool groups ─────────────────────────────────────────────────────
 
-/// Groups of tools that can be enabled/disabled in config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolGroup {
-    /// `read`, `write`, `replace`, `read_html`, `cd`
-    FileOps,
-    /// `shell`
-    Shell,
-    /// `ssh`, `disconnect`
-    Ssh,
-    /// `screenshot`, `cursor_position`, `mouse_*`, `key_*`, `window_*`, `open_url`
-    ComputerUse,
-    /// `web_fetch`
-    WebFetch,
-}
-
 fn default_tool_groups() -> Vec<ToolGroup> {
     vec![
         ToolGroup::FileOps,
@@ -338,95 +325,10 @@ pub struct SttConfig {
 
 // ── tool-pair summarization ────────────────────────────────────────
 
-/// Tool-pair summarization configuration.
-///
-/// When enabled, verbose tool call+result pairs are individually summarized
-/// by an LLM, replacing the original call and result with a short summary.
-/// This reclaims tokens incrementally without a full context compaction.
-///
-/// Independent of the full-compaction budget (`compaction`) — can be enabled
-/// while full compaction is off.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ToolSummarizationConfig {
-    /// Whether tool-pair summarization is active.  Default: `false` (opt-in).
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Model in `provider/model` format for summarization.  If `None`, uses
-    /// the session's main model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-
-    /// Only summarize a pair when its call+result exceeds this many tokens.
-    /// If `None`, a built-in default is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_tokens: Option<usize>,
-
-    /// Start summarizing when the agent-visible tool-call count exceeds this.
-    /// If `None`, a built-in default is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_tool_count: Option<usize>,
-}
+// Re-exports from goop_shared; see that crate for the types.
+// — ToolSummarizationConfig, CompactionMode, SessionConfig
 
 // ── config ──────────────────────────────────────────────────────────
-
-/// Compaction budget for the conversation memory.
-///
-/// When the agent-visible conversation exceeds this budget, the entire prefix
-/// is summarized by an LLM into a rolling summary before the next turn.
-/// `None` disables compaction (unlimited context).
-///
-/// In config files this accepts either a bare integer (absolute tokens)
-/// or a string like `"80%"` (percentage of the model's context window).
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum CompactionMode {
-    /// Absolute token budget.
-    Tokens(usize),
-    /// Percentage of the model's context window (0–100).
-    Percent(u8),
-}
-
-impl<'de> Deserialize<'de> for CompactionMode {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl serde::de::Visitor<'_> for Visitor {
-            type Value = CompactionMode;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an integer (absolute tokens) or a string like \"80%\"")
-            }
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(CompactionMode::Tokens(v as usize))
-            }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(CompactionMode::Tokens(v as usize))
-            }
-            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
-                // "80%" → Percent(80)
-                if let Some(pct_str) = s.strip_suffix('%') {
-                    let pct: u8 = pct_str
-                        .trim()
-                        .parse()
-                        .map_err(|_| E::custom(format_args!("invalid percentage: {s:?}")))?;
-                    if pct > 100 {
-                        return Err(E::custom(format_args!(
-                            "percentage out of range 0–100: {pct}"
-                        )));
-                    }
-                    return Ok(CompactionMode::Percent(pct));
-                }
-                // Bare integer string → Tokens (for env vars like GOOP_COMPACTION=64000)
-                if let Ok(n) = s.trim().parse::<usize>() {
-                    return Ok(CompactionMode::Tokens(n));
-                }
-                Err(E::custom(format_args!(
-                    "expected integer or percentage string like \"80%\", got {s:?}"
-                )))
-            }
-        }
-        d.deserialize_any(Visitor)
-    }
-}
 
 /// Effective configuration, built by merging all layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,78 +432,43 @@ impl Config {
     }
 }
 
-// ── session config ──────────────────────────────────────────────────
+// ── session config merge ──────────────────────────────────────────
 
-/// Per-session overrides for [`Config`].  All fields are optional —
-/// `None` means "defer to the global config".
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SessionConfig {
-    /// Override the model (provider/model format).  `None` means "defer to global".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_max_turns: Option<usize>,
-    /// Override the compaction budget.  `None` means "defer to global".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<CompactionMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled_tool_groups: Option<Vec<ToolGroup>>,
-    /// Override the Ollama base URL.  `None` means "defer to global".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ollama_base_url: Option<String>,
-    /// Names of MCP servers to enable for this session (adds to the
-    /// global list — no need to repeat globally-enabled names here).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled_mcp_servers: Option<Vec<String>>,
-    /// Override tool-pair summarization.  `None` means "defer to global".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_summarization: Option<ToolSummarizationConfig>,
+/// Merge session-level overrides into a clone of `config`, returning a new
+/// [`Config`].  Any `Some` value replaces the corresponding field.
+pub fn merge_session_config(session: &SessionConfig, config: &Config) -> Config {
+    let mut merged = config.clone();
+
+    if let Some(ref m) = session.model {
+        if let Ok(parsed) = m.parse::<Model>() {
+            merged.model = parsed;
+        }
+    }
+    if let Some(t) = session.max_tokens {
+        merged.max_tokens = t;
+    }
+    if let Some(t) = session.default_max_turns {
+        merged.default_max_turns = t;
+    }
+    if let Some(ref c) = session.compaction {
+        merged.compaction = Some(c.clone());
+    }
+    if let Some(ref g) = session.enabled_tool_groups {
+        merged.enabled_tool_groups = g.clone();
+    }
+    if let Some(ref u) = session.ollama_base_url {
+        merged.ollama_base_url = u.clone();
+    }
+    if let Some(ref ts) = session.tool_summarization {
+        merged.tool_summarization = ts.clone();
+    }
+
+    merged
 }
 
-impl SessionConfig {
-    /// Merge these overrides into a clone of `config`, returning a new
-    /// [`Config`].  Any `Some` value here replaces the corresponding
-    /// field from `config`.
-    pub fn merge(&self, config: &Config) -> Config {
-        let mut merged = config.clone();
-
-        if let Some(ref m) = self.model {
-            // Parse the session-level model string; fall back to
-            // the global model if parsing fails.
-            if let Ok(parsed) = m.parse::<Model>() {
-                merged.model = parsed;
-            }
-        }
-        if let Some(t) = self.max_tokens {
-            merged.max_tokens = t;
-        }
-        if let Some(t) = self.default_max_turns {
-            merged.default_max_turns = t;
-        }
-        if let Some(ref c) = self.compaction {
-            merged.compaction = Some(c.clone());
-        }
-        if let Some(ref g) = self.enabled_tool_groups {
-            merged.enabled_tool_groups = g.clone();
-        }
-        if let Some(ref u) = self.ollama_base_url {
-            merged.ollama_base_url = u.clone();
-        }
-        if let Some(ref ts) = self.tool_summarization {
-            merged.tool_summarization = ts.clone();
-        }
-        // enabled_mcp_servers is NOT merged here — it's a union
-        // (global + session) computed in Session::new.
-
-        merged
-    }
-
-    /// Return the session-level MCP server enablement, if any.
-    pub fn mcp_server_names(&self) -> &[String] {
-        self.enabled_mcp_servers.as_deref().unwrap_or(&[])
-    }
+/// Return the session-level MCP server enablement, if any.
+pub fn session_mcp_server_names(session: &SessionConfig) -> &[String] {
+    session.enabled_mcp_servers.as_deref().unwrap_or(&[])
 }
 
 // ── CLI overrides ───────────────────────────────────────────────────
@@ -905,7 +772,7 @@ mod tests {
             model: Some("openai/gpt-4o-mini".into()),
             ..Default::default()
         };
-        let merged = session.merge(&config);
+        let merged = merge_session_config(&session, &config);
 
         assert_eq!(merged.model.to_string(), "openai/gpt-4o-mini");
         assert_eq!(merged.provider(), Provider::OpenAI);
@@ -923,7 +790,7 @@ mod tests {
             max_tokens: Some(50_000),
             ..Default::default()
         };
-        let merged = session.merge(&config);
+        let merged = merge_session_config(&session, &config);
 
         // Model unchanged.
         assert_eq!(merged.model.to_string(), "deepseek/deepseek-v4-pro");
@@ -938,7 +805,7 @@ mod tests {
             max_tokens: Some(42),
             ..Default::default()
         };
-        let _merged = session.merge(&config);
+        let _merged = merge_session_config(&session, &config);
         // Original must be unchanged.
         assert_eq!(config.max_tokens, 100_000);
     }
@@ -1144,7 +1011,7 @@ enabled = true
             }),
             ..Default::default()
         };
-        let merged = session.merge(&global);
+        let merged = merge_session_config(&session, &global);
         assert!(merged.tool_summarization.enabled);
         assert_eq!(merged.tool_summarization.min_tokens, Some(500));
     }
@@ -1161,7 +1028,7 @@ enabled = true
         };
         // Session config with no override keeps global settings.
         let session = SessionConfig::default();
-        let merged = session.merge(&global);
+        let merged = merge_session_config(&session, &global);
         assert!(merged.tool_summarization.enabled);
         assert_eq!(merged.tool_summarization.min_tokens, Some(1000));
     }

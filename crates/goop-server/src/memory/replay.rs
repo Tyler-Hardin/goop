@@ -1362,7 +1362,7 @@ mod tests {
     #[test]
     fn collect_branch_linear_returns_all() {
         let log = vec![
-            entry(0, SessionEvent::SessionInfo { name: "s".into() }),
+            entry(0, SessionEvent::SessionInfo { model: None, name: "s".into() }),
             entry(
                 1,
                 SessionEvent::UserPrompt {
@@ -1383,7 +1383,7 @@ mod tests {
     #[test]
     fn collect_branch_fork_excludes_sibling() {
         let log = vec![
-            fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
+            fork_entry(0, None, SessionEvent::SessionInfo { model: None, name: "s".into() }),
             fork_entry(
                 1,
                 Some(0),
@@ -1427,7 +1427,7 @@ mod tests {
     #[test]
     fn replay_fork_shows_new_branch_only() {
         let log = vec![
-            fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
+            fork_entry(0, None, SessionEvent::SessionInfo { model: None, name: "s".into() }),
             fork_entry(
                 1,
                 Some(0),
@@ -1470,7 +1470,7 @@ mod tests {
     #[test]
     fn replay_old_branch_shows_old_branch_only() {
         let log = vec![
-            fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
+            fork_entry(0, None, SessionEvent::SessionInfo { model: None, name: "s".into() }),
             fork_entry(
                 1,
                 Some(0),
@@ -1513,7 +1513,7 @@ mod tests {
     #[test]
     fn replay_fork_preserves_shared_prefix() {
         let log = vec![
-            fork_entry(0, None, SessionEvent::SessionInfo { name: "s".into() }),
+            fork_entry(0, None, SessionEvent::SessionInfo { model: None, name: "s".into() }),
             fork_entry(
                 1,
                 Some(0),
@@ -1576,7 +1576,7 @@ mod tests {
     #[test]
     fn replay_skips_system_prompt() {
         let log = vec![
-            entry(0, SessionEvent::SessionInfo { name: "s".into() }),
+            entry(0, SessionEvent::SessionInfo { model: None, name: "s".into() }),
             entry(
                 1,
                 SessionEvent::SystemPrompt {

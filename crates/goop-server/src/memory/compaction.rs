@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use rig::completion::{AssistantContent, Message};
 use rig::message::UserContent;
 
-use crate::config::ToolSummarizationConfig;
+use goop_shared::ToolSummarizationConfig;
 
 use super::replay::{
     VisibleItem, count_tool_calls, extract_tool_pair_messages, last_prompt_boundary, tool_call_ids,

@@ -545,6 +545,9 @@ async fn handle_socket(ws: WebSocket, session: Arc<Session>) {
                             ClientMessage::CompactRange { covers } => {
                                 session.compact_range(covers);
                             }
+                            ClientMessage::UpdateSettings { config } => {
+                                session.apply_session_settings(config);
+                            }
                         }
                     }
                 }

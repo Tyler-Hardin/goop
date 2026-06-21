@@ -31,6 +31,7 @@ use chrono::Utc;
 use tokio::io::AsyncWriteExt;
 
 use crate::events::{LogEntry, SessionEvent, TurnEndReason};
+use goop_shared::SessionConfig;
 
 // ── the log ───────────────────────────────────────────────────────
 
@@ -118,6 +119,7 @@ impl TransactionLog {
             ts: Utc::now(),
             event: SessionEvent::SessionInfo {
                 name: session_name.to_owned(),
+                model: None,
             },
         };
         if was_empty {
@@ -147,6 +149,36 @@ impl TransactionLog {
             SessionEvent::SystemPrompt { content } => Some(content.clone()),
             _ => None,
         })
+    }
+
+    /// Stamp the creation model into the `SessionInfo` root entry (seq 0).
+    /// Idempotent — only writes when `model` is `None` (new/legacy sessions).
+    /// The caller should persist the change (e.g. via re-writing the log, or
+    /// at least broadcasting the updated entry).
+    pub(crate) fn stamp_session_info_model(&mut self, model: &str) {
+        if let Some(entry) = self.entries.first_mut() {
+            if let SessionEvent::SessionInfo { model: m, .. } = &mut entry.event {
+                if m.is_none() {
+                    *m = Some(model.to_string());
+                }
+            }
+        }
+    }
+
+    /// Scan backward through entries for the last `SettingsChanged` event.
+    /// Returns the session config overrides at that point.  If no
+    /// `SettingsChanged` has ever been appended, returns a default
+    /// (all `None` — "no overrides, inherit everything from global").
+    ///
+    /// Does NOT fall back to `SessionInfo.model` — that field records the
+    /// creation-time effective model for audit, not an ongoing override.
+    /// The "no override" state means the session inherits whatever the
+    /// global config says, which is the behaviour users expect.
+    pub(crate) fn last_settings_in_log(&self) -> SessionConfig {
+        self.entries.iter().rev().find_map(|e| match &e.event {
+            SessionEvent::SettingsChanged { config } => Some(config.clone()),
+            _ => None,
+        }).unwrap_or_default()
     }
 
     /// Inject a `SystemPrompt` event if the log doesn't already have one.
@@ -419,7 +451,7 @@ mod tests {
         assert_eq!(log.entries()[0].parent, None);
         assert!(matches!(
             &log.entries()[0].event,
-            SessionEvent::SessionInfo { name } if name == "my-session"
+            SessionEvent::SessionInfo { name, .. } if name == "my-session"
         ));
 
         // The root was persisted to disk.
@@ -439,7 +471,7 @@ mod tests {
             seq: 0,
             parent: None,
             ts: Utc::now(),
-            event: SessionEvent::SessionInfo { name: "s".into() },
+            event: SessionEvent::SessionInfo { model: None, name: "s".into() },
         })
         .unwrap();
         std::fs::write(&path, format!("{line}\n")).unwrap();
@@ -553,7 +585,7 @@ mod tests {
     #[test]
     fn load_migrates_legacy_bare_events() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let line1 = serde_json::to_string(&SessionEvent::SessionInfo { name: "s".into() }).unwrap();
+        let line1 = serde_json::to_string(&SessionEvent::SessionInfo { model: None, name: "s".into() }).unwrap();
         let line2 = serde_json::to_string(&SessionEvent::UserPrompt {
             content: "hi".into(),
             source: PromptSource::Terminal,
@@ -585,7 +617,7 @@ mod tests {
             })
             .unwrap()
         };
-        let l1 = mk(0, None, SessionEvent::SessionInfo { name: "s".into() });
+        let l1 = mk(0, None, SessionEvent::SessionInfo { model: None, name: "s".into() });
         let l2 = mk(
             5,
             Some(0),
@@ -610,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn load_handles_mixed_legacy_and_envelope() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let bare = serde_json::to_string(&SessionEvent::SessionInfo { name: "s".into() }).unwrap();
+        let bare = serde_json::to_string(&SessionEvent::SessionInfo { model: None, name: "s".into() }).unwrap();
         std::fs::write(tmp.path(), format!("{bare}\n")).unwrap();
 
         // Append a new-format entry; its seq continues past the legacy
@@ -776,7 +808,7 @@ mod tests {
                 seq: 0,
                 parent: None,
                 ts: Utc::now(),
-                event: SessionEvent::SessionInfo { name: "s".into() },
+                event: SessionEvent::SessionInfo { model: None, name: "s".into() },
             })
             .unwrap(),
             serde_json::to_string(&LogEntry {

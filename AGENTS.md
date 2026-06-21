@@ -23,7 +23,8 @@ goop/                         (workspace root)
 │   │   └── assets/           embedded fallback HTML (fb.html), default_config.toml template
 │   └── goop-web/             Leptos frontend (built by Trunk → wasm)
 │       ├── src/
-│       │   ├── components/   UI components (header, message_log, input_bar, etc.)
+│       │   ├── components/   UI components (header, message_log, input_bar,
+│       │   │                  settings_modal, etc.)
 │       │   ├── state.rs      AppState — global reactive state (RwSignals)
 │       │   ├── ws.rs         WebSocket connection + ServerMessage dispatch
 │       │   ├── markdown.rs   Markdown → HTML via marked.js + DOMPurify
@@ -94,7 +95,7 @@ The web UI shows a session sidebar for switching between sessions.
 - **`SessionEvent`** (`goop_shared::SessionEvent`) — enum of all events the session
   emits: `SessionInfo`, `SystemPrompt`, `SessionState`, `UserPrompt`, `Thinking`,
   `AssistantText`, `ToolCall`, `ToolResult`, `ContextUsage`, `TurnEnded`,
-  `Compacted`, `ToolSummarized`, `ContextSnapshot`, `ModelChanged`, `Edited`,
+  `Compacted`, `ToolSummarized`, `ContextSnapshot`, `SettingsChanged`, `Edited`,
   `Deleted`, `HistoryComplete`.  Serialized inside `LogEntry` envelopes over
   the WebSocket as `ServerMessage::Entry`.  `ContextUsage`
   (approximate `used`/`limit` token counts) is emitted after each turn
@@ -808,6 +809,31 @@ Two independent history systems:
 - **GUI mode.** `goop gui` runs the server on a background tokio runtime
   (if primary) and opens a native OS webview (WKWebView on macOS,
   WebView2 on Windows, WebKitGTK on Linux).
+- **Mid-session settings changes.** The web UI's ⚙ settings dialog lets the
+  user change session settings (model, and more in the future) mid-conversation.
+  `ClientMessage::UpdateSettings { config: SessionConfig }` is queued through
+  `drain_queue` (same channel as prompts), so the change is serialized — no
+  races with in-flight turns.  `apply_settings()` merges the incoming overrides
+  with the current `SessionConfig`, persists to `<name>.state.toml`, appends a
+  `SessionEvent::SettingsChanged { config }` event to the transaction log for
+  audit, and rebuilds the agent if model/tool-groups/base-url changed.
+  `SettingsChanged` carries the **complete** `SessionConfig` snapshot (all
+  `Option<T>` fields) — new fields added to `SessionConfig` are automatically
+  tracked without new event variants or bespoke scan logic.
+  **Config types** (`SessionConfig`, `CompactionMode`, `ToolGroup`,
+  `ToolSummarizationConfig`) live in `goop-shared` so both server and web UI
+  can use them without duplication.
+  **On resume:** the server scans the log for the last `SettingsChanged`;
+  if the persisted `.state.toml` config differs (e.g. hand-edited between
+  sessions), a new `SettingsChanged` is appended to bridge the gap.  The
+  `SessionInfo` root entry carries the creation-time model; `SettingsChanged`
+  events record every subsequent change.  Which settings go in the log vs.
+  stay client-side:
+  - **In the log** (audit trail): `SettingsChanged` — the full session config
+    snapshot.  This covers model, tool groups, Ollama URL, compaction budget,
+    tool summarization, and any future `SessionConfig` fields.
+  - **Client-only** (localStorage): UI preferences (theme, font size).  These
+    don't affect the agent and don't need to be logged.
 
 ## Building & running
 

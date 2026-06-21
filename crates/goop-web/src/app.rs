@@ -5,7 +5,8 @@ use wasm_bindgen::prelude::Closure;
 use crate::components::{
     empty_state::EmptyState, header::Header, input_bar::InputBar, message_log::MessageLog,
     new_session_modal::NewSessionModal, refresh_indicator::RefreshIndicator,
-    select_bar::SelectBar, session_list::SessionList, swipe_sidebar::SwipeSidebar,
+    select_bar::SelectBar, session_list::SessionList, settings_modal::SettingsModal,
+    swipe_sidebar::SwipeSidebar,
 };
 use crate::state::AppState;
 
@@ -216,6 +217,14 @@ pub fn App() -> impl IntoView {
         // accepts an initial working directory.
         <Show when=move || show_new_modal.get()>
             <NewSessionModal on_create=on_create_session on_close=on_close_modal />
+        </Show>
+
+        // Settings modal — shown when the user clicks ⚙ in the header.
+        // Allows changing the active model mid-session.
+        <Show when=move || state.settings_modal_open.get()>
+            <SettingsModal
+                on_close=Callback::new(move |_: ()| state.settings_modal_open.set(false))
+            />
         </Show>
     }
 }

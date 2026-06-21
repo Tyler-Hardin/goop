@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use goop_shared::{
-    ClientMessage, EditContent, LogEntry, ServerMessage, SessionEvent, TurnEndReason,
+    ClientMessage, EditContent, LogEntry, ServerMessage, SessionConfig, SessionEvent,
+    SettingsUpdate, TurnEndReason,
 };
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -377,6 +378,21 @@ pub struct AppState {
     /// from any component (sidebar button, input-bar FAB); the `App`
     /// component watches it and renders the modal.
     pub new_session_modal_open: RwSignal<bool>,
+
+    /// Whether the settings modal is open.  Toggled by the gear ⚙ button
+    /// in the header.
+    pub settings_modal_open: RwSignal<bool>,
+
+    /// The currently active model (provider/model format), tracked from
+    /// `SessionInfo.model` on connect and updated by `SettingsChanged` events.
+    /// `None` for legacy sessions or before history replay delivers it.
+    /// Used to pre-fill the settings dialog.
+    pub current_model: RwSignal<Option<String>>,
+
+    /// The current session config overrides, updated from
+    /// [`SettingsChanged`](SessionEvent::SettingsChanged) events.  `None`
+    /// fields mean "inherit from global."  Drives the settings dialog.
+    pub current_settings: RwSignal<SessionConfig>,
 }
 
 /// Result of pre-forming buffered history entries into UI state.
@@ -392,6 +408,10 @@ struct BuildResult {
     next_id: usize,
     context_usage: Option<(usize, usize)>,
     system_prompt: Option<String>,
+    /// Current model from `SessionInfo.model`, or updated by `SettingsChanged`.
+    current_model: Option<String>,
+    /// Current session config overrides from the last `SettingsChanged` event.
+    current_settings: SessionConfig,
 }
 
 impl AppState {
@@ -426,6 +446,9 @@ impl AppState {
             system_prompt: RwSignal::new(None),
             agent_messages: RwSignal::new(Vec::new()),
             new_session_modal_open: RwSignal::new(false),
+            settings_modal_open: RwSignal::new(false),
+            current_model: RwSignal::new(None),
+            current_settings: RwSignal::new(SessionConfig::default()),
         }
     }
 
@@ -547,6 +570,19 @@ impl AppState {
             self.btn_state.set(BtnState::Running);
             let msg =
                 serde_json::to_string(&ClientMessage::Fork { target, content }).unwrap_or_default();
+            ws.send_with_str(&msg).ok();
+        }
+    }
+
+    /// Send a settings update to the server.  The server merges the
+    /// overrides, persists, and broadcasts a `SettingsChanged` event.
+    pub fn update_settings(&self, update: SettingsUpdate) {
+        if let Some(ws) = self.ws.get_untracked()
+            && ws.ready_state() == web_sys::WebSocket::OPEN
+        {
+            let msg =
+                serde_json::to_string(&ClientMessage::UpdateSettings { config: update })
+                    .unwrap_or_default();
             ws.send_with_str(&msg).ok();
         }
     }
@@ -818,6 +854,8 @@ impl AppState {
                 self.agent_messages.set(result.agent_messages);
                 self.context_usage.set(result.context_usage);
                 self.system_prompt.set(result.system_prompt);
+                self.current_model.set(result.current_model);
+                self.current_settings.set(result.current_settings);
 
                 // Session is now loaded — refresh the sidebar.
                 log::info!("HistoryComplete — refreshing session list");
@@ -870,12 +908,17 @@ impl AppState {
         let mut turn = TurnState::Idle;
         let mut context_usage: Option<(usize, usize)> = None;
         let mut system_prompt: Option<String> = None;
+        let mut current_model: Option<String> = None;
+        let mut current_settings = SessionConfig::default();
 
         for entry in entries {
             let event_seq = entry.seq;
             match &entry.event {
-                SessionEvent::SessionInfo { name } => {
+                SessionEvent::SessionInfo { name, model } => {
                     session_name = Some(name.clone());
+                    if let Some(m) = model {
+                        current_model = Some(m.clone());
+                    }
                 }
                 SessionEvent::SystemPrompt { content } => {
                     system_prompt = Some(content.clone());
@@ -1044,7 +1087,11 @@ impl AppState {
                     apply_delete(&mut messages, *target);
                 }
                 // ── metadata events (no UI) ──
-                SessionEvent::ContextSnapshot { .. } | SessionEvent::ModelChanged { .. } => {}
+                SessionEvent::ContextSnapshot { .. } => {}
+                SessionEvent::SettingsChanged { config } => {
+                    current_model = config.model.clone();
+                    current_settings = config.clone();
+                }
                 SessionEvent::HistoryComplete => {
                     // Never appears in an envelope — the subscriber yields it
                     // as a bare `ServerMessage::HistoryComplete`.
@@ -1073,6 +1120,8 @@ impl AppState {
             next_id,
             context_usage,
             system_prompt,
+            current_model,
+            current_settings,
         }
     }
 
@@ -1211,7 +1260,7 @@ impl AppState {
         };
 
         match entry.event {
-            SessionEvent::SessionInfo { name } => {
+            SessionEvent::SessionInfo { name, .. } => {
                 self.current_session.set(Some(name));
             }
             SessionEvent::SystemPrompt { content } => {
@@ -1397,7 +1446,11 @@ impl AppState {
                 });
             }
             // ── metadata events (no UI) ──
-            SessionEvent::ContextSnapshot { .. } | SessionEvent::ModelChanged { .. } => {}
+            SessionEvent::ContextSnapshot { .. } => {}
+            SessionEvent::SettingsChanged { config } => {
+                self.current_model.set(config.model.clone());
+                self.current_settings.set(config);
+            }
             SessionEvent::HistoryComplete => {
                 // Handled in handle_subscribed() — a no-op here.
             }

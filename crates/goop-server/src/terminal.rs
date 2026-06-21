@@ -240,7 +240,7 @@ impl TerminalClient {
                         // echoes on `Entry` events.
                         let sm = match sm {
                             ServerMessage::Entry(entry) => {
-                                if let SessionEvent::SessionInfo { ref name } = entry.event {
+                                if let SessionEvent::SessionInfo { name, .. } = &entry.event {
                                     *ws_session_name.lock().expect("session name mutex poisoned") =
                                         Some(name.clone());
                                 }
@@ -476,7 +476,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
             }
         };
         match event {
-            SessionEvent::SessionInfo { ref name } => {
+            SessionEvent::SessionInfo { name, .. } => {
                 state
                     .lock_printer()
                     .print(format!("{DIM}  ● session {name}{RST}\n"))
@@ -685,7 +685,7 @@ pub(crate) async fn render_loop<P: rustyline::ExternalPrinter>(
 
             // ── metadata events (audit only, no terminal rendering) ──
             SessionEvent::ContextSnapshot { .. }
-            | SessionEvent::ModelChanged { .. }
+            | SessionEvent::SettingsChanged { .. }
             | SessionEvent::SystemPrompt { .. } => {}
 
             SessionEvent::HistoryComplete => {

@@ -8,4 +8,5 @@ pub mod new_session_modal;
 pub mod refresh_indicator;
 pub mod select_bar;
 pub mod session_list;
+pub mod settings_modal;
 pub mod swipe_sidebar;

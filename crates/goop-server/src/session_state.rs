@@ -35,7 +35,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::config::SessionConfig;
+use goop_shared::SessionConfig;
 use crate::transport::{PersistedTransport, Transport, TransportError};
 
 // ── error type ───────────────────────────────────────────────────────
@@ -145,6 +145,19 @@ impl SessionState {
             }),
             state_path,
         }
+    }
+
+    /// Read the current session config overrides.
+    pub(crate) async fn session_config(&self) -> SessionConfig {
+        self.inner.lock().await.session_config.clone()
+    }
+
+    /// Replace the session config overrides and persist to disk.
+    /// Called by [`apply_settings`](crate::session::Session::apply_settings)
+    /// so settings changes survive server restarts.
+    pub(crate) async fn set_session_config(&self, config: SessionConfig) {
+        self.inner.lock().await.session_config = config;
+        self.save().await;
     }
 
     /// Set the persisted active-tip mirror (called by the session on a branch

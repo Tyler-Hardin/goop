@@ -102,6 +102,16 @@ pub fn Header() -> impl IntoView {
     };
     let has_session = move || state.current_session.get().is_some();
 
+    // Settings modal toggle.
+    let toggle_settings = {
+        let state = state.clone();
+        move |_| {
+            state.settings_modal_open.update(|v| *v = !*v);
+        }
+    };
+    let show_settings =
+        Signal::derive(move || state.current_session.get().is_some());
+
     view! {
         <header>
             <button class="menu-btn" id="menuBtn" title="Sessions" on:click=toggle_sidebar>
@@ -130,6 +140,15 @@ pub fn Header() -> impl IntoView {
                 on:click=toggle_llm_view
             >
                 "👁"
+            </button>
+            <button
+                class="settings-btn"
+                id="settingsBtn"
+                title="Settings"
+                class:hidden=move || !show_settings.get()
+                on:click=toggle_settings
+            >
+                "⚙"
             </button>
             <button
                 class="reload-btn"

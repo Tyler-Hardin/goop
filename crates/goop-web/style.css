@@ -748,6 +748,24 @@ main.select-mode .msg-select-overlay {
   background: rgba(100, 149, 237, 0.12);
 }
 
+.settings-btn {
+  background: none;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 4px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.settings-btn:hover {
+  background: var(--surface2);
+  color: var(--fg);
+}
+
 /* ── LLM view summary messages ───────────────────── */
 
 /*
@@ -1635,6 +1653,78 @@ footer button.cancel-slide .icon-cancel {
 .modal-btn-create:hover {
   background: var(--blue-dim);
   color: var(--bg);
+}
+
+.settings-saved {
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: rgba(0, 200, 0, 0.1);
+  border: 1px solid rgba(0, 200, 0, 0.3);
+  border-radius: var(--radius-sm);
+  color: var(--green);
+  font-size: 13px;
+}
+
+/* ── settings dialog ──────────────────────────── */
+
+.settings-dialog {
+  max-width: 480px;
+}
+
+.settings-field {
+  margin-bottom: 14px;
+}
+
+.settings-field-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--dim);
+  margin-bottom: 4px;
+  cursor: pointer;
+}
+
+.settings-field-toggle {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--blue);
+  cursor: pointer;
+}
+
+.settings-field .modal-input {
+  margin-top: 2px;
+}
+
+.settings-inherited {
+  display: block;
+  font-size: 12px;
+  color: var(--dim2);
+  font-style: italic;
+  padding: 6px 0;
+}
+
+.settings-checkboxes {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.settings-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.settings-checkbox input {
+  width: 12px;
+  height: 12px;
+  accent-color: var(--blue);
 }
 
 /* ── modal CWD row ────────────────────────────── */

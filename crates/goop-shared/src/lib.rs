@@ -83,14 +83,235 @@ pub enum EditContent {
     ToolResult { content: String },
 }
 
-/// Events emitted by the session as the agent processes a prompt.
+// ── config types shared between server and web UI ──────────────────────
+
+/// Groups of tools that can be enabled/disabled in config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolGroup {
+    /// `read`, `write`, `replace`, `read_html`, `cd`
+    FileOps,
+    /// `shell`, `restart`
+    Shell,
+    /// `ssh`, `disconnect`
+    Ssh,
+    /// `screenshot`, `cursor_position`, `mouse_*`, `key_*`, `window_*`, `open_url`
+    ComputerUse,
+    /// `web_fetch`
+    WebFetch,
+}
+
+/// Compaction budget for the conversation memory.
+///
+/// When the agent-visible conversation exceeds this budget, the entire prefix
+/// is summarized by an LLM into a rolling summary before the next turn.
+/// `None` disables compaction (unlimited context).
+///
+/// In config files this accepts either a bare integer (absolute tokens)
+/// or a string like `"80%"` (percentage of the model's context window).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum CompactionMode {
+    /// Absolute token budget.
+    Tokens(usize),
+    /// Percentage of the model's context window (0–100).
+    Percent(u8),
+}
+
+impl<'de> Deserialize<'de> for CompactionMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = CompactionMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an integer (absolute tokens) or a string like \"80%\"")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(CompactionMode::Tokens(v as usize))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(CompactionMode::Tokens(v as usize))
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                if let Some(pct_str) = s.strip_suffix('%') {
+                    let pct: u8 = pct_str
+                        .trim()
+                        .parse()
+                        .map_err(|_| E::custom(format_args!("invalid percentage: {s:?}")))?;
+                    if pct > 100 {
+                        return Err(E::custom(format_args!(
+                            "percentage out of range 0–100: {pct}"
+                        )));
+                    }
+                    return Ok(CompactionMode::Percent(pct));
+                }
+                if let Ok(n) = s.trim().parse::<usize>() {
+                    return Ok(CompactionMode::Tokens(n));
+                }
+                Err(E::custom(format_args!(
+                    "expected integer or percentage string like \"80%\", got {s:?}"
+                )))
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+/// Tool-pair summarization configuration.
+///
+/// When enabled, verbose tool call+result pairs are individually summarized
+/// by an LLM, replacing the original call and result with a short summary.
+/// This reclaims tokens incrementally without a full context compaction.
+///
+/// Independent of the full-compaction budget (`compaction`) — can be enabled
+/// while full compaction is off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolSummarizationConfig {
+    /// Whether tool-pair summarization is active.  Default: `false` (opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Model in `provider/model` format for summarization.  If `None`, uses
+    /// the session's main model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Only summarize a pair when its call+result exceeds this many tokens.
+    /// If `None`, a built-in default is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<usize>,
+
+    /// Start summarizing when the agent-visible tool-call count exceeds this.
+    /// If `None`, a built-in default is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_tool_count: Option<usize>,
+}
+
+/// Per-session overrides for the global config.  All fields are optional —
+/// `None` means "defer to the global config".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SessionConfig {
+    /// Override the model (provider/model format).  `None` = defer to global.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_turns: Option<usize>,
+    /// Override the compaction budget.  `None` = defer to global.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_tool_groups: Option<Vec<ToolGroup>>,
+    /// Override the Ollama base URL.  `None` = defer to global.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ollama_base_url: Option<String>,
+    /// Names of MCP servers to enable for this session (adds to the
+    /// global list — no need to repeat globally-enabled names here).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_mcp_servers: Option<Vec<String>>,
+    /// Override tool-pair summarization.  `None` = defer to global.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_summarization: Option<ToolSummarizationConfig>,
+}
+
+// ── settings delta wire format ────────────────────────────────────────
+//
+// `SettingsUpdate` is what the client sends when the user changes a setting.
+// Each field is `Option<Setting<T>>`:
+//   - `None` (absent key in JSON)  → don't touch this field
+//   - `Some(Setting::Set(v))`       → set override to `v`
+//   - `Some(Setting::Clear)`        → remove override, go back to inheriting
+//
+// In JSON:  `{"model": "openai/gpt-4o"}` sets; `{"model": null}` clears.
+// This is distinct from `SessionConfig` (the canonical override state),
+// where `Option<T>` means "None = inherit, Some = override."
+
+/// A setting change for a single field: set it, clear the override, or
+/// (when wrapped in `Option`) leave it alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Setting<T> {
+    /// Set the override to this value.
+    Set(T),
+    /// Remove the override — go back to inheriting from the global config.
+    Clear,
+}
+
+impl<T: Serialize> Serialize for Setting<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Setting::Set(v) => v.serialize(s),
+            Setting::Clear => s.serialize_unit(),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Setting<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Visitor;
+        use std::fmt;
+        use std::marker::PhantomData;
+
+        struct SettingVisitor<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for SettingVisitor<T> {
+            type Value = Setting<T>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a value or null")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(Setting::Clear)
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(Setting::Clear)
+            }
+
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<Self::Value, D2::Error> {
+                T::deserialize(d).map(Setting::Set)
+            }
+        }
+
+        d.deserialize_option(SettingVisitor(PhantomData))
+    }
+}
+
+/// A settings change from the client.  Fields map to [`SessionConfig`] but
+/// use [`Setting<T>`] so the user can explicitly clear an override.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SettingsUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Setting<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_base_url: Option<Setting<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tool_groups: Option<Setting<Vec<ToolGroup>>>,
+}
+
+// ── events ──────────────────────────────────────────────────────────
 /// Views (terminal, web, phone, …) subscribe and render in their own way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum SessionEvent {
     /// Session metadata — sent first on connect so clients know the
     /// session name for copy/paste at exit.
-    SessionInfo { name: String },
+    ///
+    /// `model` is the active model at session creation time.  It is
+    /// `None` for legacy sessions created before this field was added;
+    /// clients should track subsequent changes via
+    /// [`SettingsChanged`](Self::SettingsChanged).
+    SessionInfo {
+        name: String,
+        /// The active model when the session was created (provider/model format).
+        /// `None` for legacy sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
 
     /// The system prompt (preamble) the agent received at session creation.
     /// Appended to the log once (for new sessions) and persisted; on resume
@@ -171,10 +392,15 @@ pub enum SessionEvent {
     /// model fully determine the messages the LLM received.
     ContextSnapshot { seqs: Vec<u64>, model: String },
 
-    /// The session's active model changed mid-conversation.  Metadata only —
-    /// does not change replay visibility.  Lets the UI annotate "model
-    /// switched from X to Y here".
-    ModelChanged { from: String, to: String },
+    /// The session's settings changed mid-conversation.  Metadata only —
+    /// does not change replay visibility.  Carries the complete set of
+    /// session-level config overrides at this point so clients can track
+    /// the active model, tool groups, etc. without field-by-field events.
+    ///
+    /// On resume, the server scans the log for the last `SettingsChanged`
+    /// event; if the persisted session config differs, a new one is
+    /// appended to bridge the gap.
+    SettingsChanged { config: SessionConfig },
 
     /// Replace the content of a prior event (`target` seq).  The original
     /// stays in the log; replay uses the replacement for the agent view.
@@ -289,6 +515,12 @@ pub enum ClientMessage {
     /// doc.
     #[serde(rename = "compact_range")]
     CompactRange { covers: Vec<u64> },
+    /// Update session settings mid-conversation.  Each field can be set to a
+    /// new value, cleared (revert to global default), or left alone.  The
+    /// server merges the changes, persists, appends `SettingsChanged`, and
+    /// rebuilds the agent if needed.
+    #[serde(rename = "update_settings")]
+    UpdateSettings { config: SettingsUpdate },
 }
 
 // ── agent-visible projection ───────────────────────────────────────
@@ -513,7 +745,7 @@ fn build_agent_view_from_branch(branch: &[LogEntry]) -> Vec<AgentVisibleItem> {
                 apply_delete_agent(&mut visible, branch, *target);
             }
 
-            // `SystemPrompt`, `ContextSnapshot`, `ModelChanged`, `HistoryComplete`,
+            // `SystemPrompt`, `ContextSnapshot`, `SettingsChanged`, `HistoryComplete`,
             // `SessionInfo`, `SessionState`, `ContextUsage` — metadata, not
             // conversation content.  Fall through to the turn buffer (they
             // become no-ops there).
