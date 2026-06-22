@@ -166,7 +166,33 @@ impl SessionState {
         self.inner.lock().await.active_tip = tip;
     }
 
+    /// Local user home directory — always the machine goop is running on.
+    /// Used by preamble construction.
+    pub(crate) fn home_dir(&self) -> &Path {
+        &self.local_home_dir
+    }
+
     // ── public operations (called by tools) ────────────────────────
+
+    /// Read a file from the current working directory via the active
+    /// transport.  Returns `None` if the file doesn't exist or can't be
+    /// read.
+    pub async fn read_cwd_file(&self, filename: &str) -> Option<String> {
+        let (transport, cwd) = {
+            let inner = self.inner.lock().await;
+            let t = inner.transport.clone();
+            let c = self.cwd_of(&inner).await;
+            (t, c)
+        };
+        let path = cwd.join(filename);
+        transport.read_file(&path).await.ok()
+    }
+
+    /// Current working directory as a display string (for the preamble template).
+    pub async fn cwd_display(&self) -> String {
+        let inner = self.inner.lock().await;
+        self.cwd_of(&inner).await.display().to_string()
+    }
 
     /// Read a file, optionally with line-range slicing.
     ///

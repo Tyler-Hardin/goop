@@ -401,11 +401,16 @@ The web UI shows a session sidebar for switching between sessions.
   the LLM's context. Replay skips it (audit-only metadata).
 - **System prompt** (`src/preamble.rs` + `src/session.rs` +
   `src/memory/transaction_log.rs`) — the preamble (system prompt) is built
-  once via `build_preamble()` for new sessions, stored as a `SystemPrompt`
+  via `build_preamble()` for new sessions, stored as a `SystemPrompt`
   event in the transaction log, and baked into the agent at build time.
   On resume the log's stored value is authoritative — the preamble is NOT
-  rebuilt, so edits to USER.md / AGENTS.md only take effect on new sessions.
-  This makes the log a complete audit trail of what the LLM saw.  The web
+  rebuilt from scratch, so edits to USER.md only take effect on new sessions.
+  **Preamble is rebuilt mid-session** when `cd`, `ssh`, or `disconnect`
+  changes the relevant project context: goop reads AGENTS.md from the new
+  CWD via the active transport (local or SSH), and if the content differs
+  from what's baked into the current preamble, a new `SystemPrompt` event
+  is appended and the agent is rebuilt with the new context.  This makes
+  the log a complete audit trail of what the LLM saw.  The web
   UI's LLM view (👁) renders the stored preamble in a collapsible panel
   above the message log.  `SystemPrompt` is metadata — skipped during
   agent-memory replay (it's already in the agent's preamble, not the

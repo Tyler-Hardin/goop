@@ -125,6 +125,11 @@ enum QueuedAction {
 pub struct Session {
     /// Session name (user-supplied or auto-generated like `20260128_001`).
     name: String,
+    /// AGENTS.md content most recently baked into the live agent's preamble.
+    /// `None` means no AGENTS.md was found.  Compared with the current CWD's
+    /// AGENTS.md after each turn to detect when `cd` / `ssh` / `disconnect`
+    /// changes the relevant project context.
+    last_agents_md: std::sync::Mutex<Option<String>>,
     /// Shared mutable state (CWD, transport, home_dir) accessible by tools.
     ///
     /// Held here to keep the `Arc` alive; tools receive their own clone
@@ -427,10 +432,15 @@ impl Session {
 
         let agent = model::build_agent(&merged_config, &preamble, mem, state.clone(), mcp_tools)?;
 
+        // Snapshot the AGENTS.md content baked into the preamble, so we can
+        // detect when cd/ssh/disconnect changes the relevant project context.
+        let last_agents_md = state.read_cwd_file("AGENTS.md").await;
+
         let this = Arc::new(Self {
             name: name.clone(),
             state: state.clone(),
             agent: std::sync::Mutex::new(agent),
+            last_agents_md: std::sync::Mutex::new(last_agents_md),
             tx,
             history,
             memory: memory_for_usage,
@@ -725,6 +735,11 @@ impl Session {
                     })
                     .await;
                     self.run_one(&content).await;
+
+                    // cd / ssh / disconnect may have changed the project
+                    // context — rebuild the preamble if AGENTS.md differs.
+                    self.maybe_rebuild_preamble().await;
+
                     // Notify the submitter that this prompt is done.
                     if let Some(tx) = done {
                         let _ = tx.send(());
@@ -1025,6 +1040,84 @@ impl Session {
             done: Some(tx),
         });
         rx
+    }
+
+    /// If the current CWD has a different AGENTS.md than what's baked into
+    /// the agent's preamble (because the user `cd`'d, `ssh`'d, or
+    /// `disconnect`ed to a different project), rebuild the preamble and
+    /// agent so the LLM sees the new project context.
+    async fn maybe_rebuild_preamble(&self) {
+        let current_agents_md = self.state.read_cwd_file("AGENTS.md").await;
+
+        {
+            let last = self.last_agents_md.lock().unwrap();
+            if *last == current_agents_md {
+                return; // unchanged — nothing to do
+            }
+        }
+
+        let cwd = self.state.cwd_display().await;
+        let home_dir = self.state.home_dir();
+        let new_preamble = crate::preamble::build_preamble_with(
+            &cwd,
+            &home_dir,
+            current_agents_md.as_deref(),
+        );
+
+        // Check whether the rendered preamble actually changed.
+        // (AGENTS.md might be None→None but CWD changed → rendered
+        // preamble is different.  Or AGENTS.md content changed but the
+        // rest is stable.  Comparing the final string handles both.)
+        let old_preamble = {
+            let log = self.history.lock().await;
+            log.system_prompt().unwrap_or_default()
+        };
+        if new_preamble == old_preamble {
+            // CWD changed but preamble is identical (e.g. two dirs with
+            // the same AGENTS.md).  Still update the tracker so we don't
+            // keep re-reading the file on every turn.
+            *self.last_agents_md.lock().unwrap() = current_agents_md;
+            return;
+        }
+
+        tracing::info!(
+            "preamble changed — AGENTS.md {} → rebuilding agent",
+            if current_agents_md.is_some() { "added/updated" } else { "removed" }
+        );
+
+        // Append the new SystemPrompt to the transaction log for audit.
+        self.emit(SessionEvent::SystemPrompt {
+            content: new_preamble.clone(),
+        })
+        .await;
+
+        // ── rebuild agent with the new preamble ─────────────────
+        // Same pattern as apply_settings, but we keep the same model +
+        // tools — only the preamble changes.
+        let session_cfg = self.state.session_config().await;
+        let merged_config = build_temp_config(&session_cfg);
+
+        let mut mcp_tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+        mcp_tools.extend(self.shared_mcp.build_tools());
+        mcp_tools.extend(self.session_mcp.build_tools());
+
+        let new_agent = match crate::model::build_agent(
+            &merged_config,
+            &new_preamble,
+            crate::memory::build_session_memory(self.history.clone()),
+            self.state.clone(),
+            mcp_tools,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("maybe_rebuild_preamble: failed to build agent: {e}");
+                return;
+            }
+        };
+
+        // Update the tracker and swap the agent.
+        *self.last_agents_md.lock().unwrap() = current_agents_md;
+        *self.agent.lock().unwrap() = new_agent;
     }
 
     // ── helpers ────────────────────────────────────────────────────
@@ -1481,6 +1574,7 @@ impl Session {
 
         let session = Arc::new(Self {
             name: name.to_string(),
+            last_agents_md: std::sync::Mutex::new(None),
             state: Arc::new(SessionState::new(
                 PathBuf::from("/tmp"),
                 PathBuf::from("/tmp"),

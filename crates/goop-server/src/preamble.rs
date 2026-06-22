@@ -11,34 +11,55 @@
 use std::path::Path;
 
 /// Render the agent preamble from the Tera template and env context.
+/// Reads AGENTS.md from `{cwd}/AGENTS.md` on the local filesystem.
 pub fn build_preamble(cwd: &str, home_dir: &Path) -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| String::from("unknown"));
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
-
-    // USER.md
-    let user_md_path = home_dir.join(".config").join("goop").join("USER.md");
-    let user_md = {
-        if !user_md_path.exists() {
-            let parent = user_md_path
-                .parent()
-                .expect("user_md_path always has a parent");
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::write(&user_md_path, "");
-        }
-        let content = std::fs::read_to_string(&user_md_path).unwrap_or_default();
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            String::from("[empty, no user memories yet.]")
-        } else {
-            trimmed.to_string()
-        }
-    };
-
-    // AGENTS.md (may be present or absent — template handles the conditional)
+    let user_md = read_user_md(home_dir);
     let agents_md = {
         let agents_path = Path::new(cwd).join("AGENTS.md");
         std::fs::read_to_string(&agents_path).ok()
     };
+    render_preamble(cwd, home_dir, &user_md, agents_md.as_deref())
+}
+
+/// Render the agent preamble with a pre-supplied AGENTS.md content.
+///
+/// `agents_md` is the content of the project's AGENTS.md (if any), obtained
+/// via the active transport.  This variant is used when rebuilding the
+/// preamble after `cd` / `ssh` / `disconnect`, where AGENTS.md may reside
+/// on a remote host.
+pub fn build_preamble_with(cwd: &str, home_dir: &Path, agents_md: Option<&str>) -> String {
+    let user_md = read_user_md(home_dir);
+    render_preamble(cwd, home_dir, &user_md, agents_md)
+}
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn read_user_md(home_dir: &Path) -> String {
+    let user_md_path = home_dir.join(".config").join("goop").join("USER.md");
+    if !user_md_path.exists() {
+        let parent = user_md_path
+            .parent()
+            .expect("user_md_path always has a parent");
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::write(&user_md_path, "");
+    }
+    let content = std::fs::read_to_string(&user_md_path).unwrap_or_default();
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        String::from("[empty, no user memories yet.]")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn render_preamble(
+    cwd: &str,
+    home_dir: &Path,
+    user_md: &str,
+    agents_md: Option<&str>,
+) -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| String::from("unknown"));
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
 
     let mut context = tera::Context::new();
     context.insert("user", &user);
@@ -48,8 +69,8 @@ pub fn build_preamble(cwd: &str, home_dir: &Path) -> String {
     context.insert("arch", std::env::consts::ARCH);
     context.insert("os_distro", &os_release());
     context.insert("cwd", cwd);
-    context.insert("user_md", &user_md);
-    if let Some(ref amd) = agents_md {
+    context.insert("user_md", user_md);
+    if let Some(amd) = agents_md {
         context.insert("agents_md", amd);
     }
 
