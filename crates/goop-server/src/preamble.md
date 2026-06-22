@@ -32,14 +32,14 @@ You can edit the USER.md, SYSTEM.md, and AGENTS.md files with the `replace` and/
 
 ---
 
-Your user memory is stored in `~/.config/goop/USER.md`. It is included in every prompt and persists across all sessions:
+Your user memory is stored in `{{ user_md_path }}`. It is included in every prompt and persists across all sessions:
 
 {{ user_md }}
 
 {% if system_md %}
 ---
 
-Your machine memory is stored in `~/.config/goop/SYSTEM.md`. It is specific to the current host:
+Your machine memory is stored in `{{ system_md_path }}`. It is specific to the current host:
 
 {{ system_md }}
 {% endif %}

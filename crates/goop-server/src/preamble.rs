@@ -99,8 +99,10 @@ fn render_preamble(
     context.insert("arch", std::env::consts::ARCH);
     context.insert("os_distro", &os_release());
     context.insert("cwd", cwd);
+    context.insert("user_md_path", &crate::config::user_md_path().display().to_string());
     context.insert("user_md", user_md);
     if let Some(smd) = system_md {
+        context.insert("system_md_path", &crate::config::system_md_path().display().to_string());
         context.insert("system_md", smd);
     }
     if let Some(amd) = agents_md {
