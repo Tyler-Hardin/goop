@@ -15,8 +15,8 @@ use std::path::Path;
 /// Render the agent preamble from the Tera template and env context.
 /// Reads SYSTEM.md and AGENTS.md from the local filesystem.
 pub fn build_preamble(cwd: &str, home_dir: &Path) -> String {
-    let user_md = read_user_md(home_dir);
-    let system_md = read_system_md(home_dir);
+    let user_md = read_user_md();
+    let system_md = read_system_md();
     let agents_md = {
         let agents_path = Path::new(cwd).join("AGENTS.md");
         std::fs::read_to_string(&agents_path).ok()
@@ -41,22 +41,23 @@ pub fn build_preamble_with(
     system_md: Option<&str>,
     agents_md: Option<&str>,
 ) -> String {
-    let user_md = read_user_md(home_dir);
+    let user_md = read_user_md();
     render_preamble(cwd, home_dir, &user_md, system_md, agents_md)
 }
 
 // ── helpers ────────────────────────────────────────────────────────
 
-fn read_user_md(home_dir: &Path) -> String {
-    let path = home_dir.join(".config").join("goop").join("USER.md");
+fn read_user_md() -> String {
+    let path = crate::config::user_md_path();
     read_or_create_md(&path)
 }
 
-/// Read SYSTEM.md from `~/.config/goop/SYSTEM.md` on the local machine.
-/// Returns `None` if the file doesn't exist (no stub is created — a missing
-/// SYSTEM.md means no per-machine conventions are recorded).
-fn read_system_md(home_dir: &Path) -> Option<String> {
-    let path = home_dir.join(".config").join("goop").join("SYSTEM.md");
+/// Read SYSTEM.md from the path given by [`crate::config::system_md_path`]
+/// on the local machine.  Returns `None` if the file doesn't exist (no
+/// stub is created — a missing SYSTEM.md means no per-machine conventions
+/// are recorded).
+fn read_system_md() -> Option<String> {
+    let path = crate::config::system_md_path();
     if !path.exists() {
         return None;
     }

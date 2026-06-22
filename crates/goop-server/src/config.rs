@@ -66,8 +66,29 @@ pub fn config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".config/goop"))
 }
 
+/// Path to the global config file.  Override with `GOOP_CONFIG_PATH`.
 pub fn global_config_path() -> PathBuf {
-    config_dir().join("config.toml")
+    env_path_override("GOOP_CONFIG_PATH")
+        .unwrap_or_else(|| config_dir().join("config.toml"))
+}
+
+/// Path to USER.md (always local).  Override with `GOOP_USER_MD_PATH`.
+pub fn user_md_path() -> PathBuf {
+    env_path_override("GOOP_USER_MD_PATH")
+        .unwrap_or_else(|| config_dir().join("USER.md"))
+}
+
+/// Path to SYSTEM.md on the active host.  Override with
+/// `GOOP_SYSTEM_MD_PATH` — when set, this absolute path is read via the
+/// active transport (local or SSH).  Defaults to
+/// `~/.config/goop/SYSTEM.md` on the active host.
+pub fn system_md_path() -> PathBuf {
+    env_path_override("GOOP_SYSTEM_MD_PATH")
+        .unwrap_or_else(|| config_dir().join("SYSTEM.md"))
+}
+
+fn env_path_override(var: &str) -> Option<PathBuf> {
+    std::env::var(var).ok().map(PathBuf::from)
 }
 
 // ── provider ────────────────────────────────────────────────────────

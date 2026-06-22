@@ -439,7 +439,7 @@ impl Session {
 
         // Snapshot SYSTEM.md and AGENTS.md baked into the preamble, so we can
         // detect when cd/ssh/disconnect changes the relevant host or project.
-        let last_system_md = state.read_home_config_file("SYSTEM.md").await;
+        let last_system_md = state.read_system_md().await;
         let last_agents_md = state.read_cwd_file("AGENTS.md").await;
 
         let this = Arc::new(Self {
@@ -1054,7 +1054,7 @@ impl Session {
     /// `ssh`'d, or `disconnect`ed), rebuild the preamble and agent so the
     /// LLM sees the new host/project context.
     async fn maybe_rebuild_preamble(&self) {
-        let current_system_md = self.state.read_home_config_file("SYSTEM.md").await;
+        let current_system_md = self.state.read_system_md().await;
         let current_agents_md = self.state.read_cwd_file("AGENTS.md").await;
 
         // Fast path: both unchanged.
