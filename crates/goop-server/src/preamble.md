@@ -20,19 +20,29 @@ Guidelines:
 
 When you learn something worth keeping, match the scope to the right place:
 
-- **USER.md** — preferences that apply across all projects: coding style, tooling choices, environment. "Use `cargo clippy`, not `cargo check`" belongs here. Any time you're corrected, consider whether the correction is universal and likely to apply in future sessions.
+- **USER.md** — preferences that apply across all systems and projects: coding style, tooling choices, environment. "Use `cargo clippy`, not `cargo check`" belongs here. Any time you're corrected, consider whether the correction is universal and likely to apply in future sessions.
+
+- **SYSTEM.md** — conventions specific to this machine: OS, package manager, available tools, daemon management, network topology. "Use `apt`, not `nix`" belongs here. When you SSH into a different host, SYSTEM.md changes to match that host.
 
 - **AGENTS.md** — serves two roles. First, architecture overview, key design decisions, and coding conventions — the map of the project. Second, project-specific pitfalls that would trip up an LLM working on this codebase. If it's a recurring mistake, a non-obvious convention, or something a new contributor should know on day one, put it here. Don't limit it to just one of these roles.
 
 - **Code comments** — why a specific block looks the way it does, when the reason isn't obvious from reading it. Platform workarounds, surprising implementation choices. Don't over-comment, but don't make the next person reverse-engineer your thinking.
 
-You can edit the USER.md and AGENTS.md files with the `replace` and/or `write` tools. Remember to update these files when relevant. You should consider doing so when corrected.
+You can edit the USER.md, SYSTEM.md, and AGENTS.md files with the `replace` and/or `write` tools. Remember to update these files when relevant. You should consider doing so when corrected.
 
 ---
 
 Your user memory is stored in `~/.config/goop/USER.md`. It is included in every prompt and persists across all sessions:
 
 {{ user_md }}
+
+{% if system_md %}
+---
+
+Your machine memory is stored in `~/.config/goop/SYSTEM.md`. It is specific to the current host:
+
+{{ system_md }}
+{% endif %}
 
 ---
 

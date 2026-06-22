@@ -1,49 +1,77 @@
 //! Agent preamble: builds the system prompt from the Tera template,
-//! environment context, and user/project memory files (USER.md, AGENTS.md).
+//! environment context, and user/project memory files (USER.md, SYSTEM.md,
+//! AGENTS.md).
 //!
 //! Order is deliberate to maximise prompt-cache prefix re-use:
 //!   1. Static guidelines (never changes)
 //!   2. User + OS info (changes only with system upgrades)
 //!   3. USER.md (persistent user memory; changes rarely)
-//!   4. CWD (changes per session / cd)
-//!   5. AGENTS.md (project context; may be edited mid-session)
+//!   4. SYSTEM.md (per-machine conventions; changes with ssh/disconnect)
+//!   5. CWD (changes per session / cd)
+//!   6. AGENTS.md (project context; changes per cd/ssh/disconnect)
 
 use std::path::Path;
 
 /// Render the agent preamble from the Tera template and env context.
-/// Reads AGENTS.md from `{cwd}/AGENTS.md` on the local filesystem.
+/// Reads SYSTEM.md and AGENTS.md from the local filesystem.
 pub fn build_preamble(cwd: &str, home_dir: &Path) -> String {
     let user_md = read_user_md(home_dir);
+    let system_md = read_system_md(home_dir);
     let agents_md = {
         let agents_path = Path::new(cwd).join("AGENTS.md");
         std::fs::read_to_string(&agents_path).ok()
     };
-    render_preamble(cwd, home_dir, &user_md, agents_md.as_deref())
+    render_preamble(
+        cwd,
+        home_dir,
+        &user_md,
+        system_md.as_deref(),
+        agents_md.as_deref(),
+    )
 }
 
-/// Render the agent preamble with a pre-supplied AGENTS.md content.
+/// Render the agent preamble with pre-supplied SYSTEM.md and AGENTS.md
+/// content.
 ///
-/// `agents_md` is the content of the project's AGENTS.md (if any), obtained
-/// via the active transport.  This variant is used when rebuilding the
-/// preamble after `cd` / `ssh` / `disconnect`, where AGENTS.md may reside
-/// on a remote host.
-pub fn build_preamble_with(cwd: &str, home_dir: &Path, agents_md: Option<&str>) -> String {
+/// Both are obtained via the active transport, so they work across SSH.
+/// Used when rebuilding the preamble after `cd` / `ssh` / `disconnect`.
+pub fn build_preamble_with(
+    cwd: &str,
+    home_dir: &Path,
+    system_md: Option<&str>,
+    agents_md: Option<&str>,
+) -> String {
     let user_md = read_user_md(home_dir);
-    render_preamble(cwd, home_dir, &user_md, agents_md)
+    render_preamble(cwd, home_dir, &user_md, system_md, agents_md)
 }
 
 // ── helpers ────────────────────────────────────────────────────────
 
 fn read_user_md(home_dir: &Path) -> String {
-    let user_md_path = home_dir.join(".config").join("goop").join("USER.md");
-    if !user_md_path.exists() {
-        let parent = user_md_path
-            .parent()
-            .expect("user_md_path always has a parent");
-        let _ = std::fs::create_dir_all(parent);
-        let _ = std::fs::write(&user_md_path, "");
+    let path = home_dir.join(".config").join("goop").join("USER.md");
+    read_or_create_md(&path)
+}
+
+/// Read SYSTEM.md from `~/.config/goop/SYSTEM.md` on the local machine.
+/// Returns `None` if the file doesn't exist (no stub is created — a missing
+/// SYSTEM.md means no per-machine conventions are recorded).
+fn read_system_md(home_dir: &Path) -> Option<String> {
+    let path = home_dir.join(".config").join("goop").join("SYSTEM.md");
+    if !path.exists() {
+        return None;
     }
-    let content = std::fs::read_to_string(&user_md_path).unwrap_or_default();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let trimmed = content.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+fn read_or_create_md(path: &Path) -> String {
+    if !path.exists() {
+        let parent = path.parent().expect("md path always has a parent");
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::write(path, "");
+    }
+    let content = std::fs::read_to_string(path).unwrap_or_default();
     let trimmed = content.trim();
     if trimmed.is_empty() {
         String::from("[empty, no user memories yet.]")
@@ -56,6 +84,7 @@ fn render_preamble(
     cwd: &str,
     home_dir: &Path,
     user_md: &str,
+    system_md: Option<&str>,
     agents_md: Option<&str>,
 ) -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| String::from("unknown"));
@@ -70,6 +99,9 @@ fn render_preamble(
     context.insert("os_distro", &os_release());
     context.insert("cwd", cwd);
     context.insert("user_md", user_md);
+    if let Some(smd) = system_md {
+        context.insert("system_md", smd);
+    }
     if let Some(amd) = agents_md {
         context.insert("agents_md", amd);
     }

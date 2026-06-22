@@ -188,6 +188,27 @@ impl SessionState {
         transport.read_file(&path).await.ok()
     }
 
+    /// Read a file from `~/.config/goop/` on the active host via the
+    /// current transport.  Returns `None` if the file doesn't exist or
+    /// can't be read.
+    ///
+    /// Used to read SYSTEM.md from whichever machine the session is
+    /// operating on (local or remote).
+    pub async fn read_home_config_file(&self, filename: &str) -> Option<String> {
+        let (transport, home) = {
+            let inner = self.inner.lock().await;
+            let t = inner.transport.clone();
+            let h = if matches!(inner.transport, Transport::Local) {
+                self.local_home_dir.clone()
+            } else {
+                inner.transport_home_dir()
+            };
+            (t, h)
+        };
+        let path = home.join(".config").join("goop").join(filename);
+        transport.read_file(&path).await.ok()
+    }
+
     /// Current working directory as a display string (for the preamble template).
     pub async fn cwd_display(&self) -> String {
         let inner = self.inner.lock().await;

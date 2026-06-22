@@ -125,6 +125,11 @@ enum QueuedAction {
 pub struct Session {
     /// Session name (user-supplied or auto-generated like `20260128_001`).
     name: String,
+    /// SYSTEM.md content most recently baked into the live agent's preamble.
+    /// `None` means no SYSTEM.md was found on the active host.  Compared with
+    /// `~/.config/goop/SYSTEM.md` on the active transport after each turn to
+    /// detect when `ssh` / `disconnect` changes the host.
+    last_system_md: std::sync::Mutex<Option<String>>,
     /// AGENTS.md content most recently baked into the live agent's preamble.
     /// `None` means no AGENTS.md was found.  Compared with the current CWD's
     /// AGENTS.md after each turn to detect when `cd` / `ssh` / `disconnect`
@@ -432,14 +437,16 @@ impl Session {
 
         let agent = model::build_agent(&merged_config, &preamble, mem, state.clone(), mcp_tools)?;
 
-        // Snapshot the AGENTS.md content baked into the preamble, so we can
-        // detect when cd/ssh/disconnect changes the relevant project context.
+        // Snapshot SYSTEM.md and AGENTS.md baked into the preamble, so we can
+        // detect when cd/ssh/disconnect changes the relevant host or project.
+        let last_system_md = state.read_home_config_file("SYSTEM.md").await;
         let last_agents_md = state.read_cwd_file("AGENTS.md").await;
 
         let this = Arc::new(Self {
             name: name.clone(),
             state: state.clone(),
             agent: std::sync::Mutex::new(agent),
+            last_system_md: std::sync::Mutex::new(last_system_md),
             last_agents_md: std::sync::Mutex::new(last_agents_md),
             tx,
             history,
@@ -1042,17 +1049,20 @@ impl Session {
         rx
     }
 
-    /// If the current CWD has a different AGENTS.md than what's baked into
-    /// the agent's preamble (because the user `cd`'d, `ssh`'d, or
-    /// `disconnect`ed to a different project), rebuild the preamble and
-    /// agent so the LLM sees the new project context.
+    /// If the active host or CWD has a different SYSTEM.md or AGENTS.md
+    /// than what's baked into the agent's preamble (because the user `cd`'d,
+    /// `ssh`'d, or `disconnect`ed), rebuild the preamble and agent so the
+    /// LLM sees the new host/project context.
     async fn maybe_rebuild_preamble(&self) {
+        let current_system_md = self.state.read_home_config_file("SYSTEM.md").await;
         let current_agents_md = self.state.read_cwd_file("AGENTS.md").await;
 
+        // Fast path: both unchanged.
         {
-            let last = self.last_agents_md.lock().unwrap();
-            if *last == current_agents_md {
-                return; // unchanged — nothing to do
+            let last_sys = self.last_system_md.lock().unwrap();
+            let last_agt = self.last_agents_md.lock().unwrap();
+            if *last_sys == current_system_md && *last_agt == current_agents_md {
+                return;
             }
         }
 
@@ -1061,28 +1071,46 @@ impl Session {
         let new_preamble = crate::preamble::build_preamble_with(
             &cwd,
             &home_dir,
+            current_system_md.as_deref(),
             current_agents_md.as_deref(),
         );
 
         // Check whether the rendered preamble actually changed.
-        // (AGENTS.md might be None→None but CWD changed → rendered
-        // preamble is different.  Or AGENTS.md content changed but the
-        // rest is stable.  Comparing the final string handles both.)
+        // (e.g. SYSTEM.md changed but the rendered output is identical,
+        // or AGENTS.md changed from None→None but CWD changed.  Comparing
+        // the final string handles all cases.)
         let old_preamble = {
             let log = self.history.lock().await;
             log.system_prompt().unwrap_or_default()
         };
         if new_preamble == old_preamble {
-            // CWD changed but preamble is identical (e.g. two dirs with
-            // the same AGENTS.md).  Still update the tracker so we don't
-            // keep re-reading the file on every turn.
+            // Update trackers so we don't keep re-reading on every turn.
+            *self.last_system_md.lock().unwrap() = current_system_md;
             *self.last_agents_md.lock().unwrap() = current_agents_md;
             return;
         }
 
+        let changed_parts: Vec<&str> = {
+            let mut parts = Vec::new();
+            if *self.last_system_md.lock().unwrap() != current_system_md {
+                parts.push(if current_system_md.is_some() {
+                    "SYSTEM.md added/updated"
+                } else {
+                    "SYSTEM.md removed"
+                });
+            }
+            if *self.last_agents_md.lock().unwrap() != current_agents_md {
+                parts.push(if current_agents_md.is_some() {
+                    "AGENTS.md added/updated"
+                } else {
+                    "AGENTS.md removed"
+                });
+            }
+            parts
+        };
         tracing::info!(
-            "preamble changed — AGENTS.md {} → rebuilding agent",
-            if current_agents_md.is_some() { "added/updated" } else { "removed" }
+            "preamble changed — {} → rebuilding agent",
+            changed_parts.join(", ")
         );
 
         // Append the new SystemPrompt to the transaction log for audit.
@@ -1115,7 +1143,8 @@ impl Session {
             }
         };
 
-        // Update the tracker and swap the agent.
+        // Update trackers and swap the agent.
+        *self.last_system_md.lock().unwrap() = current_system_md;
         *self.last_agents_md.lock().unwrap() = current_agents_md;
         *self.agent.lock().unwrap() = new_agent;
     }
@@ -1574,6 +1603,7 @@ impl Session {
 
         let session = Arc::new(Self {
             name: name.to_string(),
+            last_system_md: std::sync::Mutex::new(None),
             last_agents_md: std::sync::Mutex::new(None),
             state: Arc::new(SessionState::new(
                 PathBuf::from("/tmp"),

@@ -404,15 +404,23 @@ The web UI shows a session sidebar for switching between sessions.
   via `build_preamble()` for new sessions, stored as a `SystemPrompt`
   event in the transaction log, and baked into the agent at build time.
   On resume the log's stored value is authoritative — the preamble is NOT
-  rebuilt from scratch, so edits to USER.md only take effect on new sessions.
+  rebuilt from scratch, so edits to USER.md only take effect on new sessions
+  (SYSTEM.md and AGENTS.md are re-read from the active host mid-session).
   **Preamble is rebuilt mid-session** when `cd`, `ssh`, or `disconnect`
-  changes the relevant project context: goop reads AGENTS.md from the new
-  CWD via the active transport (local or SSH), and if the content differs
-  from what's baked into the current preamble, a new `SystemPrompt` event
-  is appended and the agent is rebuilt with the new context.  This makes
-  the log a complete audit trail of what the LLM saw.  The web
-  UI's LLM view (👁) renders the stored preamble in a collapsible panel
-  above the message log.  `SystemPrompt` is metadata — skipped during
+  changes the relevant host or project context: goop reads SYSTEM.md from
+  `~/.config/goop/` and AGENTS.md from the CWD via the active transport
+  (local or SSH), and if either differs from what's baked into the current
+  preamble, a new `SystemPrompt` event is appended and the agent is rebuilt
+  with the new context.  This makes the log a complete audit trail of what
+  the LLM saw.  The three memory files, scoped widest to narrowest:
+  - **USER.md** — `~/.config/goop/USER.md` on the local machine.  Always
+    local (never read from a remote host).
+  - **SYSTEM.md** — `~/.config/goop/SYSTEM.md` on the **active host**
+    (local or remote).  Changes when you `ssh`/`disconnect`.
+  - **AGENTS.md** — `./AGENTS.md` in the session CWD on the **active host**.
+    Changes when you `cd`, `ssh`, or `disconnect`.
+  The web UI's LLM view (👁) renders the stored preamble in a collapsible
+  panel above the message log.  `SystemPrompt` is metadata — skipped during
   agent-memory replay (it's already in the agent's preamble, not the
   conversation messages).
 
