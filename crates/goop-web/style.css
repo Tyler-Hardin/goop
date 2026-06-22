@@ -1,12 +1,8 @@
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-}
+/* goop style.css
+   ── design tokens + component styles ─────────────────────────── */
 
 :root {
+  /* colors */
   --bg: #0c0e12;
   --surface: #16191e;
   --surface2: #1c2027;
@@ -24,13 +20,31 @@
   --red-dim: #a03a3a;
   --cyan: #4dd4c0;
   --purple: #b99aff;
+
+  /* spacing / radii */
   --radius: 12px;
   --radius-sm: 8px;
-  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
-  --mono:
-    "Cascadia Code", "JetBrains Mono", ui-monospace, "SF Mono", "Fira Code",
-    monospace;
   --sidebar-w: 250px;
+
+  /* fonts */
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Cascadia Code", "JetBrains Mono", ui-monospace, "SF Mono",
+    "Fira Code", monospace;
+
+  /* transitions */
+  --t-fast: 0.15s;
+  --t-med: 0.2s;
+  --t-slow: 0.3s;
+}
+
+/* ── reset ──────────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
 }
 
 html,
@@ -43,11 +57,8 @@ body {
   font-size: 15px;
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
-  /* overscroll-behavior-x: none prevents Chrome's swipe-to-back. */
   overscroll-behavior-x: none;
 }
-
-/* ── layout ────────────────────────────────────── */
 
 body {
   display: grid;
@@ -56,7 +67,21 @@ body {
   height: 100dvh;
 }
 
-/* ── sidebar ──────────────────────────────────── */
+/* ── utility ─────────────────────────────────────────────── */
+
+.hidden { display: none !important; }
+
+/* ── layout ──────────────────────────────────────────────── */
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── sidebar ─────────────────────────────────────────────── */
 
 nav {
   background: var(--surface);
@@ -67,18 +92,19 @@ nav {
 }
 
 nav .sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
   padding: 13px 16px;
   border-bottom: 1px solid var(--border);
   font-weight: 650;
   font-size: 15px;
   letter-spacing: -0.2px;
   color: var(--fg2);
-  display: flex;
-  align-items: center;
-  gap: 9px;
   flex-shrink: 0;
   min-height: 49px;
 }
+
 nav .sidebar-header .logo-icon {
   width: 18px;
   height: 18px;
@@ -100,28 +126,30 @@ nav .session-item {
   cursor: pointer;
   font-size: 13.5px;
   color: var(--dim);
-  transition:
-    background 0.15s,
-    color 0.15s;
   border-left: 3px solid transparent;
   user-select: none;
+  transition: background var(--t-fast), color var(--t-fast);
 }
+
 nav .session-item:hover {
   background: var(--surface2);
   color: var(--fg);
 }
+
 nav .session-item.active {
   background: rgba(109, 179, 242, 0.06);
   color: var(--fg2);
   border-left-color: var(--blue);
   font-weight: 500;
 }
+
 nav .session-item .name {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
 nav .session-item .del-btn {
   visibility: hidden;
   background: none;
@@ -132,13 +160,13 @@ nav .session-item .del-btn {
   line-height: 1;
   padding: 2px 5px;
   border-radius: 4px;
-  transition:
-    color 0.15s,
-    background 0.15s;
+  transition: color var(--t-fast), background var(--t-fast);
 }
+
 nav .session-item:hover .del-btn {
   visibility: visible;
 }
+
 nav .session-item .del-btn:hover {
   color: var(--red);
   background: rgba(242, 98, 90, 0.1);
@@ -152,6 +180,7 @@ nav .sidebar-footer {
   display: flex;
   align-items: center;
 }
+
 nav .new-btn {
   width: 100%;
   background: rgba(109, 179, 242, 0.06);
@@ -159,70 +188,61 @@ nav .new-btn {
   border-radius: var(--radius-sm);
   color: var(--fg);
   cursor: pointer;
+  font-family: var(--font);
   font-size: 14px;
   font-weight: 650;
   padding: 11px;
-  transition:
-    border-color 0.2s,
-    color 0.2s,
-    background 0.2s;
-  font-family: var(--font);
+  transition: border-color var(--t-med), color var(--t-med), background var(--t-med);
 }
+
 nav .new-btn:hover {
   border-color: var(--blue);
   color: var(--blue);
   background: rgba(109, 179, 242, 0.1);
 }
 
-/* ── main area ────────────────────────────────── */
-
-.main {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-}
-
-/* ── header ───────────────────────────────────── */
+/* ── header ────────────────────────────────────────────────── */
 
 header {
-  padding: 13px 20px;
-  border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   gap: 10px;
+  padding: 13px 20px;
+  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   background: var(--surface);
   min-height: 49px;
 }
+
 header .dot {
   width: 9px;
   height: 9px;
   border-radius: 50%;
   background: var(--dim2);
   box-shadow: 0 0 6px rgba(125, 135, 148, 0.3);
-  transition:
-    background 0.3s,
-    box-shadow 0.3s;
+  transition: background var(--t-slow), box-shadow var(--t-slow);
 }
+
 header .dot.live {
   background: var(--green);
   box-shadow: 0 0 10px rgba(107, 224, 124, 0.5);
 }
+
 header .title {
   font-weight: 650;
   font-size: 15px;
   letter-spacing: -0.2px;
   color: var(--fg2);
 }
+
 header .status {
   font-size: 12px;
   color: var(--dim);
   margin-left: auto;
-  transition: color 0.3s;
+  transition: color var(--t-slow);
   font-feature-settings: "ss02";
 }
+
 header .menu-btn {
   display: none;
   background: none;
@@ -233,6 +253,7 @@ header .menu-btn {
   line-height: 1;
   padding: 4px 6px;
 }
+
 header .reload-btn {
   background: none;
   border: none;
@@ -242,18 +263,41 @@ header .reload-btn {
   line-height: 1;
   padding: 2px 6px;
   border-radius: 4px;
-  transition: color 0.2s;
+  transition: color var(--t-fast);
 }
-header .reload-btn:hover {
+
+header .reload-btn:hover { color: var(--blue); }
+
+/* ── header icon buttons (select, LLM view, settings) ─────── */
+
+header .select-btn,
+header .llm-view-btn,
+header .settings-btn {
+  background: none;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 4px;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+
+header .select-btn:hover,
+header .llm-view-btn:hover,
+header .settings-btn:hover {
+  background: var(--surface2);
+  color: var(--fg);
+}
+
+header .select-btn.active,
+header .llm-view-btn.active {
   color: var(--blue);
+  background: rgba(100, 149, 237, 0.12);
 }
 
-/* ── message list ─────────────────────────────── */
-
-/* Do NOT set scroll-behavior: smooth here.  Auto-scroll during
-         LLM streaming sets scrollTop on every animation frame; smooth
-         scrolling can never catch up because the target keeps moving.
-         scrollDown() uses scrollTo({ behavior: "auto" }) explicitly. */
+/* ── message list ───────────────────────────────────────────── */
 
 main {
   flex: 1;
@@ -262,11 +306,8 @@ main {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  /* overscroll-behavior-y: none stops Chrome's native pull-to-refresh
-           and iOS rubber-banding, so our JS handler owns the gesture. */
   overscroll-behavior-y: none;
-  background:
-    radial-gradient(
+  background: radial-gradient(
       ellipse at 50% 0%,
       rgba(109, 179, 242, 0.02) 0%,
       transparent 60%
@@ -274,58 +315,54 @@ main {
     var(--bg);
 }
 
+/* ── messages: shared ───────────────────────────────────────── */
+
 .msg {
-  max-width: 78%;
+  position: relative;
   padding: 11px 16px;
   border-radius: var(--radius);
   font-size: 14.5px;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
-  animation: fadeIn 0.2s ease;
-  position: relative;
+  animation: fadeIn var(--t-med) ease;
 }
+
 @keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 .msg.user {
   background: var(--blue-dim);
   color: #fff;
+  max-width: 78%;
+  align-self: flex-end;
   border-bottom-right-radius: 4px;
   font-weight: 450;
 }
 
 .msg.assistant {
   background: var(--surface2);
+  max-width: 78%;
+  align-self: flex-start;
   border-bottom-left-radius: 4px;
   border: 1px solid var(--border);
 }
 
-/* Streaming text bubble — no animation, DOM node is persistent.
-   contain: content prevents reflow of the entire message log when
-   the streaming text grows. */
 .msg.streaming {
   animation: none;
   display: none;
   contain: content;
 }
-.msg.streaming.visible {
-  display: block;
-}
+.msg.streaming.visible { display: block; }
 
 .msg.thinking {
   align-self: flex-start;
   font-style: italic;
   color: var(--dim);
 }
+
 .msg.thinking::before {
   content: "";
   display: inline-block;
@@ -337,91 +374,10 @@ main {
   vertical-align: middle;
   animation: pulse 1s ease-in-out infinite;
 }
+
 @keyframes pulse {
-  0%,
-  100% {
-    opacity: 0.3;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-.msg.tool {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--cyan);
-  font-family: var(--mono);
-  font-size: 13px;
-  cursor: pointer;
-  user-select: none;
-  transition: border-color 0.2s;
-}
-.msg.tool:hover {
-  border-color: var(--cyan);
-}
-.msg.tool .tool-header {
-  padding: 9px 14px;
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-}
-.msg.tool .tool-header .arrow {
-  color: var(--cyan);
-  font-size: 13px;
-  line-height: 1.4;
-  transition: transform 0.2s;
-  flex-shrink: 0;
-}
-.msg.tool.open .tool-header .arrow {
-  transform: rotate(90deg);
-}
-.msg.tool .tool-header .info {
-  flex: 1;
-  min-width: 0;
-}
-.msg.tool .name {
-  color: var(--cyan);
-  font-weight: 650;
-  font-size: 13.5px;
-  margin-bottom: 2px;
-}
-.msg.tool .arg {
-  color: var(--dim);
-  margin: 2px 0;
-}
-.msg.tool .arg b {
-  color: var(--fg);
-  font-weight: 550;
-}
-.msg.tool .tool-body {
-  display: none;
-  border-top: 1px solid var(--border);
-  padding: 9px 14px;
-  color: var(--dim);
-  font-size: 12.5px;
-  font-family: var(--mono);
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 220px;
-  overflow-y: auto;
-}
-.msg.tool.open .tool-body {
-  display: block;
-}
-
-.msg.result {
-  align-self: flex-start;
-  color: var(--dim);
-  font-size: 12.5px;
-  font-family: var(--mono);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  padding: 9px 14px;
-  max-height: 180px;
-  overflow-y: auto;
-  max-width: 90%;
-  border-radius: var(--radius-sm);
+  0%, 100% { opacity: 0.3; }
+  50%      { opacity: 1; }
 }
 
 .msg.error {
@@ -441,7 +397,89 @@ main {
   letter-spacing: 0.4px;
 }
 
-/* ── compaction & tool-summary groups (collapsible tree nodes) ─── */
+/* ── messages: tool call ───────────────────────────────────────────────── */
+
+.msg.tool {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--cyan);
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color var(--t-fast);
+}
+
+.msg.tool:hover { border-color: var(--cyan); }
+
+.msg.tool .tool-header {
+  padding: 9px 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.msg.tool .tool-header .arrow {
+  color: var(--cyan);
+  font-size: 13px;
+  line-height: 1.4;
+  flex-shrink: 0;
+  transition: transform var(--t-med);
+}
+
+.msg.tool.open .tool-header .arrow { transform: rotate(90deg); }
+
+.msg.tool .tool-header .info { flex: 1; min-width: 0; }
+
+.msg.tool .name {
+  color: var(--cyan);
+  font-weight: 650;
+  font-size: 13.5px;
+  margin-bottom: 2px;
+}
+
+.msg.tool .arg {
+  color: var(--dim);
+  margin: 2px 0;
+}
+
+.msg.tool .arg b {
+  color: var(--fg);
+  font-weight: 550;
+}
+
+.msg.tool .tool-body {
+  display: none;
+  border-top: 1px solid var(--border);
+  padding: 9px 14px;
+  color: var(--dim);
+  font-size: 12.5px;
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.msg.tool.open .tool-body { display: block; }
+
+/* ── messages: tool result ────────────────────────────────────────────── */
+
+.msg.result {
+  align-self: flex-start;
+  color: var(--dim);
+  font-size: 12.5px;
+  font-family: var(--mono);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 9px 14px;
+  max-height: 180px;
+  overflow-y: auto;
+  max-width: 90%;
+  border-radius: var(--radius-sm);
+}
+
+/* ── messages: compaction & tool-summary groups ────────────────────────── */
 
 .msg.group {
   align-self: stretch;
@@ -453,9 +491,8 @@ main {
   font-family: var(--font);
   overflow: hidden;
 }
-.msg.group.tool-summary {
-  border-left-color: var(--cyan);
-}
+
+.msg.group.tool-summary { border-left-color: var(--cyan); }
 
 .msg.group .group-header {
   display: flex;
@@ -464,26 +501,23 @@ main {
   padding: 9px 14px;
   cursor: pointer;
   user-select: none;
-  transition: background 0.15s;
+  transition: background var(--t-fast);
 }
-.msg.group .group-header:hover {
-  background: var(--surface2);
-}
+
+.msg.group .group-header:hover { background: var(--surface2); }
+
 .msg.group .group-header .arrow {
   color: var(--dim);
   font-size: 12px;
   line-height: 1.5;
-  transition: transform 0.2s;
   flex-shrink: 0;
-}
-.msg.group.open .group-header .arrow {
-  transform: rotate(90deg);
+  transition: transform var(--t-med);
 }
 
-.msg.group .group-summary {
-  flex: 1;
-  min-width: 0;
-}
+.msg.group.open .group-header .arrow { transform: rotate(90deg); }
+
+.msg.group .group-summary { flex: 1; min-width: 0; }
+
 .msg.group .group-meta {
   color: var(--dim2);
   font-size: 11px;
@@ -491,19 +525,15 @@ main {
   letter-spacing: 0.2px;
   margin-bottom: 4px;
 }
+
 .msg.group .group-summary .rendered-inner {
   font-size: 13.5px;
   color: var(--fg);
   line-height: 1.5;
 }
-.msg.group .group-summary .rendered-inner p {
-  margin: 0;
-}
-.msg.group .group-summary .rendered-inner p:first-child {
-  margin-top: 0;
-}
 
-/* Children hidden by default; revealed on expand. */
+.msg.group .group-summary .rendered-inner p { margin: 0; }
+
 .msg.group .group-children {
   display: none;
   padding: 4px 10px 10px 22px;
@@ -514,11 +544,10 @@ main {
   overflow-y: auto;
   max-height: 50vh;
 }
-.msg.group.open .group-children {
-  display: flex;
-}
 
-/* ── edit / delete overlays ─────────────────────── */
+.msg.group.open .group-children { display: flex; }
+
+/* ── messages: edit / delete overlays ──────────────────────────────────── */
 
 .msg.deleted {
   opacity: 0.4;
@@ -539,11 +568,10 @@ main {
   cursor: pointer;
   user-select: none;
   vertical-align: middle;
-  transition: background 0.15s;
+  transition: background var(--t-fast);
 }
-.edit-badge:hover {
-  background: rgba(226, 185, 111, 0.2);
-}
+
+.edit-badge:hover { background: rgba(226, 185, 111, 0.2); }
 
 .msg.tool .name.edited-replacement {
   white-space: pre-wrap;
@@ -551,81 +579,41 @@ main {
   font-size: 12.5px;
 }
 
-/* ── message action buttons (edit / delete) ──────────────────── */
+/* ── messages: action buttons (edit / delete) ──────────────────────────── */
 
-/* Utility: elements with class `hidden` are removed from the layout.
-   Used to toggle between display and inline-edit views without
-   conditional rendering (which would move FnOnce closures into Fn). */
-.hidden {
-  display: none !important;
-}
-
-/* ── message wrapper (bubble + actions row) ──────────────────── */
-/*
-   The three action-bearing variants (UserPrompt, AssistantFinal,
-   ToolCall) are wrapped so the action row can sit *outside* the chat
-   bubble — against the page background for better contrast, rather
-   than inside the bubble's tinted surface.  The wrapper inherits the
-   flex alignment and max-width the bubble used to own; the bubble
-   fills the wrapper (max-width: none).
-*/
 .msg-wrap {
   display: flex;
   flex-direction: column;
   gap: 3px;
 }
-.msg-wrap > .msg {
-  max-width: none;
-}
-.msg-wrap.user {
-  align-self: flex-end;
-  max-width: 78%;
-}
-.msg-wrap.assistant {
-  align-self: flex-start;
-  max-width: 78%;
-}
-.msg-wrap.tool {
-  align-self: flex-start;
-  max-width: 85%;
-}
 
-/* ── message action buttons (edit / delete) ──────────────────── */
-/*
-   Actions sit in a row *below* the bubble, outside it (against the
-   page background for contrast).  The row is always in the DOM but
-   `opacity: 0`; `:hover` on the `.msg-wrap` reveals it.  On touch
-   devices a tap on the message triggers `:hover` (browsers fire
-   `mouseover` on touch), so the pattern doubles as tap-to-reveal —
-   no JS needed.  The `.confirming` class forces the row visible so
-   the inline delete-confirm prompt is always shown.
-*/
+.msg-wrap > .msg { max-width: none; }
+
+.msg-wrap.user   { align-self: flex-end;   max-width: 78%; }
+.msg-wrap.assistant { align-self: flex-start; max-width: 78%; }
+.msg-wrap.tool   { align-self: flex-start; max-width: 85%; }
+
 .msg-actions {
   display: flex;
   opacity: 0;
-  transition: opacity 0.15s;
+  transition: opacity var(--t-fast);
 }
+
 .msg-wrap:hover .msg-actions,
-.msg-wrap.confirming .msg-actions {
-  opacity: 1;
-}
-/* User messages are right-aligned bubbles — actions align right. */
-.msg-wrap.user .msg-actions {
-  justify-content: flex-end;
-}
+.msg-wrap.confirming .msg-actions { opacity: 1; }
+
+.msg-wrap.user .msg-actions  { justify-content: flex-end; }
 .msg-wrap.assistant .msg-actions,
-.msg-wrap.tool .msg-actions {
-  justify-content: flex-start;
-}
+.msg-wrap.tool .msg-actions  { justify-content: flex-start; }
 
 .actions-row {
   display: flex;
   align-items: center;
   gap: 2px;
 }
-.actions-row.confirm {
-  gap: 4px;
-}
+
+.actions-row.confirm { gap: 4px; }
+
 .confirm-text {
   font-size: 11px;
   color: var(--red);
@@ -642,269 +630,28 @@ main {
   line-height: 1;
   padding: 3px 5px;
   border-radius: 4px;
-  transition:
-    background 0.15s,
-    color 0.15s;
+  transition: background var(--t-fast), color var(--t-fast);
 }
-.msg-action:hover {
-  background: var(--surface2);
-  color: var(--fg);
-}
+
+.msg-action:hover { background: var(--surface2); color: var(--fg); }
+
 .msg-action.delete:hover,
-.msg-action.confirm {
-  color: var(--red);
-}
-.msg-action.confirm:hover {
-  background: rgba(242, 98, 90, 0.12);
-}
-.msg-action.cancel:hover {
-  color: var(--fg);
-}
+.msg-action.confirm { color: var(--red); }
 
-/* ── select mode (manual range compaction) ───────────────────── */
+.msg-action.confirm:hover { background: rgba(242, 98, 90, 0.12); }
 
-/*
-   In select mode, clicking a message sets the start/end of a contiguous
-   range.  An invisible overlay div sits on top of each message to capture
-   clicks; selected messages get a blue border highlight.
+.msg-action.cancel:hover { color: var(--fg); }
 
-   `.msg-select-wrap` is a flex column so `.msg-wrap`'s `align-self`
-   (flex-end for user, flex-start for assistant) still works — the wrapper
-   replaced `.msg-wrap` as the direct child of `main`'s flex column.
-*/
-.msg-select-wrap {
-  display: flex;
-  flex-direction: column;
-  position: relative;
-}
+/* ── messages: inline edit mode ────────────────────────────────────────── */
 
-/* Invisible click overlay — only active in select mode.  Sits above the
-   message content to intercept clicks for range selection. */
-.msg-select-overlay {
-  display: none;
-  position: absolute;
-  inset: 0;
-  cursor: pointer;
-  z-index: 10;
-}
-.msg-select-overlay.hidden {
-  display: none;
-}
-main.select-mode .msg-select-overlay {
-  display: block;
-}
+.msg.editing { padding: 8px; }
 
-/* Selected messages get a blue border highlight. */
-.msg-select-wrap.selected .msg-wrap > .msg {
-  border-color: var(--blue);
-  box-shadow: 0 0 0 1px var(--blue);
-}
-
-/* ── header select button ─────────────────────────── */
-
-.select-btn {
-  background: none;
-  border: none;
-  color: var(--dim2);
-  cursor: pointer;
-  font-size: 15px;
-  line-height: 1;
-  padding: 4px 6px;
-  border-radius: 4px;
-  transition:
-    background 0.15s,
-    color 0.15s;
-}
-.select-btn:hover {
-  background: var(--surface2);
-  color: var(--fg);
-}
-.select-btn.active {
-  color: var(--blue);
-  background: rgba(100, 149, 237, 0.12);
-}
-
-/* ── LLM view button ─────────────────────────────── */
-
-.llm-view-btn {
-  background: none;
-  border: none;
-  color: var(--dim2);
-  cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-  padding: 4px 6px;
-  border-radius: 4px;
-  transition:
-    background 0.15s,
-    color 0.15s;
-}
-.llm-view-btn:hover {
-  background: var(--surface2);
-  color: var(--fg);
-}
-.llm-view-btn.active {
-  color: var(--blue);
-  background: rgba(100, 149, 237, 0.12);
-}
-
-.settings-btn {
-  background: none;
-  border: none;
-  color: var(--dim2);
-  cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-  padding: 4px 6px;
-  border-radius: 4px;
-  transition:
-    background 0.15s,
-    color 0.15s;
-}
-.settings-btn:hover {
-  background: var(--surface2);
-  color: var(--fg);
-}
-
-/* ── LLM view summary messages ───────────────────── */
-
-/*
-   In LLM view, compaction summaries and tool summaries render as plain
-   messages — exactly what the agent sees.  A small label distinguishes
-   them from regular user/assistant messages.  Full-width and solid-
-   bordered so the layout stays consistent with chat view; LLM view
-   changes content, not spacing.
-*/
-.msg.llm-summary {
-  align-self: stretch;
-  max-width: 100%;
-  padding: 10px 14px;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--purple);
-  border-radius: 8px;
-  background: var(--surface);
-}
-.llm-summary-label {
-  font-size: 11px;
-  color: var(--dim2);
-  font-family: var(--mono);
-  margin-bottom: 4px;
-}
-
-/* ── system prompt (LLM view only) ─────────────────── */
-
-/*
-   Shown above the message log in LLM view.  Collapsed by default — the
-   preamble can be very long (it includes AGENTS.md).  Click the header to
-   expand/collapse the rendered markdown.
-*/
-.msg.system-prompt {
-  align-self: stretch;
-  flex-shrink: 0;
-  margin-bottom: 8px;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--red);
-  border-radius: 8px;
-  background: var(--surface);
-  overflow: hidden;
-}
-.system-prompt-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  cursor: pointer;
-  user-select: none;
-}
-.system-prompt-header .arrow {
-  display: inline-block;
-  transition: transform 0.15s ease;
-  color: var(--dim2);
-  font-size: 11px;
-}
-.system-prompt-header .arrow.open {
-  transform: rotate(90deg);
-}
-.system-prompt-label {
-  font-size: 11px;
-  color: var(--dim2);
-  font-family: var(--mono);
-}
-.system-prompt-body {
-  padding: 0 14px 12px;
-  border-top: 1px solid var(--border);
-  max-height: 60vh;
-  overflow: hidden auto;
-}
-.system-prompt-body .rendered-inner {
-  font-size: 13px;
-  color: var(--dim);
-}
-
-/* ── select bar (replaces input bar in select mode) ──────────── */
-
-.select-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 16px;
-  gap: 12px;
-  background: var(--surface);
-  border-top: 1px solid var(--border);
-}
-.select-count {
-  font-size: 13px;
-  color: var(--dim);
-  font-family: var(--mono);
-}
-.select-actions {
-  display: flex;
-  gap: 8px;
-}
-.select-compact-btn {
-  background: var(--blue);
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  padding: 7px 14px;
-  font-size: 13px;
-  cursor: pointer;
-  transition: opacity 0.15s;
-}
-.select-compact-btn:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-.select-compact-btn:not(:disabled):hover {
-  opacity: 0.88;
-}
-.select-cancel-btn {
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--dim);
-  border-radius: 6px;
-  padding: 7px 14px;
-  font-size: 13px;
-  cursor: pointer;
-  transition:
-    color 0.15s,
-    border-color 0.15s;
-}
-.select-cancel-btn:hover {
-  color: var(--fg);
-  border-color: var(--dim2);
-}
-
-/* ── inline edit mode ────────────────────────────── */
-
-.msg.editing {
-  padding: 8px;
-}
 .msg-edit {
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
+
 .msg-edit-area {
   width: 100%;
   min-height: 38px;
@@ -919,16 +666,17 @@ main.select-mode .msg-select-overlay {
   padding: 8px 10px;
   resize: none;
   outline: none;
-  transition: border-color 0.15s;
+  transition: border-color var(--t-fast);
 }
-.msg-edit-area:focus {
-  border-color: var(--cyan);
-}
+
+.msg-edit-area:focus { border-color: var(--cyan); }
+
 .msg-edit-actions {
   display: flex;
   gap: 6px;
   margin-top: 6px;
 }
+
 .msg-edit-btn {
   padding: 3px 14px;
   border-radius: var(--radius-sm);
@@ -937,27 +685,22 @@ main.select-mode .msg-select-overlay {
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--fg);
-  transition:
-    background 0.15s,
-    opacity 0.15s;
+  transition: background var(--t-fast), opacity var(--t-fast);
 }
+
 .msg-edit-btn.save {
   background: var(--blue-dim);
   color: #fff;
   border-color: transparent;
 }
-.msg-edit-btn.save:hover {
-  opacity: 0.85;
-}
-.msg-edit-btn.cancel:hover {
-  background: var(--surface2);
-}
 
-/* ── rendered markdown ────────────────────────── */
+.msg-edit-btn.save:hover { opacity: 0.85; }
 
-.msg.assistant.rendered {
-  white-space: normal;
-}
+.msg-edit-btn.cancel:hover { background: var(--surface2); }
+
+/* ── rendered markdown ─────────────────────────────────────────────────── */
+
+.msg.assistant.rendered { white-space: normal; }
 
 .msg.assistant.rendered h1,
 .msg.assistant.rendered h2,
@@ -968,40 +711,33 @@ main.select-mode .msg-select-overlay {
   line-height: 1.3;
   color: var(--fg2);
 }
-.msg.assistant.rendered h1 {
-  font-size: 1.35em;
-}
+
+.msg.assistant.rendered h1 { font-size: 1.35em; }
+
 .msg.assistant.rendered h2 {
   font-size: 1.18em;
   padding-bottom: 0.2em;
   border-bottom: 1px solid var(--border);
 }
-.msg.assistant.rendered h3 {
-  font-size: 1.06em;
-}
+
+.msg.assistant.rendered h3 { font-size: 1.06em; }
+
 .msg.assistant.rendered h4 {
   font-size: 0.95em;
   color: var(--dim);
 }
 
-.msg.assistant.rendered p {
-  margin: 0.45em 0;
-}
-.msg.assistant.rendered p:first-child {
-  margin-top: 0;
-}
-.msg.assistant.rendered p:last-child {
-  margin-bottom: 0;
-}
+.msg.assistant.rendered p { margin: 0.45em 0; }
+.msg.assistant.rendered p:first-child { margin-top: 0; }
+.msg.assistant.rendered p:last-child  { margin-bottom: 0; }
 
 .msg.assistant.rendered ul,
 .msg.assistant.rendered ol {
   margin: 0.35em 0;
   padding-left: 1.6em;
 }
-.msg.assistant.rendered li {
-  margin: 0.18em 0;
-}
+
+.msg.assistant.rendered li { margin: 0.18em 0; }
 
 .msg.assistant.rendered blockquote {
   margin: 0.45em 0;
@@ -1011,13 +747,10 @@ main.select-mode .msg-select-overlay {
   background: rgba(77, 212, 192, 0.04);
   border-radius: 0 6px 6px 0;
 }
-.msg.assistant.rendered a {
-  color: var(--blue);
-  text-decoration: none;
-}
-.msg.assistant.rendered a:hover {
-  text-decoration: underline;
-}
+
+.msg.assistant.rendered a { color: var(--blue); text-decoration: none; }
+.msg.assistant.rendered a:hover { text-decoration: underline; }
+
 .msg.assistant.rendered hr {
   margin: 0.7em 0;
   border: none;
@@ -1032,20 +765,21 @@ main.select-mode .msg-select-overlay {
   border-radius: 6px;
   overflow: hidden;
 }
+
 .msg.assistant.rendered th,
 .msg.assistant.rendered td {
   padding: 6px 12px;
   border: 1px solid var(--border);
   text-align: left;
 }
+
 .msg.assistant.rendered th {
   background: var(--surface);
   font-weight: 650;
   color: var(--fg2);
 }
-.msg.assistant.rendered td {
-  background: var(--surface2);
-}
+
+.msg.assistant.rendered td { background: var(--surface2); }
 
 .msg.assistant.rendered :not(pre) > code {
   background: rgba(109, 179, 242, 0.1);
@@ -1065,6 +799,7 @@ main.select-mode .msg-select-overlay {
   overflow-x: auto;
   white-space: pre;
 }
+
 .msg.assistant.rendered pre code {
   background: none;
   padding: 0;
@@ -1074,20 +809,87 @@ main.select-mode .msg-select-overlay {
   color: var(--fg);
 }
 
-/* ── input bar ────────────────────────────────── */
+/* ── LLM view ──────────────────────────────────────────────────────────── */
+
+.msg.llm-summary {
+  align-self: stretch;
+  max-width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--purple);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.llm-summary-label {
+  font-size: 11px;
+  color: var(--dim2);
+  font-family: var(--mono);
+  margin-bottom: 4px;
+}
+
+/* ── system prompt (LLM view) ──────────────────────────────────────────── */
+
+.msg.system-prompt {
+  align-self: stretch;
+  flex-shrink: 0;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--red);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.system-prompt-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.system-prompt-header .arrow {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  color: var(--dim2);
+  font-size: 11px;
+}
+
+.system-prompt-header .arrow.open { transform: rotate(90deg); }
+
+.system-prompt-label {
+  font-size: 11px;
+  color: var(--dim2);
+  font-family: var(--mono);
+}
+
+.system-prompt-body {
+  padding: 0 14px 12px;
+  border-top: 1px solid var(--border);
+  max-height: 60vh;
+  overflow: hidden auto;
+}
+
+.system-prompt-body .rendered-inner {
+  font-size: 13px;
+  color: var(--dim);
+}
+
+/* ── input bar ─────────────────────────────────────────────────────────── */
 
 footer {
   position: relative;
   padding: 12px 20px;
   border-top: 1px solid var(--border);
-  flex-shrink: 0;
   display: flex;
   gap: 10px;
   background: var(--surface);
+  flex-shrink: 0;
   min-height: 71px;
 }
 
-/* ── context-usage progress bar ───────────────── */
 .context-bar {
   position: absolute;
   top: 0;
@@ -1097,19 +899,18 @@ footer {
   background: transparent;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 0.3s;
+  transition: opacity var(--t-slow);
   z-index: 10;
 }
-.context-bar.visible {
-  opacity: 1;
-}
+
+.context-bar.visible { opacity: 1; }
+
 .context-bar-fill {
   height: 100%;
-  transition:
-    width 0.4s ease,
-    background-color 0.4s ease;
   border-radius: 0 2px 2px 0;
+  transition: width 0.4s ease, background-color 0.4s ease;
 }
+
 footer textarea {
   flex: 1;
   background: var(--bg);
@@ -1117,24 +918,22 @@ footer textarea {
   border-radius: var(--radius-sm);
   padding: 11px 16px;
   color: var(--fg);
-  font-size: 15px;
-  outline: none;
   font-family: var(--font);
-  transition:
-    border-color 0.2s,
-    box-shadow 0.2s;
+  font-size: 15px;
+  line-height: 1.55;
   resize: none;
+  outline: none;
   min-height: 46px;
   max-height: 200px;
-  line-height: 1.55;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
 }
+
 footer textarea:focus {
   border-color: var(--blue);
   box-shadow: 0 0 0 3px rgba(109, 179, 242, 0.12);
 }
-footer textarea::placeholder {
-  color: var(--dim2);
-}
+
+footer textarea::placeholder { color: var(--dim2); }
 
 footer button {
   background: var(--surface2);
@@ -1145,136 +944,90 @@ footer button {
   width: 46px;
   height: 46px;
   cursor: pointer;
-  transition:
-    background 0.2s,
-    color 0.2s,
-    border-color 0.2s,
-    opacity 0.2s,
-    box-shadow 0.2s;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-}
-footer button svg {
-  width: 20px;
-  height: 20px;
-  display: none;
-}
-/* Show the right icon based on state. */
-footer button .icon-mic {
-  display: block;
-}
-/* When input has text, hide mic, show send. */
-footer button.has-text .icon-mic {
-  display: none;
-}
-footer button.has-text .icon-send {
-  display: block;
-}
-footer button .icon-rec {
-  display: none;
-}
-footer button .icon-cancel {
-  display: none;
-}
-footer button.recording .icon-mic {
-  display: none;
-}
-footer button.recording .icon-send {
-  display: none;
-}
-footer button.recording .icon-rec {
-  display: block;
-}
-footer button.cancel .icon-mic {
-  display: none;
-}
-footer button.cancel .icon-send {
-  display: none;
-}
-footer button.cancel .icon-rec {
-  display: none;
-}
-footer button.cancel .icon-cancel {
-  display: block;
+  transition:
+    background var(--t-med),
+    color var(--t-med),
+    border-color var(--t-med),
+    opacity var(--t-med),
+    box-shadow var(--t-med);
 }
 
-footer button:hover {
-  border-color: var(--blue);
-  color: var(--blue);
-  background: var(--surface2);
-}
-footer button:active {
-  opacity: 0.85;
-  transform: scale(0.96);
-}
+footer button:hover  { border-color: var(--blue); color: var(--blue); background: var(--surface2); }
+footer button:active { opacity: 0.85; transform: scale(0.96); }
+
 footer button:disabled {
   opacity: 0.35;
   cursor: default;
   pointer-events: none;
 }
-footer button:disabled:hover {
-  border-color: var(--border);
-  color: var(--dim);
-}
+
+footer button:disabled:hover { border-color: var(--border); color: var(--dim); }
+
 footer button.cancel {
   background: var(--red);
   color: #fff;
   border-color: var(--red);
 }
+
 footer button.cancel:hover {
   background: #f87870;
   border-color: #f87870;
   color: #fff;
 }
+
 footer button.recording {
   background: var(--red);
   color: #fff;
   border-color: var(--red);
   animation: micPulse 1.2s ease-in-out infinite;
 }
+
 footer button.recording:hover {
   background: #f87870;
   border-color: #f87870;
   color: #fff;
 }
-/* Slide-up-to-cancel: solid red + X icon, no pulse. */
+
 footer button.cancel-slide {
   background: var(--red);
   color: #fff;
   border-color: var(--red);
   animation: none;
 }
-footer button.cancel-slide .icon-mic {
-  display: none;
-}
-footer button.cancel-slide .icon-send {
-  display: none;
-}
-footer button.cancel-slide .icon-rec {
-  display: none;
-}
-footer button.cancel-slide .icon-cancel {
-  display: block;
-}
+
 @keyframes micPulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(242, 98, 90, 0.4);
-  }
-  50% {
-    box-shadow: 0 0 0 8px rgba(242, 98, 90, 0);
-  }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(242, 98, 90, 0.4); }
+  50%      { box-shadow: 0 0 0 8px rgba(242, 98, 90, 0); }
 }
 
-/* ── mobile floating new-session button ────────── */
+/* ── input button: icon toggling ───────────────────────────────────────── */
 
-#newSessionFab {
-  display: none;
-}
+footer button svg { width: 20px; height: 20px; display: none; }
 
-/* ── empty state ──────────────────────────────── */
+footer button .icon-mic               { display: block; }
+footer button.has-text .icon-mic      { display: none; }
+footer button.has-text .icon-send     { display: block; }
+footer button.recording .icon-mic,
+footer button.recording .icon-send    { display: none; }
+footer button.recording .icon-rec     { display: block; }
+footer button.cancel .icon-mic,
+footer button.cancel .icon-send,
+footer button.cancel .icon-rec        { display: none; }
+footer button.cancel .icon-cancel     { display: block; }
+footer button.cancel-slide .icon-mic,
+footer button.cancel-slide .icon-send,
+footer button.cancel-slide .icon-rec  { display: none; }
+footer button.cancel-slide .icon-cancel { display: block; }
+
+/* ── mobile floating new-session button ────────────────────────────────── */
+
+#newSessionFab { display: none; }
+
+/* ── empty state ───────────────────────────────────────────────────────── */
 
 .empty-state {
   flex: 1;
@@ -1285,253 +1038,85 @@ footer button.cancel-slide .icon-cancel {
   color: var(--dim2);
   gap: 8px;
 }
+
 .empty-state .empty-icon {
   opacity: 0.35;
   margin-bottom: 4px;
 }
-.empty-state .hint {
-  font-size: 14px;
+
+.empty-state .hint { font-size: 14px; }
+
+/* ── select mode ───────────────────────────────────────────────────────── */
+
+.msg-select-wrap {
+  display: flex;
+  flex-direction: column;
+  position: relative;
 }
 
-/* ── sidebar overlay (mobile) ─────────────────── */
-
-#edgeZone {
+.msg-select-overlay {
   display: none;
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+  z-index: 10;
 }
 
-.sidebar-overlay {
-  display: none;
+main.select-mode .msg-select-overlay { display: block; }
+
+.msg-select-wrap.selected .msg-wrap > .msg {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
 }
 
-/* ── responsive ───────────────────────────────── */
+/* ── select bar ────────────────────────────────────────────────────────── */
 
-@media (max-width: 750px) {
-  body {
-    grid-template-columns: 1fr;
-    /* Lock the viewport: 100dvh is buggy on mobile Safari — it can
-             be larger than the visible area when the address bar is
-             showing, causing the entire body to scroll.  Fixed positioning
-             anchors the layout to the actual visible viewport. */
-    position: fixed;
-    inset: 0;
-    height: auto;
-    /* overflow:hidden on the global html,body rule propagates to the
-             viewport and clips position:fixed children in some browsers. */
-    overflow: clip;
-  }
-  nav {
-    position: fixed;
-    top: 0;
-    left: 0;
-    bottom: 0;
-    width: var(--sidebar-w);
-    z-index: 100;
-    transform: translateX(-100%);
-    box-shadow: 2px 0 20px rgba(0, 0, 0, 0.5);
-    will-change: transform;
-  }
-  nav.open {
-    transform: translateX(0);
-    touch-action: none;
-  }
-  .sidebar-overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.4);
-    z-index: 99;
-    /* Prevent the browser from claiming touches on the overlay
-             (e.g. scrolling) so our swipe-to-close gesture works. */
-    touch-action: none;
-  }
-  .sidebar-overlay.open {
-    display: block;
-  }
-  #edgeZone {
-    display: block;
-    position: fixed;
-    top: 50px; /* below the header so the ☰ menu button isn't covered */
-    left: 0;
-    bottom: 0;
-    width: 40px;
-    z-index: 1;
-    /* Prevent the browser from claiming left-edge touches so
-             our swipe-to-open gesture owns them. */
-    touch-action: none;
-  }
-  header .menu-btn {
-    display: block;
-  }
-  main {
-    padding: 14px;
-    gap: 10px;
-  }
-  .msg {
-    max-width: 88%;
-    font-size: 14px;
-    padding: 10px 14px;
-  }
-  .msg.tool {
-    max-width: 94%;
-  }
-  .msg.result {
-    max-width: 96%;
-  }
-  header {
-    padding: 10px 14px;
-  }
-  footer {
-    padding: 10px 14px;
-    gap: 8px;
-    min-height: 0;
-    /* Positioning context for the floating buttons so they
-       track the footer's top edge as the textarea expands. */
-    position: relative;
-  }
-  footer textarea {
-    font-size: 16px;
-  } /* prevent iOS zoom */
-  /* Floating send/mic/cancel button — anchored to the top of the
-     footer so it stays in the gap between messages and input even
-     when the textarea grows. */
-  footer button#send {
-    position: absolute;
-    bottom: calc(100% + 8px);
-    right: 14px;
-    width: 44px;
-    height: 44px;
-    border-radius: 50%;
-    z-index: 50;
-    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
-    font-size: 14px;
-    padding: 0;
-  }
-  /* Floating new-session button — when a session is active it lives
-     inside the footer so it also tracks the footer's top edge. */
-  footer #newSessionFab {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    position: absolute;
-    bottom: calc(100% + 8px);
-    left: 14px;
-    width: 44px;
-    height: 44px;
-    border-radius: 50%;
-    background: var(--surface2);
-    color: var(--dim);
-    border: 1px solid var(--border);
-    font-size: 22px;
-    font-weight: 400;
-    cursor: pointer;
-    z-index: 50;
-    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
-    transition:
-      background 0.2s,
-      color 0.2s,
-      border-color 0.2s,
-      opacity 0.2s,
-      box-shadow 0.2s;
-    font-family: var(--font);
-    -webkit-tap-highlight-color: transparent;
-  }
-  footer #newSessionFab:hover {
-    border-color: var(--blue);
-    color: var(--blue);
-    background: var(--surface2);
-  }
-  footer #newSessionFab:active {
-    opacity: 0.85;
-    transform: scale(0.96);
-  }
-  /* Standalone new-session FAB — only shown when no session is active
-     (so there's no footer to anchor to).  Fixed to the viewport. */
-  #newSessionFab {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    position: fixed;
-    bottom: 20px;
-    left: 14px;
-    width: 44px;
-    height: 44px;
-    border-radius: 50%;
-    background: var(--surface2);
-    color: var(--dim);
-    border: 1px solid var(--border);
-    font-size: 22px;
-    font-weight: 400;
-    cursor: pointer;
-    z-index: 50;
-    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
-    transition:
-      background 0.2s,
-      color 0.2s,
-      border-color 0.2s,
-      opacity 0.2s,
-      box-shadow 0.2s;
-    font-family: var(--font);
-    -webkit-tap-highlight-color: transparent;
-  }
-  #newSessionFab:hover {
-    border-color: var(--blue);
-    color: var(--blue);
-    background: var(--surface2);
-  }
-  #newSessionFab:active {
-    opacity: 0.85;
-    transform: scale(0.96);
-  }
-  nav .sidebar-footer {
-    min-height: 0;
-  }
-}
-
-@media (max-width: 400px) {
-  main {
-    padding: 10px;
-    gap: 8px;
-  }
-  .msg {
-    max-width: 93%;
-    font-size: 13.5px;
-    padding: 9px 12px;
-  }
-  header {
-    padding: 8px 10px;
-  }
-  footer {
-    padding: 8px 10px;
-  }
-}
-
-/* ── pull-to-refresh indicator ──────────────── */
-
-#refreshIndicator {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 48px;
+.select-bar {
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  gap: 12px;
   background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  transform: translateY(-100%);
-  z-index: 150;
-  pointer-events: none;
-}
-#refreshIndicator .refresh-label {
-  font-size: 13px;
-  color: var(--dim);
-  transition: color 0.15s;
-}
-#refreshIndicator.ready .refresh-label {
-  color: var(--blue);
+  border-top: 1px solid var(--border);
 }
 
-/* ── new-session modal ────────────────────────── */
+.select-count {
+  font-size: 13px;
+  color: var(--dim);
+  font-family: var(--mono);
+}
+
+.select-actions { display: flex; gap: 8px; }
+
+.select-compact-btn {
+  background: var(--blue);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: opacity var(--t-fast);
+}
+
+.select-compact-btn:disabled { opacity: 0.4; cursor: default; }
+.select-compact-btn:not(:disabled):hover { opacity: 0.88; }
+
+.select-cancel-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast);
+}
+
+.select-cancel-btn:hover { color: var(--fg); border-color: var(--dim2); }
+
+/* ── modal: shared ─────────────────────────────────────────────────────── */
 
 .modal-backdrop {
   position: fixed;
@@ -1542,11 +1127,6 @@ footer button.cancel-slide .icon-cancel {
   align-items: center;
   justify-content: center;
   animation: fadeIn 0.15s ease;
-}
-
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to   { opacity: 1; }
 }
 
 .modal-dialog {
@@ -1606,16 +1186,11 @@ footer button.cancel-slide .icon-cancel {
   font-family: var(--mono);
   font-size: 14px;
   outline: none;
-  transition: border-color 0.15s;
+  transition: border-color var(--t-fast);
 }
 
-.modal-input:focus {
-  border-color: var(--blue);
-}
-
-.modal-input::placeholder {
-  color: var(--dim2);
-}
+.modal-input:focus { border-color: var(--blue); }
+.modal-input::placeholder { color: var(--dim2); }
 
 .modal-footer {
   padding: 12px 20px 16px;
@@ -1632,48 +1207,20 @@ footer button.cancel-slide .icon-cancel {
   font-weight: 500;
   border: none;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: background var(--t-fast), color var(--t-fast);
 }
 
-.modal-btn-cancel {
-  background: var(--surface2);
-  color: var(--dim);
-}
+.modal-btn-cancel { background: var(--surface2); color: var(--dim); }
+.modal-btn-cancel:hover { background: var(--border); color: var(--fg); }
 
-.modal-btn-cancel:hover {
-  background: var(--border);
-  color: var(--fg);
-}
+.modal-btn-create { background: var(--blue); color: var(--bg); }
+.modal-btn-create:hover { background: var(--blue-dim); color: var(--bg); }
 
-.modal-btn-create {
-  background: var(--blue);
-  color: var(--bg);
-}
+/* ── modal: settings dialog ────────────────────────────────────────────── */
 
-.modal-btn-create:hover {
-  background: var(--blue-dim);
-  color: var(--bg);
-}
+.settings-dialog { max-width: 480px; }
 
-.settings-saved {
-  margin-top: 10px;
-  padding: 8px 12px;
-  background: rgba(0, 200, 0, 0.1);
-  border: 1px solid rgba(0, 200, 0, 0.3);
-  border-radius: var(--radius-sm);
-  color: var(--green);
-  font-size: 13px;
-}
-
-/* ── settings dialog ──────────────────────────── */
-
-.settings-dialog {
-  max-width: 480px;
-}
-
-.settings-field {
-  margin-bottom: 14px;
-}
+.settings-field { margin-bottom: 14px; }
 
 .settings-field-label {
   display: flex;
@@ -1693,9 +1240,7 @@ footer button.cancel-slide .icon-cancel {
   cursor: pointer;
 }
 
-.settings-field .modal-input {
-  margin-top: 2px;
-}
+.settings-field .modal-input { margin-top: 2px; }
 
 .settings-inherited {
   display: block;
@@ -1727,16 +1272,20 @@ footer button.cancel-slide .icon-cancel {
   accent-color: var(--blue);
 }
 
-/* ── modal CWD row ────────────────────────────── */
-
-.modal-cwd-row {
-  display: flex;
-  gap: 6px;
+.settings-saved {
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: rgba(0, 200, 0, 0.1);
+  border: 1px solid rgba(0, 200, 0, 0.3);
+  border-radius: var(--radius-sm);
+  color: var(--green);
+  font-size: 13px;
 }
 
-.modal-cwd-row .modal-input {
-  flex: 1;
-}
+/* ── modal: directory browser ──────────────────────────────────────────── */
+
+.modal-cwd-row { display: flex; gap: 6px; }
+.modal-cwd-row .modal-input { flex: 1; }
 
 .modal-btn-browse {
   flex-shrink: 0;
@@ -1747,16 +1296,26 @@ footer button.cancel-slide .icon-cancel {
   color: var(--dim);
   font-size: 13px;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
 
-.modal-btn-browse:hover {
-  background: var(--border);
-  color: var(--fg);
-  border-color: var(--blue);
+.modal-btn-browse:hover { background: var(--border); color: var(--fg); border-color: var(--blue); }
+
+.modal-cwd-resets { display: flex; gap: 6px; }
+
+.modal-btn-reset {
+  padding: 4px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--dim);
+  font-size: 12px;
+  font-family: var(--mono);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
 }
 
-/* ── directory browser panel ──────────────────── */
+.modal-btn-reset:hover { background: var(--border); color: var(--fg); }
 
 .browse-panel {
   margin-top: 2px;
@@ -1776,9 +1335,7 @@ footer button.cancel-slide .icon-cancel {
   font-size: 13px;
 }
 
-.browse-dir-label {
-  flex-shrink: 0;
-}
+.browse-dir-label { flex-shrink: 0; }
 
 .browse-dir-path {
   color: var(--fg2);
@@ -1789,17 +1346,9 @@ footer button.cancel-slide .icon-cancel {
   text-align: left;
 }
 
-.browse-error {
-  padding: 10px;
-  color: var(--red);
-  font-size: 13px;
-}
+.browse-error { padding: 10px; color: var(--red); font-size: 13px; }
 
-.browse-entries {
-  max-height: 180px;
-  overflow-y: auto;
-  padding: 4px 0;
-}
+.browse-entries { max-height: 180px; overflow-y: auto; padding: 4px 0; }
 
 .browse-entry {
   display: flex;
@@ -1811,51 +1360,177 @@ footer button.cancel-slide .icon-cancel {
   transition: background 0.1s;
 }
 
-.browse-entry:hover {
-  background: var(--border);
-}
+.browse-entry:hover { background: var(--border); }
 
-.browse-entry-icon {
-  flex-shrink: 0;
-  font-size: 13px;
-}
+.browse-entry-icon { flex-shrink: 0; font-size: 13px; }
 
-.browse-entry-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.browse-entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.browse-parent {
-  color: var(--blue);
-  border-bottom: 1px solid var(--border);
-}
+.browse-parent { color: var(--blue); border-bottom: 1px solid var(--border); }
+.browse-file   { color: var(--dim); cursor: default; }
 
-.browse-file {
-  color: var(--dim);
-  cursor: default;
-}
+/* ── pull-to-refresh indicator ─────────────────────────────────────────── */
 
-/* ── CWD quick-reset buttons ──────────────────── */
-
-.modal-cwd-resets {
+#refreshIndicator {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 48px;
   display: flex;
-  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  transform: translateY(-100%);
+  z-index: 150;
+  pointer-events: none;
 }
 
-.modal-btn-reset {
-  padding: 4px 10px;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+#refreshIndicator .refresh-label {
+  font-size: 13px;
   color: var(--dim);
-  font-size: 12px;
-  font-family: var(--mono);
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: color var(--t-fast);
 }
 
-.modal-btn-reset:hover {
-  background: var(--border);
-  color: var(--fg);
+#refreshIndicator.ready .refresh-label { color: var(--blue); }
+
+/* ── sidebar overlay (mobile) ──────────────────────────────────────────── */
+
+#edgeZone { display: none; }
+.sidebar-overlay { display: none; }
+
+/* ── responsive: ≤750px ────────────────────────────────────────────────── */
+
+@media (max-width: 750px) {
+  body {
+    grid-template-columns: 1fr;
+    position: fixed;
+    inset: 0;
+    height: auto;
+    overflow: clip;
+  }
+
+  nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: var(--sidebar-w);
+    z-index: 100;
+    transform: translateX(-100%);
+    box-shadow: 2px 0 20px rgba(0, 0, 0, 0.5);
+    will-change: transform;
+  }
+
+  nav.open { transform: translateX(0); touch-action: none; }
+
+  .sidebar-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 99;
+    touch-action: none;
+  }
+
+  .sidebar-overlay.open { display: block; }
+
+  #edgeZone {
+    display: block;
+    position: fixed;
+    top: 50px;
+    left: 0;
+    bottom: 0;
+    width: 40px;
+    z-index: 1;
+    touch-action: none;
+  }
+
+  header .menu-btn { display: block; }
+
+  main  { padding: 14px; gap: 10px; }
+
+  .msg  { max-width: 88%;  font-size: 14px;   padding: 10px 14px; }
+  .msg.tool   { max-width: 94%; }
+  .msg.result { max-width: 96%; }
+
+  header { padding: 10px 14px; }
+
+  footer {
+    padding: 10px 14px;
+    gap: 8px;
+    min-height: 0;
+    position: relative;
+  }
+
+  footer textarea { font-size: 16px; } /* prevent iOS zoom */
+
+  footer button#send {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    right: 14px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    z-index: 50;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+    font-size: 14px;
+    padding: 0;
+  }
+
+  footer #newSessionFab {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 14px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: var(--surface2);
+    color: var(--dim);
+    border: 1px solid var(--border);
+    font-size: 22px;
+    font-weight: 400;
+    cursor: pointer;
+    z-index: 50;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+    font-family: var(--font);
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  #newSessionFab {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    bottom: 20px;
+    left: 14px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: var(--surface2);
+    color: var(--dim);
+    border: 1px solid var(--border);
+    font-size: 22px;
+    font-weight: 400;
+    cursor: pointer;
+    z-index: 50;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+    font-family: var(--font);
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  nav .sidebar-footer { min-height: 0; }
+}
+
+/* ── responsive: ≤400px ────────────────────────────────────────────────── */
+
+@media (max-width: 400px) {
+  main  { padding: 10px; gap: 8px; }
+  .msg  { max-width: 93%; font-size: 13.5px; padding: 9px 12px; }
+  header { padding: 8px 10px; }
+  footer { padding: 8px 10px; }
 }
